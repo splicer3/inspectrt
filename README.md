@@ -2,7 +2,7 @@
 
 InspectRT is an early-stage engineering project for building a portable runtime for industrial visual inspection, focused on reproducible anomaly-detection pipelines and measured behavior across software and hardware backends.
 
-`RT` means **Runtime**. InspectRT does not currently claim hard real-time guarantees.
+`RT` means **Runtime**. InspectRT isn't made with real-time guarantees in mind.
 
 ## Development
 
