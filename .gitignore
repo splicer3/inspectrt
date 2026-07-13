@@ -1,0 +1,26 @@
+.DS_Store
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local environments
+.venv/
+venv/
+env/
+.python-version
+
+# Datasets and generated outputs
+datasets/
+outputs/
+
+# Internal and temporary directories
+_*/
+**/_*/
