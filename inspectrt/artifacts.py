@@ -19,6 +19,7 @@ from types import MappingProxyType
 import torch
 from torch import Tensor
 
+from inspectrt.benchmark import BaselineBenchmark
 from inspectrt.data import MvtecSample
 from inspectrt.evaluation import CategoryEvaluation, MvtecSampleObservation
 from inspectrt.metrics import ThresholdFreeMetrics, compute_threshold_free_metrics
@@ -112,6 +113,8 @@ def persist_baseline_run(
     evaluation: CategoryEvaluation,
     output_root: Path,
     metadata: BaselineRunMetadata,
+    *,
+    benchmark: BaselineBenchmark | None = None,
 ) -> Path:
     """Persist one validated evaluation using an atomic run-directory rename."""
     if not isinstance(output_root, Path):
@@ -120,6 +123,7 @@ def persist_baseline_run(
         raise TypeError("metadata must be BaselineRunMetadata")
 
     samples, test_ids, counts = _validate_evaluation(evaluation)
+    _validate_benchmark(evaluation, metadata, benchmark)
     sample_bytes = b"".join(_canonical_json(record) for record in samples)
     inventory_sha256 = hashlib.sha256(sample_bytes).hexdigest()
     predictions = b"".join(
@@ -175,10 +179,11 @@ def persist_baseline_run(
             },
         ),
         ("metrics.json", _canonical_json(metrics)),
+        *((("benchmark.json", benchmark.canonical_json()),) if benchmark else ()),
         (
             "run.json",
             _canonical_json(
-                _run_record(evaluation, metadata, inventory_sha256, counts)
+                _run_record(evaluation, metadata, inventory_sha256, counts, benchmark)
             ),
         ),
     )
@@ -202,6 +207,27 @@ def persist_baseline_run(
             shutil.rmtree(temporary)
         raise
     return destination
+
+
+def _validate_benchmark(
+    evaluation: CategoryEvaluation,
+    metadata: BaselineRunMetadata,
+    benchmark: BaselineBenchmark | None,
+) -> None:
+    if benchmark is None:
+        return
+    if not isinstance(benchmark, BaselineBenchmark):
+        raise TypeError("benchmark must be BaselineBenchmark or None")
+    expected = {
+        "category": evaluation.category,
+        "created_at_utc": metadata.created_at_utc,
+        "device": metadata.requested_device,
+        "profile_id": "inspectrt_feature_memory_v1",
+        "run_id": metadata.run_id,
+    }
+    for name, value in expected.items():
+        if getattr(benchmark, name) != value:
+            raise ValueError(f"Benchmark {name} must match the run {name}")
 
 
 def _validate_evaluation(
@@ -334,6 +360,7 @@ def _run_record(
     metadata: BaselineRunMetadata,
     inventory_sha256: str,
     counts: dict[str, int],
+    benchmark: BaselineBenchmark | None,
 ) -> dict[str, object]:
     tensors = {
         name: {"dtype": _dtype_name(tensor), "shape": list(tensor.shape)}
@@ -353,7 +380,15 @@ def _run_record(
     return {
         "bank_chunk_size": metadata.bank_chunk_size,
         "batch_size": 1,
-        "benchmark": None,
+        "benchmark": (
+            None
+            if benchmark is None
+            else {
+                "artifact": "benchmark.json",
+                "schema_version": benchmark.schema_version,
+                "timing_device": benchmark.device,
+            }
+        ),
         "category": evaluation.category,
         "dataset_root": metadata.dataset_root,
         "determinism": dict(metadata.determinism_flags),

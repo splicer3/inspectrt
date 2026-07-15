@@ -13,6 +13,7 @@ import random
 import re
 import subprocess
 import sys
+from time import perf_counter_ns
 import tomllib
 from typing import Any
 from urllib.parse import urlsplit
@@ -122,13 +123,33 @@ def _argument_parser() -> argparse.ArgumentParser:
     evaluate = commands.add_parser(
         "evaluate", help="evaluate and persist one MVTec AD category"
     )
-    evaluate.add_argument("--config", required=True, type=Path)
-    evaluate.add_argument("--dataset-root", required=True, type=Path)
-    evaluate.add_argument("--category", required=True)
-    evaluate.add_argument("--device", required=True)
-    evaluate.add_argument("--output-root", type=Path, default=Path("outputs"))
-    evaluate.add_argument("--run-id")
+    _add_runtime_arguments(evaluate)
+    benchmark = commands.add_parser(
+        "benchmark", help="measure and persist one MVTec AD category"
+    )
+    _add_runtime_arguments(benchmark)
+    benchmark.add_argument("--warmup-count", type=_positive_integer, default=5)
+    benchmark.add_argument("--repeat-count", type=_positive_integer, default=30)
     return parser
+
+
+def _add_runtime_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--config", required=True, type=Path)
+    command.add_argument("--dataset-root", required=True, type=Path)
+    command.add_argument("--category", required=True)
+    command.add_argument("--device", required=True)
+    command.add_argument("--output-root", type=Path, default=Path("outputs"))
+    command.add_argument("--run-id")
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -137,9 +158,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_baseline_config(arguments.config)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
-        return _evaluate(arguments, config)
+        handler = _benchmark if arguments.command == "benchmark" else _evaluate
+        return handler(arguments, config)
     except Exception as error:
-        print(f"inspectrt evaluate failed: {error}", file=sys.stderr)
+        print(f"inspectrt {arguments.command} failed: {error}", file=sys.stderr)
         return 1
 
 
@@ -152,16 +174,11 @@ def _evaluate(arguments: argparse.Namespace, config: BaselineConfig) -> int:
 
     from torchvision.models import ResNet50_Weights
 
-    from inspectrt.artifacts import BaselineRunMetadata, persist_baseline_run
+    from inspectrt.artifacts import persist_baseline_run
     from inspectrt.evaluation import evaluate_mvtec_category
     from inspectrt.features import build_resnet50_layer2_extractor
 
-    now = _utc_now()
-    _, commit, dirty, lock_digest = _repository_metadata(Path.cwd())
-    run_id = arguments.run_id or _generated_run_id(now, arguments.category, commit)
-    dependencies = {name: importlib_metadata.version(name) for name in _DISTRIBUTIONS}
-    python_version = platform.python_version()
-    platform_description = platform.platform()
+    identity = _baseline_run_identity(arguments)
     weights = ResNet50_Weights.IMAGENET1K_V2
     extractor = build_resnet50_layer2_extractor(weights=weights)
     weight_digest = _cached_weight_sha256(weights.url, torch)
@@ -172,22 +189,15 @@ def _evaluate(arguments: argparse.Namespace, config: BaselineConfig) -> int:
         device=device,
         bank_chunk_size=config.bank_chunk_size,
     )
-    metadata = BaselineRunMetadata(
-        run_id=run_id,
-        created_at_utc=now.isoformat(timespec="microseconds").replace("+00:00", "Z"),
-        dataset_root=str(arguments.dataset_root.resolve()),
-        requested_device=str(device),
-        bank_chunk_size=config.bank_chunk_size,
-        git_commit=commit,
-        git_dirty=dirty,
-        uv_lock_sha256=lock_digest,
-        python_version=python_version,
-        platform_description=platform_description,
-        dependency_versions=dependencies,
-        determinism_flags=determinism,
-        weight_enum=str(weights),
-        weight_source_url=weights.url,
-        weight_file_sha256=weight_digest,
+    metadata = _baseline_run_metadata(
+        arguments,
+        config,
+        device,
+        determinism,
+        weights,
+        torch,
+        identity,
+        weight_digest=weight_digest,
     )
     run_directory = persist_baseline_run(evaluation, arguments.output_root, metadata)
     print(f"Run written to {run_directory}")
@@ -196,6 +206,114 @@ def _evaluate(arguments: argparse.Namespace, config: BaselineConfig) -> int:
     print(f"image_average_precision={evaluation.metrics.image_average_precision}")
     print(f"pixel_auroc={evaluation.metrics.pixel_auroc}")
     return 0
+
+
+def _benchmark(arguments: argparse.Namespace, config: BaselineConfig) -> int:
+    import numpy as np
+    import torch
+
+    determinism = _configure_determinism(config, np, torch)
+    device = _resolve_device(arguments.device, torch)
+
+    from torchvision.models import ResNet50_Weights
+
+    from inspectrt.artifacts import persist_baseline_run
+    from inspectrt.benchmark import benchmark_mvtec_category
+    from inspectrt.features import build_resnet50_layer2_extractor
+
+    identity = _baseline_run_identity(arguments)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    model_start = perf_counter_ns()
+    weights = ResNet50_Weights.IMAGENET1K_V2
+    extractor = build_resnet50_layer2_extractor(weights=weights)
+    extractor.to(device).eval()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    model_load_ms = float(perf_counter_ns() - model_start) / 1_000_000.0
+
+    metadata = _baseline_run_metadata(
+        arguments, config, device, determinism, weights, torch, identity
+    )
+    evaluation, benchmark = benchmark_mvtec_category(
+        arguments.dataset_root,
+        arguments.category,
+        extractor,
+        device=device,
+        bank_chunk_size=config.bank_chunk_size,
+        warmup_count=arguments.warmup_count,
+        repeat_count=arguments.repeat_count,
+        model_and_weight_load_ms=model_load_ms,
+        run_id=metadata.run_id,
+        created_at_utc=metadata.created_at_utc,
+    )
+    run_directory = persist_baseline_run(
+        evaluation, arguments.output_root, metadata, benchmark=benchmark
+    )
+    end_to_end = benchmark.results["synchronized_end_to_end"]
+    print(f"Run written to {run_directory}")
+    print(f"category={evaluation.category}")
+    print(f"image_auroc={evaluation.metrics.image_auroc}")
+    print(f"image_average_precision={evaluation.metrics.image_average_precision}")
+    print(f"pixel_auroc={evaluation.metrics.pixel_auroc}")
+    print(f"synchronized_end_to_end_p50_ms={end_to_end['p50']}")
+    print(f"synchronized_end_to_end_p95_ms={end_to_end['p95']}")
+    print(f"timing_device={benchmark.device}")
+    return 0
+
+
+def _baseline_run_metadata(
+    arguments: argparse.Namespace,
+    config: BaselineConfig,
+    device: Any,
+    determinism: Mapping[str, str | int | bool | None],
+    weights: Any,
+    torch: Any,
+    identity: Mapping[str, Any],
+    *,
+    weight_digest: str | None = None,
+) -> Any:
+    from inspectrt.artifacts import BaselineRunMetadata
+
+    return BaselineRunMetadata(
+        run_id=identity["run_id"],
+        created_at_utc=identity["created_at_utc"],
+        dataset_root=str(arguments.dataset_root.resolve()),
+        requested_device=str(device),
+        bank_chunk_size=config.bank_chunk_size,
+        git_commit=identity["git_commit"],
+        git_dirty=identity["git_dirty"],
+        uv_lock_sha256=identity["uv_lock_sha256"],
+        python_version=identity["python_version"],
+        platform_description=identity["platform_description"],
+        dependency_versions=identity["dependency_versions"],
+        determinism_flags=determinism,
+        weight_enum=str(weights),
+        weight_source_url=weights.url,
+        weight_file_sha256=(
+            weight_digest
+            if weight_digest is not None
+            else _cached_weight_sha256(weights.url, torch)
+        ),
+    )
+
+
+def _baseline_run_identity(arguments: argparse.Namespace) -> dict[str, Any]:
+    now = _utc_now()
+    _, commit, dirty, lock_digest = _repository_metadata(Path.cwd())
+    run_id = arguments.run_id or _generated_run_id(now, arguments.category, commit)
+    return {
+        "created_at_utc": now.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "dependency_versions": {
+            name: importlib_metadata.version(name) for name in _DISTRIBUTIONS
+        },
+        "git_commit": commit,
+        "git_dirty": dirty,
+        "platform_description": platform.platform(),
+        "python_version": platform.python_version(),
+        "run_id": run_id,
+        "uv_lock_sha256": lock_digest,
+    }
 
 
 def _configure_determinism(
