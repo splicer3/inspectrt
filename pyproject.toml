@@ -9,11 +9,15 @@ description = "A portable runtime for industrial visual inspection."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "numpy>=2.4.6",
     "pillow>=12.3.0",
     "scikit-learn>=1.9.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
 ]
+
+[project.scripts]
+inspectrt = "inspectrt.cli:main"
 
 [dependency-groups]
 dev = [

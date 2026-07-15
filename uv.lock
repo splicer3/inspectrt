@@ -124,6 +124,8 @@ name = "inspectrt"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pillow" },
     { name = "scikit-learn" },
     { name = "torch" },
@@ -138,6 +140,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2.4.6" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "scikit-learn", specifier = ">=1.9.0" },
     { name = "torch", specifier = ">=2.13.0" },

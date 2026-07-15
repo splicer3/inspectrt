@@ -1,0 +1,12 @@
+schema_version = 1
+profile_id = "inspectrt_feature_memory_v1"
+preprocessing_profile_id = "inspectrt_resize256_v1"
+weights = "IMAGENET1K_V2"
+bank_chunk_size = 16384
+seed = 0
+
+[determinism]
+use_deterministic_algorithms = true
+cudnn_benchmark = false
+allow_tf32 = false
+cublas_workspace_config = ":4096:8"
