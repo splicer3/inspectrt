@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
+import json
 from pathlib import Path
 import re
 import shutil
@@ -15,6 +16,7 @@ import inspectrt.cli as cli
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PROFILE = _ROOT / "configs" / "baseline.toml"
+_RETRIEVAL_FIXTURE = _ROOT / "tests" / "fixtures" / "retrieval_v1"
 _TOP_LEVEL_KEYS = {
     "schema_version",
     "profile_id",
@@ -57,7 +59,9 @@ def test_import_does_not_load_heavy_runtime_modules() -> None:
         "import sys; import inspectrt.cli; "
         "assert 'torch' not in sys.modules; "
         "assert 'torchvision' not in sys.modules; "
-        "assert 'numpy' not in sys.modules"
+        "assert 'numpy' not in sys.modules; "
+        "assert 'inspectrt.fixtures' not in sys.modules; "
+        "assert 'inspectrt.retrieval' not in sys.modules"
     )
     result = subprocess.run(
         (sys.executable, "-c", code),
@@ -186,6 +190,239 @@ def test_command_help_succeeds(arguments: tuple[str, ...], expected: str) -> Non
             "--seed",
         ):
             assert forbidden not in result.stdout
+
+
+def test_fixture_command_help_and_action_surface() -> None:
+    root = _console("--help")
+    group = _console("fixture", "--help")
+    validate = _console("fixture", "validate", "--help")
+    assert root.returncode == group.returncode == validate.returncode == 0
+    assert "fixture" in root.stdout
+    assert "{validate}" in group.stdout
+    assert "--fixture" in validate.stdout
+    assert "--device" in validate.stdout
+    for action in ("export", "inspect", "generate"):
+        result = _console("fixture", action)
+        assert result.returncode == 2
+        assert "invalid choice" in result.stderr
+
+
+def test_fixture_validate_requires_both_arguments() -> None:
+    for arguments in (
+        ("fixture", "validate"),
+        ("fixture", "validate", "--fixture", str(_RETRIEVAL_FIXTURE)),
+        ("fixture", "validate", "--device", "cpu"),
+    ):
+        result = _console(*arguments)
+        assert result.returncode == 2
+        assert "required" in result.stderr
+
+
+def test_committed_fixture_validates_on_cpu() -> None:
+    result = _console(
+        "fixture",
+        "validate",
+        "--fixture",
+        str(_RETRIEVAL_FIXTURE),
+        "--device",
+        "cpu",
+    )
+    assert result.returncode == 0, result.stderr
+    output = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    manifest_bytes = (_RETRIEVAL_FIXTURE / "manifest.json").read_bytes()
+    payload = (_RETRIEVAL_FIXTURE / "tensors.bin").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    assert output == {
+        "fixture_id": "synthetic-correctness-v1",
+        "fixture_class": "synthetic_correctness",
+        "Q": "4",
+        "M": "7",
+        "D": "5",
+        "k": "1",
+        "chunk_size": "3",
+        "payload_sha256": manifest["payload"]["sha256"],
+        "fixture_digest": hashlib.sha256(manifest_bytes + payload).hexdigest(),
+        "indices": "exact",
+        "distances": "exact",
+        "status": "accepted",
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", output["payload_sha256"])
+    assert re.fullmatch(r"[0-9a-f]{64}", output["fixture_digest"])
+
+
+def _mismatched_fixture(
+    tmp_path: Path, *, index: bool = False, distance: bool = False
+) -> Path:
+    import numpy as np
+
+    from inspectrt.fixtures import RetrievalFixture, load_retrieval_fixture
+    from inspectrt.fixtures import write_retrieval_fixture
+
+    loaded = load_retrieval_fixture(_RETRIEVAL_FIXTURE)
+    expected_indices = loaded.expected_indices.copy()
+    expected_distances = loaded.expected_squared_l2_distances.copy()
+    if index:
+        expected_indices[0] = np.int64(2)
+    if distance:
+        expected_distances[0] = np.float32(2)
+    fixture = RetrievalFixture(
+        loaded.metadata,
+        loaded.queries,
+        loaded.memory_bank,
+        expected_distances,
+        expected_indices,
+    )
+    directory = tmp_path / f"mismatch-{index}-{distance}"
+    write_retrieval_fixture(fixture, directory)
+    return directory
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    (("missing", "not found"), ("corrupt", "SHA-256 mismatch")),
+)
+def test_fixture_path_and_hash_failures_are_concise(
+    tmp_path: Path, kind: str, message: str
+) -> None:
+    fixture = tmp_path / kind
+    if kind == "corrupt":
+        shutil.copytree(_RETRIEVAL_FIXTURE, fixture)
+        payload = bytearray((fixture / "tensors.bin").read_bytes())
+        payload[0] ^= 1
+        (fixture / "tensors.bin").write_bytes(payload)
+    result = _console(
+        "fixture", "validate", "--fixture", str(fixture), "--device", "cpu"
+    )
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("index", "distance", "message"),
+    ((True, False, "index mismatch"), (False, True, "distance mismatch")),
+)
+def test_fixture_reference_mismatch_fails(
+    tmp_path: Path, index: bool, distance: bool, message: str
+) -> None:
+    fixture = _mismatched_fixture(tmp_path, index=index, distance=distance)
+    result = _console(
+        "fixture", "validate", "--fixture", str(fixture), "--device", "cpu"
+    )
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert "status=accepted" not in result.stdout
+
+
+def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) -> None:
+    from inspectrt.fixtures import (
+        RealApplicationFixtureSource,
+        RetrievalFixture,
+        RetrievalFixtureMetadata,
+        load_retrieval_fixture,
+        real_fixture_id,
+        write_retrieval_fixture,
+    )
+
+    loaded = load_retrieval_fixture(_RETRIEVAL_FIXTURE)
+    source_commit = "a" * 40
+    source = RealApplicationFixtureSource(
+        category="bottle",
+        sample_id="mvtec_ad/bottle/test/crack/000.png",
+        test_tensor_index=0,
+        accepted_run_id="accepted-run",
+        source_commit=source_commit,
+        source_dirty=False,
+        inventory_sha256="b" * 64,
+        uv_lock_sha256="c" * 64,
+        weight_enum="ResNet50_Weights.IMAGENET1K_V2",
+        weight_file_sha256="d" * 64,
+        baseline_profile="inspectrt_feature_memory_v1",
+        configuration_sha256="e" * 64,
+        preprocessing_identity="inspectrt_resize256_v1",
+        feature_layer="layer2",
+        source_image_sha256="f" * 64,
+        python_version="3.11.15",
+        dependency_versions={
+            name: "1"
+            for name in (
+                "inspectrt",
+                "numpy",
+                "pillow",
+                "scikit-learn",
+                "torch",
+                "torchvision",
+            )
+        },
+        platform_description="test platform",
+        requested_device="cuda:0",
+        determinism={
+            "allow_tf32": False,
+            "cublas_workspace_config": ":4096:8",
+            "cudnn_benchmark": False,
+            "deterministic_algorithms_warn_only": False,
+            "fp32_precision": "ieee",
+            "numpy_seed": 0,
+            "python_random_seed": 0,
+            "torch_cpu_seed": 0,
+            "torch_cuda_seed_all": 0,
+            "use_deterministic_algorithms": True,
+        },
+        cuda_device_name="test GPU",
+        cuda_compute_capability=(7, 5),
+        pytorch_cuda_runtime_version="13.0",
+        source_artifact_sha256={
+            name: str(index) * 64
+            for index, name in enumerate(
+                (
+                    "run.json",
+                    "samples.jsonl",
+                    "memory_bank.pt",
+                    "retrieval.pt",
+                    "benchmark.json",
+                ),
+                1,
+            )
+        },
+    )
+    metadata = RetrievalFixtureMetadata(
+        real_fixture_id(source.category, source.sample_id, source_commit),
+        "real_application",
+        3,
+        source,
+        loaded.metadata.generator,
+    )
+    directory = tmp_path / "real"
+    write_retrieval_fixture(
+        RetrievalFixture(
+            metadata,
+            loaded.queries,
+            loaded.memory_bank,
+            loaded.expected_squared_l2_distances,
+            loaded.expected_indices,
+        ),
+        directory,
+    )
+    result = _console(
+        "fixture", "validate", "--fixture", str(directory), "--device", "cpu"
+    )
+    assert result.returncode == 1
+    assert "not implemented for fixture class real_application" in result.stderr
+    assert "status=accepted" not in result.stdout
+
+
+def test_fixture_invalid_device_fails_without_fallback() -> None:
+    result = _console(
+        "fixture",
+        "validate",
+        "--fixture",
+        str(_RETRIEVAL_FIXTURE),
+        "--device",
+        "not-a-device",
+    )
+    assert result.returncode == 1
+    assert "device" in result.stderr.lower()
+    assert "status=accepted" not in result.stdout
 
 
 def test_missing_runtime_arguments_use_argparse_status_two() -> None:

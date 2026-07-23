@@ -130,6 +130,13 @@ def _argument_parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(benchmark)
     benchmark.add_argument("--warmup-count", type=_positive_integer, default=5)
     benchmark.add_argument("--repeat-count", type=_positive_integer, default=30)
+    fixture = commands.add_parser("fixture", help="validate retrieval fixtures")
+    fixture_commands = fixture.add_subparsers(dest="fixture_command", required=True)
+    validate = fixture_commands.add_parser(
+        "validate", help="validate a retrieval fixture"
+    )
+    validate.add_argument("--fixture", required=True, type=Path)
+    validate.add_argument("--device", required=True)
     return parser
 
 
@@ -156,13 +163,66 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface."""
     arguments = _argument_parser().parse_args(argv)
     try:
+        if arguments.command == "fixture":
+            return _validate_fixture(arguments)
         config = load_baseline_config(arguments.config)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
         handler = _benchmark if arguments.command == "benchmark" else _evaluate
         return handler(arguments, config)
     except Exception as error:
-        print(f"inspectrt {arguments.command} failed: {error}", file=sys.stderr)
+        command = arguments.command
+        if command == "fixture":
+            command = f"{command} {arguments.fixture_command}"
+        print(f"inspectrt {command} failed: {error}", file=sys.stderr)
         return 1
+
+
+def _validate_fixture(arguments: argparse.Namespace) -> int:
+    fixture_directory = arguments.fixture
+    if not fixture_directory.exists():
+        raise FileNotFoundError(f"fixture directory not found: {fixture_directory}")
+    if not fixture_directory.is_dir() or fixture_directory.is_symlink():
+        raise ValueError(f"fixture path must be a real directory: {fixture_directory}")
+
+    import torch
+
+    from inspectrt.fixtures import load_retrieval_fixture
+    from inspectrt.retrieval import exact_top1_squared_l2
+
+    fixture = load_retrieval_fixture(fixture_directory)
+    if fixture.metadata.fixture_class != "synthetic_correctness":
+        raise ValueError(
+            "reference acceptance is not implemented for fixture class "
+            f"{fixture.metadata.fixture_class}"
+        )
+    device = _resolve_device(arguments.device, torch)
+    if str(device) != "cpu":
+        raise ValueError("canonical synthetic fixture acceptance requires device cpu")
+    distances, indices = exact_top1_squared_l2(
+        torch.from_numpy(fixture.queries).to(device),
+        torch.from_numpy(fixture.memory_bank).to(device),
+        bank_chunk_size=fixture.metadata.reference_chunk_size,
+    )
+    expected_indices = torch.from_numpy(fixture.expected_indices)
+    if not torch.equal(indices.cpu(), expected_indices):
+        raise ValueError("expected index mismatch")
+    expected_distances = torch.from_numpy(fixture.expected_squared_l2_distances)
+    if not torch.equal(distances.cpu(), expected_distances):
+        raise ValueError("expected distance mismatch")
+
+    workload = fixture.manifest["workload"]
+    payload = fixture.manifest["payload"]
+    print(f"fixture_id={fixture.metadata.fixture_id}")
+    print(f"fixture_class={fixture.metadata.fixture_class}")
+    for name in ("Q", "M", "D", "k"):
+        print(f"{name}={workload[name]}")
+    print(f"chunk_size={fixture.metadata.reference_chunk_size}")
+    print(f"payload_sha256={payload['sha256']}")
+    print(f"fixture_digest={fixture.fixture_digest}")
+    print("indices=exact")
+    print("distances=exact")
+    print("status=accepted")
+    return 0
 
 
 def _evaluate(arguments: argparse.Namespace, config: BaselineConfig) -> int:

@@ -19,6 +19,8 @@ from inspectrt.fixtures import (
 )
 
 _COMMIT = "bc330b9070c5ca8db9cb7cfbb27617256388536b"
+_FIXTURE_GENERATOR_COMMIT = "de731ee404e2ab1cd381230ec042496282413662"
+_COMMITTED_FIXTURE = Path(__file__).parent / "fixtures" / "retrieval_v1"
 _SAMPLE_ID = "mvtec_ad/bottle/test/broken_large/000.png"
 _TENSOR_NAMES = [
     "queries",
@@ -59,6 +61,29 @@ _ARTIFACT_HASHES = {
         1,
     )
 }
+_CANONICAL_QUERIES = np.array(
+    (
+        (0, 1, 0, 0, 0),
+        (0, 0, 0, 2, 0),
+        (2, 0, 0, 0, 0),
+        (0, 0, 0, 0, 4),
+    ),
+    dtype="<f4",
+)
+_CANONICAL_BANK = np.array(
+    (
+        (0, 0, 0, 0, 0),
+        (1, 0, 0, 0, 0),
+        (0, 2, 0, 0, 0),
+        (0, 0, 3, 0, 0),
+        (0, 0, 0, 4, 0),
+        (-1, 0, 0, 0, 0),
+        (0, 0, 0, 0, 5),
+    ),
+    dtype="<f4",
+)
+_CANONICAL_DISTANCES = np.array((1, 4, 1, 1), dtype="<f4")
+_CANONICAL_INDICES = np.array((0, 0, 1, 6), dtype="<i8")
 
 
 def _generator(**changes: object) -> FixtureGenerator:
@@ -87,6 +112,27 @@ def _synthetic_fixture(**changes: object) -> RetrievalFixture:
         np.array((0, 1), dtype="<i8"),
     )
     return replace(fixture, **changes)
+
+
+def _committed_fixture() -> RetrievalFixture:
+    return RetrievalFixture(
+        RetrievalFixtureMetadata(
+            "synthetic-correctness-v1",
+            "synthetic_correctness",
+            3,
+            SyntheticFixtureSource("inspectrt_synthetic_correctness_v1", 3),
+            FixtureGenerator(
+                "inspectrt_retrieval_fixture_v1",
+                1,
+                _FIXTURE_GENERATOR_COMMIT,
+                False,
+            ),
+        ),
+        _CANONICAL_QUERIES,
+        _CANONICAL_BANK,
+        _CANONICAL_DISTANCES,
+        _CANONICAL_INDICES,
+    )
 
 
 def _real_source(**changes: object) -> RealApplicationFixtureSource:
@@ -160,6 +206,125 @@ def _write_case(tmp_path: Path, name: str) -> Path:
     directory = tmp_path / name
     write_retrieval_fixture(_synthetic_fixture(), directory)
     return directory
+
+
+def test_committed_fixture_has_canonical_identity_workload_and_values() -> None:
+    files = {path.name: path for path in _COMMITTED_FIXTURE.iterdir()}
+    assert set(files) == {"manifest.json", "tensors.bin"}
+    assert sum(path.stat().st_size for path in files.values()) < 4096
+
+    loaded = load_retrieval_fixture(_COMMITTED_FIXTURE)
+    assert loaded.metadata == _committed_fixture().metadata
+    assert loaded.manifest["schema_version"] == 1
+    assert loaded.manifest["workload"] == {
+        "D": 5,
+        "M": 7,
+        "Q": 4,
+        "dtype": "float32",
+        "k": 1,
+        "layout": "C",
+        "reference_chunk_size": 3,
+    }
+    for actual, expected in zip(
+        (
+            loaded.queries,
+            loaded.memory_bank,
+            loaded.expected_squared_l2_distances,
+            loaded.expected_indices,
+        ),
+        (
+            _CANONICAL_QUERIES,
+            _CANONICAL_BANK,
+            _CANONICAL_DISTANCES,
+            _CANONICAL_INDICES,
+        ),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert actual.flags.c_contiguous
+
+    fixture_bytes = (
+        files["manifest.json"].read_bytes() + files["tensors.bin"].read_bytes()
+    )
+    for forbidden in (
+        b"mvtec",
+        b"accepted_run",
+        b"run_id",
+        b"weight",
+        b"\x89PNG\r\n\x1a\n",
+        b"\xff\xd8\xff",
+    ):
+        assert forbidden not in fixture_bytes.lower()
+
+
+def test_committed_fixture_raw_bytes_reload_independently() -> None:
+    manifest = json.loads((_COMMITTED_FIXTURE / "manifest.json").read_bytes())
+    payload = (_COMMITTED_FIXTURE / "tensors.bin").read_bytes()
+    expected_arrays = (
+        _CANONICAL_QUERIES,
+        _CANONICAL_BANK,
+        _CANONICAL_DISTANCES,
+        _CANONICAL_INDICES,
+    )
+    assert [entry["offset_bytes"] for entry in manifest["tensors"]] == [
+        0,
+        128,
+        320,
+        384,
+    ]
+    assert len(payload) == manifest["payload"]["nbytes"] == 416
+    assert hashlib.sha256(payload).hexdigest() == manifest["payload"]["sha256"]
+
+    cursor = 0
+    for entry, expected in zip(manifest["tensors"], expected_arrays, strict=True):
+        offset = entry["offset_bytes"]
+        end = offset + entry["nbytes"]
+        assert offset % manifest["payload"]["alignment_bytes"] == 0
+        assert payload[cursor:offset] == bytes(offset - cursor)
+        assert entry["byte_order"] == "little"
+        assert entry["layout"] == "C"
+        assert entry["shape"] == list(expected.shape)
+        assert entry["dtype"] == (
+            "int64" if expected.dtype == np.dtype("<i8") else "float32"
+        )
+        assert hashlib.sha256(payload[offset:end]).hexdigest() == entry["sha256"]
+        dtype = "<i8" if entry["dtype"] == "int64" else "<f4"
+        raw = np.frombuffer(payload[offset:end], dtype=dtype).reshape(entry["shape"])
+        assert raw.dtype == expected.dtype
+        assert raw.flags.c_contiguous
+        np.testing.assert_array_equal(raw, expected)
+        cursor = end
+    assert cursor == len(payload)
+
+
+def test_committed_fixture_regenerates_and_matches_reference(tmp_path: Path) -> None:
+    regenerated = tmp_path / "retrieval_v1"
+    digest = write_retrieval_fixture(_committed_fixture(), regenerated)
+    for name in ("manifest.json", "tensors.bin"):
+        assert (regenerated / name).read_bytes() == (
+            _COMMITTED_FIXTURE / name
+        ).read_bytes()
+    committed_manifest = (_COMMITTED_FIXTURE / "manifest.json").read_bytes()
+    committed_payload = (_COMMITTED_FIXTURE / "tensors.bin").read_bytes()
+    assert digest == hashlib.sha256(committed_manifest + committed_payload).hexdigest()
+
+    import torch
+
+    from inspectrt.retrieval import exact_top1_squared_l2
+
+    queries = torch.from_numpy(_CANONICAL_QUERIES)
+    bank = torch.from_numpy(_CANONICAL_BANK)
+    distances, indices = exact_top1_squared_l2(queries, bank, bank_chunk_size=3)
+    assert torch.equal(distances, torch.from_numpy(_CANONICAL_DISTANCES))
+    assert torch.equal(indices, torch.from_numpy(_CANONICAL_INDICES))
+    all_distances = torch.cdist(queries, bank).square()
+    assert all_distances[0, 0] == all_distances[0, 2] == 1
+    assert all_distances[1, 0] == all_distances[1, 4] == 4
+    assert indices[0] == indices[1] == 0
+    assert len(_CANONICAL_BANK) % 3 == 1
+    assert indices[3] == 6
 
 
 def test_deterministic_write_and_load_recovers_exact_contract(tmp_path: Path) -> None:
