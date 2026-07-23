@@ -16,13 +16,9 @@ _SYNTHETIC_RECIPE = "inspectrt_synthetic_correctness_v1"
 _TENSOR_NAMES = (
     "queries memory_bank expected_squared_l2_distances expected_indices".split()
 )
-_ARTIFACT_NAMES = {
-    "benchmark.json",
-    "memory_bank.pt",
-    "retrieval.pt",
-    "run.json",
-    "samples.jsonl",
-}
+_ARTIFACT_NAMES = set(
+    "benchmark.json memory_bank.pt retrieval.pt run.json samples.jsonl".split()
+)
 _DEPENDENCIES = {"inspectrt", "numpy", "pillow", "scikit-learn", "torch", "torchvision"}
 _DETERMINISM = {
     "allow_tf32": False,
@@ -444,8 +440,8 @@ def _parse_real_source(source: dict[str, object]) -> RealApplicationFixtureSourc
         _string(source[name], f"source.{name}")
     dependencies = _object(source["dependency_versions"], "source.dependency_versions")
     _keys(dependencies, _DEPENDENCIES, "source.dependency_versions")
-    if any(not isinstance(value, str) or not value for value in dependencies.values()):
-        raise ValueError("dependency versions must be nonempty strings")
+    for name, value in dependencies.items():
+        _string(value, f"source.dependency_versions.{name}")
     determinism = _object(source["determinism"], "source.determinism")
     _keys(determinism, set(_DETERMINISM), "source.determinism")
     if any(
@@ -542,6 +538,8 @@ def _validate_arrays(fixture: RetrievalFixture) -> tuple[int, int, int]:
         raise ValueError("retrieval inputs must contain only finite values")
     if not np.isfinite(fixture.expected_squared_l2_distances).all():
         raise ValueError("expected distances must contain only finite values")
+    if np.any(fixture.expected_squared_l2_distances < 0):
+        raise ValueError("expected squared-L2 distances must be nonnegative")
     if np.any(fixture.expected_indices < 0) or np.any(fixture.expected_indices >= m):
         raise ValueError("expected indices must lie within the memory bank")
     _integer(
