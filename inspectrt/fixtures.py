@@ -7,6 +7,10 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import re
+import shutil
+import subprocess
+import tempfile
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -37,6 +41,23 @@ _COMMIT = re.compile(r"[0-9a-f]{40}")
 _FIXTURE_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _FLOAT32 = np.dtype("<f4")
 _INT64 = np.dtype("<i8")
+_RUN_FILES = {
+    "anomaly_maps.pt",
+    "benchmark.json",
+    "memory_bank.pt",
+    "metrics.json",
+    "predictions.jsonl",
+    "retrieval.pt",
+    "run.json",
+    "samples.jsonl",
+}
+_REAL_CATEGORY = "bottle"
+_REAL_Q = 1024
+_REAL_M = 214016
+_REAL_D = 512
+_REAL_CHUNK_SIZE = 16384
+_WEIGHT_ENUM = "ResNet50_Weights.IMAGENET1K_V2"
+_WEIGHT_URL = "https://download.pytorch.org/models/resnet50-11ad3fa6.pth"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +129,19 @@ class LoadedRetrievalFixture:
     expected_indices: NDArray[np.int64]
     manifest: Mapping[str, object]
     fixture_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedRunFixtureSource:
+    """Validated accepted-run data needed to publish one real fixture."""
+
+    metadata: RetrievalFixtureMetadata
+    memory_bank: Any
+    expected_squared_l2_distances: Any
+    expected_indices: Any
+    image_path: Path
+    run_directory: Path
+    source_hashes: Mapping[str, str]
 
 
 def real_fixture_id(category: str, sample_id: str, source_commit: str) -> str:
@@ -242,6 +276,697 @@ def load_retrieval_fixture(directory: Path) -> LoadedRetrievalFixture:
         manifest,
         hashlib.sha256(manifest_bytes + payload).hexdigest(),
     )
+
+
+def prepare_accepted_run_fixture(
+    *,
+    run_directory: Path,
+    dataset_root: Path,
+    sample_id: str,
+    config_path: Path,
+    repository_root: Path,
+    generator_commit: str,
+    generator_dirty: bool,
+    current_lock_sha256: str,
+    torch: Any,
+) -> AcceptedRunFixtureSource:
+    """Validate one accepted benchmark bundle before model construction."""
+    if not run_directory.is_dir() or run_directory.is_symlink():
+        raise ValueError(f"source run must be a real directory: {run_directory}")
+    paths = {path.name: path for path in run_directory.iterdir()}
+    if set(paths) != _RUN_FILES:
+        raise ValueError(
+            "source run files are invalid; "
+            f"missing={sorted(_RUN_FILES - set(paths))}, "
+            f"unexpected={sorted(set(paths) - _RUN_FILES)}"
+        )
+    if any(path.is_symlink() or not path.is_file() for path in paths.values()):
+        raise ValueError("source run artifacts must be regular files")
+    source_hashes = _source_hashes(run_directory)
+    run = _parse_manifest(paths["run.json"].read_bytes())
+    benchmark = _parse_manifest(paths["benchmark.json"].read_bytes())
+    _validate_run_metadata(run, benchmark, run_directory.name, current_lock_sha256)
+
+    config_bytes = config_path.read_bytes()
+    expected_config = repository_root / "configs" / "baseline.toml"
+    if config_path.resolve() != expected_config.resolve():
+        raise ValueError(f"config must be the committed baseline: {expected_config}")
+    source_commit = run["source"]["git_commit"]
+    if (
+        _git_blob(repository_root, source_commit, "configs/baseline.toml")
+        != config_bytes
+    ):
+        raise ValueError("baseline configuration differs from the accepted source")
+    if (
+        _git_blob(repository_root, generator_commit, "configs/baseline.toml")
+        != config_bytes
+    ):
+        raise ValueError("baseline configuration differs from the generator commit")
+    if generator_dirty:
+        raise ValueError("fixture generator working tree must be clean")
+
+    samples_bytes = paths["samples.jsonl"].read_bytes()
+    inventory_digest = hashlib.sha256(samples_bytes).hexdigest()
+    if inventory_digest != run["inventory"]["sample_inventory_sha256"]:
+        raise ValueError("sample inventory SHA-256 mismatch")
+    samples = _parse_json_lines(samples_bytes)
+    inventory_matches = [
+        record for record in samples if record.get("sample_id") == sample_id
+    ]
+    if len(inventory_matches) != 1:
+        raise ValueError("sample ID must occur exactly once in the source inventory")
+    sample_record = inventory_matches[0]
+    if (
+        sample_record.get("category") != _REAL_CATEGORY
+        or sample_record.get("split") != "test"
+        or not isinstance(sample_record.get("image_relpath"), str)
+    ):
+        raise ValueError("source sample inventory record is invalid")
+    _relative_posix(sample_record["image_relpath"], "source image_relpath")
+    image_path = dataset_root / sample_record["image_relpath"]
+    if not image_path.is_file() or image_path.is_symlink():
+        raise FileNotFoundError(f"source dataset image not found: {image_path}")
+
+    cached_weight = (
+        Path(torch.hub.get_dir())
+        / "checkpoints"
+        / PurePosixPath(run["weights"]["source_url"]).name
+    )
+    if not cached_weight.is_file() or cached_weight.is_symlink():
+        raise FileNotFoundError(
+            f"cached official weight file not found: {cached_weight}"
+        )
+    if _file_sha256(cached_weight) != run["weights"]["cached_file_sha256"]:
+        raise ValueError("cached official weight SHA-256 mismatch")
+
+    bank_payload = torch.load(
+        paths["memory_bank.pt"], map_location="cpu", weights_only=True
+    )
+    retrieval_payload = torch.load(
+        paths["retrieval.pt"], map_location="cpu", weights_only=True
+    )
+    memory_bank, distances, indices, test_index = _validate_source_tensors(
+        bank_payload, retrieval_payload, run, benchmark, sample_id, torch
+    )
+    source = RealApplicationFixtureSource(
+        category=_REAL_CATEGORY,
+        sample_id=sample_id,
+        test_tensor_index=test_index,
+        accepted_run_id=run["run_id"],
+        source_commit=source_commit,
+        source_dirty=False,
+        inventory_sha256=inventory_digest,
+        uv_lock_sha256=current_lock_sha256,
+        weight_enum=run["weights"]["enum"],
+        weight_file_sha256=run["weights"]["cached_file_sha256"],
+        baseline_profile=run["profile_id"],
+        configuration_sha256=hashlib.sha256(config_bytes).hexdigest(),
+        preprocessing_identity=run["preprocessing_profile"],
+        feature_layer=run["feature_layer"],
+        source_image_sha256=_file_sha256(image_path),
+        python_version=run["environment"]["python_version"],
+        dependency_versions=dict(run["environment"]["dependency_versions"]),
+        platform_description=run["environment"]["platform_description"],
+        requested_device=run["device"],
+        determinism=dict(run["determinism"]),
+        cuda_device_name=benchmark["environment"]["cuda_device_name"],
+        cuda_compute_capability=tuple(
+            benchmark["environment"]["cuda_compute_capability"]
+        ),
+        pytorch_cuda_runtime_version=benchmark["environment"][
+            "pytorch_cuda_runtime_version"
+        ],
+        source_artifact_sha256=source_hashes,
+    )
+    metadata = RetrievalFixtureMetadata(
+        real_fixture_id(_REAL_CATEGORY, sample_id, source_commit),
+        "real_application",
+        _REAL_CHUNK_SIZE,
+        source,
+        FixtureGenerator(_MILESTONE, 1, generator_commit, False),
+    )
+    return AcceptedRunFixtureSource(
+        metadata,
+        memory_bank,
+        distances,
+        indices,
+        image_path,
+        run_directory,
+        source_hashes,
+    )
+
+
+def publish_accepted_run_fixture(
+    source: AcceptedRunFixtureSource,
+    queries: Any,
+    recomputed_distances: Any,
+    recomputed_indices: Any,
+    output_root: Path,
+) -> tuple[Path, LoadedRetrievalFixture]:
+    """Require exact source parity and atomically publish one real fixture."""
+    import torch
+
+    _torch_tensor(
+        queries, "queries", (_REAL_Q, _REAL_D), torch.float32, torch, finite=True
+    )
+    _torch_tensor(
+        source.memory_bank,
+        "memory bank",
+        (_REAL_M, _REAL_D),
+        torch.float32,
+        torch,
+        finite=True,
+    )
+    _torch_tensor(
+        recomputed_distances,
+        "recomputed distances",
+        (_REAL_Q,),
+        torch.float32,
+        torch,
+        finite=True,
+    )
+    _torch_tensor(
+        recomputed_indices,
+        "recomputed indices",
+        (_REAL_Q,),
+        torch.int64,
+        torch,
+    )
+    if (
+        recomputed_indices.min().item() < 0
+        or recomputed_indices.max().item() >= _REAL_M
+    ):
+        raise ValueError("recomputed indices lie outside the memory bank")
+    if not torch.equal(recomputed_indices, source.expected_indices):
+        raise ValueError("reference index mismatch")
+    if not torch.equal(recomputed_distances, source.expected_squared_l2_distances):
+        raise ValueError("reference distance mismatch")
+
+    fixture = RetrievalFixture(
+        source.metadata,
+        _numpy_tensor(queries, _FLOAT32),
+        _numpy_tensor(source.memory_bank, _FLOAT32),
+        _numpy_tensor(recomputed_distances, _FLOAT32),
+        _numpy_tensor(recomputed_indices, _INT64),
+    )
+    parent = output_root / "fixtures" / _MILESTONE
+    parent.mkdir(parents=True, exist_ok=True)
+    destination = parent / source.metadata.fixture_id
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"fixture directory already exists: {destination}")
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{source.metadata.fixture_id}.tmp-", dir=parent)
+    )
+    try:
+        write_retrieval_fixture(fixture, temporary)
+        loaded = load_retrieval_fixture(temporary)
+        for actual, expected in zip(
+            (
+                loaded.queries,
+                loaded.memory_bank,
+                loaded.expected_squared_l2_distances,
+                loaded.expected_indices,
+            ),
+            (
+                fixture.queries,
+                fixture.memory_bank,
+                fixture.expected_squared_l2_distances,
+                fixture.expected_indices,
+            ),
+            strict=True,
+        ):
+            if not np.array_equal(actual, expected):
+                raise ValueError("raw fixture reload differs from source tensors")
+        if _source_hashes(source.run_directory) != dict(source.source_hashes):
+            raise ValueError("source artifacts changed during fixture export")
+        from inspectrt.artifacts import _rename_without_overwrite
+
+        _rename_without_overwrite(temporary, destination)
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    return destination, loaded
+
+
+def reconstruct_fixture_query(image_path: Path, extractor: Any, device: Any) -> Any:
+    """Reconstruct the canonical query through the frozen baseline pipeline."""
+    from inspectrt.features import extract_patch_embeddings
+    from inspectrt.preprocessing import decode_image, preprocess_decoded_image
+
+    decoded = decode_image(image_path)
+    try:
+        image = preprocess_decoded_image(decoded)
+    finally:
+        decoded.image.close()
+    queries = extract_patch_embeddings(extractor, image.unsqueeze(0).to(device))[0]
+    return queries.contiguous()
+
+
+def basic_environment_mismatches(
+    source: RealApplicationFixtureSource,
+    *,
+    requested_device: str,
+    current_lock_sha256: str,
+    python_version: str,
+    dependency_versions: Mapping[str, str],
+    platform_description: str,
+) -> list[str]:
+    """Compare real reference identity without importing or initializing CUDA."""
+    mismatches = []
+    values = (
+        ("requested_device", requested_device, source.requested_device),
+        ("uv_lock_sha256", current_lock_sha256, source.uv_lock_sha256),
+        ("python_version", python_version, source.python_version),
+        (
+            "dependency_versions",
+            dict(dependency_versions),
+            dict(source.dependency_versions),
+        ),
+        ("platform_description", platform_description, source.platform_description),
+    )
+    for name, actual, expected in values:
+        if actual != expected:
+            mismatches.append(name)
+    return mismatches
+
+
+def cuda_environment_mismatches(
+    source: RealApplicationFixtureSource, device: Any, torch: Any
+) -> list[str]:
+    """Compare the recorded CUDA identity after availability is established."""
+    mismatches = []
+    index = device.index
+    values = (
+        (
+            "cuda_device_name",
+            torch.cuda.get_device_name(index),
+            source.cuda_device_name,
+        ),
+        (
+            "cuda_compute_capability",
+            tuple(torch.cuda.get_device_capability(index)),
+            source.cuda_compute_capability,
+        ),
+        (
+            "pytorch_cuda_runtime_version",
+            torch.version.cuda,
+            source.pytorch_cuda_runtime_version,
+        ),
+    )
+    for name, actual, expected in values:
+        if actual != expected:
+            mismatches.append(name)
+    return mismatches
+
+
+def _validate_run_metadata(
+    run: dict[str, object],
+    benchmark: dict[str, object],
+    directory_name: str,
+    current_lock_sha256: str,
+) -> None:
+    _keys(
+        run,
+        {
+            "bank_chunk_size",
+            "batch_size",
+            "benchmark",
+            "category",
+            "dataset_root",
+            "determinism",
+            "device",
+            "environment",
+            "feature_extractor",
+            "feature_layer",
+            "inventory",
+            "map_interpolation",
+            "preprocessing_profile",
+            "profile_id",
+            "retrieval_semantics",
+            "run_id",
+            "schema_version",
+            "source",
+            "tensors",
+            "weights",
+        },
+        "run.json",
+    )
+    fixed = {
+        "schema_version": 1,
+        "run_id": directory_name,
+        "profile_id": "inspectrt_feature_memory_v1",
+        "preprocessing_profile": "inspectrt_resize256_v1",
+        "feature_extractor": "ResNet-50",
+        "feature_layer": "layer2",
+        "retrieval_semantics": "exact top-1 squared L2",
+        "category": _REAL_CATEGORY,
+        "device": "cuda:0",
+        "bank_chunk_size": _REAL_CHUNK_SIZE,
+        "batch_size": 1,
+    }
+    if any(run[name] != value for name, value in fixed.items()):
+        raise ValueError("source run does not identify the frozen bottle baseline")
+    _component(run["run_id"], "run.run_id")
+
+    source = _object(run["source"], "run.source")
+    _keys(source, {"dirty", "git_commit", "uv_lock_sha256"}, "run.source")
+    if source["dirty"] is not False:
+        raise ValueError("accepted source run must record a clean source state")
+    _commit(source["git_commit"], "run.source.git_commit")
+    _hash(source["uv_lock_sha256"], "run.source.uv_lock_sha256")
+    _hash(current_lock_sha256, "current_lock_sha256")
+    if source["uv_lock_sha256"] != current_lock_sha256:
+        raise ValueError("current uv.lock SHA-256 differs from the accepted source")
+
+    determinism = _object(run["determinism"], "run.determinism")
+    _keys(determinism, set(_DETERMINISM), "run.determinism")
+    if any(
+        type(determinism[name]) is not type(value) or determinism[name] != value
+        for name, value in _DETERMINISM.items()
+    ):
+        raise ValueError("source determinism does not match the frozen baseline")
+
+    environment = _object(run["environment"], "run.environment")
+    _keys(
+        environment,
+        {
+            "created_at_utc",
+            "dependency_versions",
+            "platform_description",
+            "python_version",
+        },
+        "run.environment",
+    )
+    for name in ("created_at_utc", "platform_description", "python_version"):
+        _string(environment[name], f"run.environment.{name}")
+    dependencies = _object(
+        environment["dependency_versions"], "run.environment.dependency_versions"
+    )
+    _keys(dependencies, _DEPENDENCIES, "run.environment.dependency_versions")
+    for name, value in dependencies.items():
+        _string(value, f"run.environment.dependency_versions.{name}")
+
+    weights = _object(run["weights"], "run.weights")
+    _keys(weights, {"cached_file_sha256", "enum", "source_url"}, "run.weights")
+    if weights["enum"] != _WEIGHT_ENUM or weights["source_url"] != _WEIGHT_URL:
+        raise ValueError("source weight identity does not match IMAGENET1K_V2")
+    _hash(weights["cached_file_sha256"], "run.weights.cached_file_sha256")
+
+    inventory = _object(run["inventory"], "run.inventory")
+    _keys(
+        inventory,
+        {
+            "anomalous_test_sample_count",
+            "sample_inventory_sha256",
+            "test_good_sample_count",
+            "test_sample_count",
+            "total_sample_count",
+            "training_sample_count",
+        },
+        "run.inventory",
+    )
+    _hash(inventory["sample_inventory_sha256"], "run.inventory digest")
+    for name in set(inventory) - {"sample_inventory_sha256"}:
+        _integer(inventory[name], f"run.inventory.{name}", positive=True)
+
+    benchmark_record = _object(run["benchmark"], "run.benchmark")
+    _keys(
+        benchmark_record,
+        {"artifact", "schema_version", "timing_device"},
+        "run.benchmark",
+    )
+    if benchmark_record != {
+        "artifact": "benchmark.json",
+        "schema_version": 1,
+        "timing_device": "cuda:0",
+    }:
+        raise ValueError("source run is not an accepted benchmark bundle")
+
+    tensors = _object(run["tensors"], "run.tensors")
+    expected_tensor_names = {
+        "anomaly_maps",
+        "evaluation_masks",
+        "image_scores",
+        "memory_bank",
+        "nearest_bank_indices",
+        "patch_distances",
+        "test_labels",
+    }
+    _keys(tensors, expected_tensor_names, "run.tensors")
+    bank = _object(tensors["memory_bank"], "run.tensors.memory_bank")
+    _keys(bank, {"byte_count", "dtype", "shape"}, "run.tensors.memory_bank")
+    if bank != {
+        "byte_count": _REAL_M * _REAL_D * 4,
+        "dtype": "float32",
+        "shape": [_REAL_M, _REAL_D],
+    }:
+        raise ValueError("source bank tensor metadata is invalid")
+    test_count = inventory["test_sample_count"]
+    for name, dtype, shape in (
+        ("patch_distances", "float32", [test_count, _REAL_Q]),
+        ("nearest_bank_indices", "int64", [test_count, _REAL_Q]),
+    ):
+        record = _object(tensors[name], f"run.tensors.{name}")
+        _keys(record, {"dtype", "shape"}, f"run.tensors.{name}")
+        if record != {"dtype": dtype, "shape": shape}:
+            raise ValueError(f"source {name} tensor metadata is invalid")
+
+    _keys(
+        benchmark,
+        {
+            "benchmark_sample_id",
+            "category",
+            "created_at_utc",
+            "device",
+            "environment",
+            "methodology",
+            "profile_id",
+            "results",
+            "run_id",
+            "schema_version",
+            "workload",
+        },
+        "benchmark.json",
+    )
+    benchmark_fixed = {
+        "schema_version": 1,
+        "run_id": run["run_id"],
+        "category": _REAL_CATEGORY,
+        "profile_id": "inspectrt_feature_memory_v1",
+        "device": "cuda:0",
+        "created_at_utc": environment["created_at_utc"],
+    }
+    if any(benchmark[name] != value for name, value in benchmark_fixed.items()):
+        raise ValueError("benchmark identity differs from run.json")
+    _relative_posix(benchmark["benchmark_sample_id"], "benchmark_sample_id")
+    benchmark_environment = _object(benchmark["environment"], "benchmark.environment")
+    _keys(
+        benchmark_environment,
+        {
+            "cuda_compute_capability",
+            "cuda_device_name",
+            "pytorch_cuda_runtime_version",
+        },
+        "benchmark.environment",
+    )
+    _string(benchmark_environment["cuda_device_name"], "benchmark CUDA device")
+    _string(
+        benchmark_environment["pytorch_cuda_runtime_version"],
+        "benchmark CUDA runtime",
+    )
+    capability = benchmark_environment["cuda_compute_capability"]
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or any(type(value) is not int or value < 0 for value in capability)
+    ):
+        raise ValueError("benchmark compute capability is invalid")
+    workload = _object(benchmark["workload"], "benchmark.workload")
+    _keys(
+        workload,
+        {
+            "D",
+            "M",
+            "Q",
+            "bank_bytes",
+            "bank_chunk_size",
+            "bank_shape",
+            "batch_size",
+            "dtype",
+            "k",
+            "tensor_layout",
+            "test_sample_count",
+            "training_sample_count",
+        },
+        "benchmark.workload",
+    )
+    workload_fixed = {
+        "Q": _REAL_Q,
+        "M": _REAL_M,
+        "D": _REAL_D,
+        "k": 1,
+        "bank_chunk_size": _REAL_CHUNK_SIZE,
+        "bank_shape": [_REAL_M, _REAL_D],
+        "bank_bytes": _REAL_M * _REAL_D * 4,
+        "batch_size": 1,
+        "dtype": "float32",
+        "test_sample_count": inventory["test_sample_count"],
+        "training_sample_count": inventory["training_sample_count"],
+    }
+    if any(workload[name] != value for name, value in workload_fixed.items()):
+        raise ValueError("benchmark workload does not match the frozen baseline")
+    _object(benchmark["methodology"], "benchmark.methodology")
+    _object(benchmark["results"], "benchmark.results")
+
+
+def _validate_source_tensors(
+    bank_payload: object,
+    retrieval_payload: object,
+    run: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    sample_id: str,
+    torch: Any,
+) -> tuple[Any, Any, Any, int]:
+    if not isinstance(bank_payload, dict):
+        raise TypeError("memory_bank.pt must contain an object")
+    _keys(
+        bank_payload,
+        {
+            "dtype",
+            "embedding_dimension",
+            "memory_bank",
+            "patches_per_training_sample",
+            "shape",
+        },
+        "memory_bank.pt",
+    )
+    fixed = {
+        "dtype": "float32",
+        "embedding_dimension": _REAL_D,
+        "patches_per_training_sample": _REAL_Q,
+        "shape": [_REAL_M, _REAL_D],
+    }
+    if any(bank_payload[name] != value for name, value in fixed.items()):
+        raise ValueError("memory_bank.pt metadata is invalid")
+    memory_bank = bank_payload["memory_bank"]
+    _torch_tensor(
+        memory_bank,
+        "memory bank",
+        (_REAL_M, _REAL_D),
+        torch.float32,
+        torch,
+        finite=True,
+    )
+
+    if not isinstance(retrieval_payload, dict):
+        raise TypeError("retrieval.pt must contain an object")
+    _keys(
+        retrieval_payload,
+        {"nearest_bank_indices", "patch_distances", "test_sample_ids"},
+        "retrieval.pt",
+    )
+    test_ids = retrieval_payload["test_sample_ids"]
+    test_count = run["inventory"]["test_sample_count"]
+    if (
+        not isinstance(test_ids, list)
+        or len(test_ids) != test_count
+        or any(not isinstance(value, str) for value in test_ids)
+    ):
+        raise ValueError("retrieval test_sample_ids are invalid")
+    matches = [index for index, value in enumerate(test_ids) if value == sample_id]
+    if len(matches) != 1:
+        raise ValueError("sample ID must occur exactly once in retrieval rows")
+    if benchmark["benchmark_sample_id"] != sample_id:
+        raise ValueError("requested sample does not match the benchmark sample")
+    distances = retrieval_payload["patch_distances"]
+    indices = retrieval_payload["nearest_bank_indices"]
+    _torch_tensor(
+        distances,
+        "retrieval distances",
+        (test_count, _REAL_Q),
+        torch.float32,
+        torch,
+        finite=True,
+    )
+    _torch_tensor(
+        indices,
+        "retrieval indices",
+        (test_count, _REAL_Q),
+        torch.int64,
+        torch,
+    )
+    if distances.min().item() < 0:
+        raise ValueError("retrieval squared distances must be nonnegative")
+    if indices.min().item() < 0 or indices.max().item() >= _REAL_M:
+        raise ValueError("retrieval indices lie outside the memory bank")
+    index = matches[0]
+    return (
+        memory_bank,
+        distances[index].contiguous(),
+        indices[index].contiguous(),
+        index,
+    )
+
+
+def _torch_tensor(
+    value: object,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: object,
+    torch: Any,
+    *,
+    finite: bool = False,
+) -> None:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tuple(value.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}; got {tuple(value.shape)}")
+    if value.dtype != dtype:
+        raise TypeError(f"{name} must use {dtype}; got {value.dtype}")
+    if value.device.type != "cpu":
+        raise ValueError(f"{name} must be on the CPU")
+    if not value.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if finite and not torch.isfinite(value).all().item():
+        raise ValueError(f"{name} must contain only finite values")
+
+
+def _numpy_tensor(tensor: Any, dtype: np.dtype[Any]) -> np.ndarray[Any, Any]:
+    array = tensor.detach().numpy()
+    if array.dtype != dtype or not array.flags.c_contiguous:
+        raise ValueError("raw export tensor does not match its storage contract")
+    return array
+
+
+def _parse_json_lines(payload: bytes) -> list[dict[str, object]]:
+    if not payload or not payload.endswith(b"\n"):
+        raise ValueError("samples.jsonl must be nonempty canonical JSONL")
+    return [_parse_manifest(line) for line in payload.splitlines(keepends=True)]
+
+
+def _source_hashes(run_directory: Path) -> dict[str, str]:
+    return {
+        name: _file_sha256(run_directory / name) for name in sorted(_ARTIFACT_NAMES)
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _git_blob(repository_root: Path, commit: str, path: str) -> bytes:
+    result = subprocess.run(
+        ("git", "show", f"{commit}:{path}"),
+        cwd=repository_root,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip() or "unknown error"
+        raise ValueError(f"cannot read committed baseline configuration: {detail}")
+    return result.stdout
 
 
 def _validate_encoded(
@@ -438,6 +1163,8 @@ def _parse_real_source(source: dict[str, object]) -> RealApplicationFixtureSourc
         "pytorch_cuda_runtime_version",
     ):
         _string(source[name], f"source.{name}")
+    if source["weight_enum"] != _WEIGHT_ENUM or source["requested_device"] != "cuda:0":
+        raise ValueError("real source must use IMAGENET1K_V2 on explicit cuda:0")
     dependencies = _object(source["dependency_versions"], "source.dependency_versions")
     _keys(dependencies, _DEPENDENCIES, "source.dependency_versions")
     for name, value in dependencies.items():

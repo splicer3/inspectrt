@@ -196,15 +196,156 @@ def test_fixture_command_help_and_action_surface() -> None:
     root = _console("--help")
     group = _console("fixture", "--help")
     validate = _console("fixture", "validate", "--help")
+    export = _console("fixture", "export", "--help")
     assert root.returncode == group.returncode == validate.returncode == 0
+    assert export.returncode == 0
     assert "fixture" in root.stdout
-    assert "{validate}" in group.stdout
+    assert "{validate,export}" in group.stdout
     assert "--fixture" in validate.stdout
     assert "--device" in validate.stdout
-    for action in ("export", "inspect", "generate"):
+    for argument in (
+        "--config",
+        "--run-dir",
+        "--dataset-root",
+        "--sample-id",
+        "--device",
+        "--output-root",
+    ):
+        assert argument in export.stdout
+    for action in ("inspect", "generate"):
         result = _console("fixture", action)
         assert result.returncode == 2
         assert "invalid choice" in result.stderr
+
+
+def test_fixture_export_requires_all_six_arguments() -> None:
+    values = {
+        "--config": str(_PROFILE),
+        "--run-dir": "run",
+        "--dataset-root": "dataset",
+        "--sample-id": "sample",
+        "--device": "cuda:0",
+        "--output-root": "outputs",
+    }
+    for omitted in values:
+        arguments = ["fixture", "export"]
+        for name, value in values.items():
+            if name != omitted:
+                arguments.extend((name, value))
+        result = _console(*arguments)
+        assert result.returncode == 2
+        assert omitted in result.stderr
+
+
+def _export_arguments(*, run_directory: str = "run") -> list[str]:
+    return [
+        "fixture",
+        "export",
+        "--config",
+        str(_PROFILE),
+        "--run-dir",
+        run_directory,
+        "--dataset-root",
+        "dataset",
+        "--sample-id",
+        "mvtec_ad/bottle/test/broken_large/000.png",
+        "--device",
+        "cuda:0",
+        "--output-root",
+        "outputs",
+    ]
+
+
+def test_controlled_fixture_export_returns_accepted_identity(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def export(arguments: object, config: cli.BaselineConfig) -> int:
+        assert config == cli.load_baseline_config(_PROFILE)
+        print("fixture_id=bottle-broken-large-000-bc330b9070c5")
+        print("fixture_class=real_application")
+        print("source_run=accepted-run")
+        print("Q=2")
+        print("M=3")
+        print("D=2")
+        print("k=1")
+        print(f"payload_sha256={'a' * 64}")
+        print(f"fixture_digest={'b' * 64}")
+        print("indices=exact")
+        print("distances=exact")
+        print("status=accepted")
+        return 0
+
+    monkeypatch.setattr(cli, "_export_fixture", export)
+    assert cli.main(_export_arguments()) == 0
+    output = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    assert output["fixture_id"] == "bottle-broken-large-000-bc330b9070c5"
+    assert output["source_run"] == "accepted-run"
+    assert (output["Q"], output["M"], output["D"], output["k"]) == (
+        "2",
+        "3",
+        "2",
+        "1",
+    )
+    assert output["indices"] == output["distances"] == "exact"
+    assert output["status"] == "accepted"
+
+
+def test_fixture_export_missing_source_is_concise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_repository_metadata",
+        lambda cwd: (
+            _ROOT,
+            _git(_ROOT, "rev-parse", "HEAD"),
+            False,
+            hashlib.sha256((_ROOT / "uv.lock").read_bytes()).hexdigest(),
+        ),
+    )
+    assert cli.main(_export_arguments(run_directory=str(tmp_path / "missing"))) == 1
+    captured = capsys.readouterr()
+    assert "source run must be a real directory" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    (
+        ("evaluation-only source run", "evaluation-only"),
+        ("reference distance mismatch", "reference distance mismatch"),
+        ("fixture directory already exists", "already exists"),
+    ),
+)
+def test_fixture_export_expected_failures_return_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    message: str,
+    expected: str,
+) -> None:
+    def fail(*args: object) -> int:
+        raise ValueError(message)
+
+    monkeypatch.setattr(cli, "_export_fixture", fail)
+    assert cli.main(_export_arguments()) == 1
+    captured = capsys.readouterr()
+    assert expected in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_fixture_export_rejects_dirty_generator_before_runtime_work(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_repository_metadata",
+        lambda cwd: (_ROOT, "f" * 40, True, "a" * 64),
+    )
+    assert cli.main(_export_arguments()) == 1
+    assert "working tree must be clean" in capsys.readouterr().err
 
 
 def test_fixture_validate_requires_both_arguments() -> None:
@@ -314,7 +455,7 @@ def test_fixture_reference_mismatch_fails(
     assert "status=accepted" not in result.stdout
 
 
-def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) -> None:
+def _real_cli_fixture(tmp_path: Path) -> tuple[Path, object]:
     from inspectrt.fixtures import (
         RealApplicationFixtureSource,
         RetrievalFixture,
@@ -326,6 +467,7 @@ def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) ->
 
     loaded = load_retrieval_fixture(_RETRIEVAL_FIXTURE)
     source_commit = "a" * 40
+    lock_digest = hashlib.sha256((_ROOT / "uv.lock").read_bytes()).hexdigest()
     source = RealApplicationFixtureSource(
         category="bottle",
         sample_id="mvtec_ad/bottle/test/crack/000.png",
@@ -334,7 +476,7 @@ def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) ->
         source_commit=source_commit,
         source_dirty=False,
         inventory_sha256="b" * 64,
-        uv_lock_sha256="c" * 64,
+        uv_lock_sha256=lock_digest,
         weight_enum="ResNet50_Weights.IMAGENET1K_V2",
         weight_file_sha256="d" * 64,
         baseline_profile="inspectrt_feature_memory_v1",
@@ -342,9 +484,9 @@ def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) ->
         preprocessing_identity="inspectrt_resize256_v1",
         feature_layer="layer2",
         source_image_sha256="f" * 64,
-        python_version="3.11.15",
+        python_version=cli.platform.python_version(),
         dependency_versions={
-            name: "1"
+            name: metadata.version(name)
             for name in (
                 "inspectrt",
                 "numpy",
@@ -354,7 +496,7 @@ def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) ->
                 "torchvision",
             )
         },
-        platform_description="test platform",
+        platform_description=cli.platform.platform(),
         requested_device="cuda:0",
         determinism={
             "allow_tf32": False,
@@ -385,7 +527,7 @@ def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) ->
             )
         },
     )
-    metadata = RetrievalFixtureMetadata(
+    fixture_metadata = RetrievalFixtureMetadata(
         real_fixture_id(source.category, source.sample_id, source_commit),
         "real_application",
         3,
@@ -395,7 +537,7 @@ def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) ->
     directory = tmp_path / "real"
     write_retrieval_fixture(
         RetrievalFixture(
-            metadata,
+            fixture_metadata,
             loaded.queries,
             loaded.memory_bank,
             loaded.expected_squared_l2_distances,
@@ -403,12 +545,95 @@ def test_real_fixture_reference_acceptance_is_not_implemented(tmp_path: Path) ->
         ),
         directory,
     )
+    return directory, source
+
+
+def test_real_fixture_nonmatching_environment_is_structurally_valid(
+    tmp_path: Path,
+) -> None:
+    directory, _ = _real_cli_fixture(tmp_path)
     result = _console(
         "fixture", "validate", "--fixture", str(directory), "--device", "cpu"
     )
-    assert result.returncode == 1
-    assert "not implemented for fixture class real_application" in result.stderr
+    assert result.returncode == 0, result.stderr
+    output = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert output["fixture_class"] == "real_application"
+    assert output["status"] == "structurally_valid"
+    assert output["reference_status"] == "unavailable"
+    assert "requested_device" in output["environment_mismatches"]
     assert "status=accepted" not in result.stdout
+
+
+def test_real_structural_validation_skips_reference_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory, _ = _real_cli_fixture(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_run_fixture_reference",
+        lambda *args: (_ for _ in ()).throw(AssertionError("reference executed")),
+    )
+    assert (
+        cli.main(
+            [
+                "fixture",
+                "validate",
+                "--fixture",
+                str(directory),
+                "--device",
+                "cpu",
+            ]
+        )
+        == 0
+    )
+    assert "reference_status=unavailable" in capsys.readouterr().out
+
+
+def test_real_fixture_matching_environment_requires_exact_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import inspectrt.fixtures as fixture_module
+
+    directory, source = _real_cli_fixture(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_repository_metadata",
+        lambda cwd: (_ROOT, "f" * 40, False, source.uv_lock_sha256),
+    )
+    device = SimpleNamespace(index=0)
+    monkeypatch.setattr(cli, "_resolve_device", lambda requested, torch: device)
+    monkeypatch.setattr(fixture_module, "cuda_environment_mismatches", lambda *args: [])
+    monkeypatch.setattr(
+        cli, "_configure_determinism", lambda *args: dict(source.determinism)
+    )
+    reference_calls: list[object] = []
+    monkeypatch.setattr(
+        cli,
+        "_run_fixture_reference",
+        lambda fixture, actual_device, torch: reference_calls.append(actual_device),
+    )
+    assert (
+        cli.main(
+            [
+                "fixture",
+                "validate",
+                "--fixture",
+                str(directory),
+                "--device",
+                "cuda:0",
+            ]
+        )
+        == 0
+    )
+    output = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    assert output["environment"] == "exact"
+    assert output["indices"] == output["distances"] == "exact"
+    assert output["status"] == "accepted"
+    assert reference_calls == [device]
 
 
 def test_fixture_invalid_device_fails_without_fallback() -> None:

@@ -130,13 +130,24 @@ def _argument_parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(benchmark)
     benchmark.add_argument("--warmup-count", type=_positive_integer, default=5)
     benchmark.add_argument("--repeat-count", type=_positive_integer, default=30)
-    fixture = commands.add_parser("fixture", help="validate retrieval fixtures")
+    fixture = commands.add_parser(
+        "fixture", help="export or validate retrieval fixtures"
+    )
     fixture_commands = fixture.add_subparsers(dest="fixture_command", required=True)
     validate = fixture_commands.add_parser(
         "validate", help="validate a retrieval fixture"
     )
     validate.add_argument("--fixture", required=True, type=Path)
     validate.add_argument("--device", required=True)
+    export = fixture_commands.add_parser(
+        "export", help="export an accepted benchmark run as a retrieval fixture"
+    )
+    export.add_argument("--config", required=True, type=Path)
+    export.add_argument("--run-dir", required=True, type=Path)
+    export.add_argument("--dataset-root", required=True, type=Path)
+    export.add_argument("--sample-id", required=True)
+    export.add_argument("--device", required=True)
+    export.add_argument("--output-root", required=True, type=Path)
     return parser
 
 
@@ -164,7 +175,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
     try:
         if arguments.command == "fixture":
-            return _validate_fixture(arguments)
+            if arguments.fixture_command == "validate":
+                return _validate_fixture(arguments)
+            config = load_baseline_config(arguments.config)
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
+            return _export_fixture(arguments, config)
         config = load_baseline_config(arguments.config)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
         handler = _benchmark if arguments.command == "benchmark" else _evaluate
@@ -184,20 +199,78 @@ def _validate_fixture(arguments: argparse.Namespace) -> int:
     if not fixture_directory.is_dir() or fixture_directory.is_symlink():
         raise ValueError(f"fixture path must be a real directory: {fixture_directory}")
 
-    import torch
-
-    from inspectrt.fixtures import load_retrieval_fixture
-    from inspectrt.retrieval import exact_top1_squared_l2
+    from inspectrt.fixtures import (
+        RealApplicationFixtureSource,
+        basic_environment_mismatches,
+        cuda_environment_mismatches,
+        load_retrieval_fixture,
+    )
 
     fixture = load_retrieval_fixture(fixture_directory)
-    if fixture.metadata.fixture_class != "synthetic_correctness":
-        raise ValueError(
-            "reference acceptance is not implemented for fixture class "
-            f"{fixture.metadata.fixture_class}"
+    if fixture.metadata.fixture_class == "real_application":
+        source = fixture.metadata.source
+        if not isinstance(source, RealApplicationFixtureSource):
+            raise ValueError("real fixture source metadata is malformed")
+        _, _, _, lock_digest = _repository_metadata(Path.cwd())
+        mismatches = basic_environment_mismatches(
+            source,
+            requested_device=arguments.device,
+            current_lock_sha256=lock_digest,
+            python_version=platform.python_version(),
+            dependency_versions={
+                name: importlib_metadata.version(name) for name in _DISTRIBUTIONS
+            },
+            platform_description=platform.platform(),
         )
+        if mismatches:
+            _print_unavailable_fixture(fixture, mismatches)
+            return 0
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = source.determinism[
+            "cublas_workspace_config"
+        ]
+        import numpy as np
+        import torch
+
+        device = _resolve_device(arguments.device, torch)
+        mismatches = cuda_environment_mismatches(source, device, torch)
+        if mismatches:
+            _print_unavailable_fixture(fixture, mismatches)
+            return 0
+        determinism = _configure_determinism(
+            BaselineConfig(
+                1,
+                source.baseline_profile,
+                source.preprocessing_identity,
+                "IMAGENET1K_V2",
+                fixture.metadata.reference_chunk_size,
+                int(source.determinism["python_random_seed"]),
+                True,
+                False,
+                False,
+                str(source.determinism["cublas_workspace_config"]),
+            ),
+            np,
+            torch,
+        )
+        if dict(determinism) != dict(source.determinism):
+            raise ValueError("current determinism settings differ from the fixture")
+        _run_fixture_reference(fixture, device, torch)
+        _print_accepted_fixture(fixture, environment="exact")
+        return 0
+
+    import torch
+
     device = _resolve_device(arguments.device, torch)
     if str(device) != "cpu":
         raise ValueError("canonical synthetic fixture acceptance requires device cpu")
+    _run_fixture_reference(fixture, device, torch)
+    _print_accepted_fixture(fixture)
+    return 0
+
+
+def _run_fixture_reference(fixture: Any, device: Any, torch: Any) -> None:
+    from inspectrt.retrieval import exact_top1_squared_l2
+
     distances, indices = exact_top1_squared_l2(
         torch.from_numpy(fixture.queries).to(device),
         torch.from_numpy(fixture.memory_bank).to(device),
@@ -210,15 +283,111 @@ def _validate_fixture(arguments: argparse.Namespace) -> int:
     if not torch.equal(distances.cpu(), expected_distances):
         raise ValueError("expected distance mismatch")
 
+
+def _print_accepted_fixture(fixture: Any, *, environment: str | None = None) -> None:
     workload = fixture.manifest["workload"]
     payload = fixture.manifest["payload"]
     print(f"fixture_id={fixture.metadata.fixture_id}")
     print(f"fixture_class={fixture.metadata.fixture_class}")
     for name in ("Q", "M", "D", "k"):
         print(f"{name}={workload[name]}")
-    print(f"chunk_size={fixture.metadata.reference_chunk_size}")
+    if fixture.metadata.fixture_class == "synthetic_correctness":
+        print(f"chunk_size={fixture.metadata.reference_chunk_size}")
     print(f"payload_sha256={payload['sha256']}")
     print(f"fixture_digest={fixture.fixture_digest}")
+    if environment is not None:
+        print(f"environment={environment}")
+    print("indices=exact")
+    print("distances=exact")
+    print("status=accepted")
+
+
+def _print_unavailable_fixture(fixture: Any, mismatches: Sequence[str]) -> None:
+    payload = fixture.manifest["payload"]
+    print(f"fixture_id={fixture.metadata.fixture_id}")
+    print(f"fixture_class={fixture.metadata.fixture_class}")
+    print(f"payload_sha256={payload['sha256']}")
+    print(f"fixture_digest={fixture.fixture_digest}")
+    print("status=structurally_valid")
+    print("reference_status=unavailable")
+    print(f"environment_mismatches={','.join(mismatches)}")
+
+
+def _export_fixture(arguments: argparse.Namespace, config: BaselineConfig) -> int:
+    repository_root, generator_commit, generator_dirty, lock_digest = (
+        _repository_metadata(Path.cwd())
+    )
+    if generator_dirty:
+        raise ValueError("fixture generator working tree must be clean")
+
+    import numpy as np
+    import torch
+
+    from inspectrt.fixtures import (
+        prepare_accepted_run_fixture,
+        publish_accepted_run_fixture,
+        reconstruct_fixture_query,
+    )
+
+    source = prepare_accepted_run_fixture(
+        run_directory=arguments.run_dir,
+        dataset_root=arguments.dataset_root,
+        sample_id=arguments.sample_id,
+        config_path=arguments.config,
+        repository_root=repository_root,
+        generator_commit=generator_commit,
+        generator_dirty=generator_dirty,
+        current_lock_sha256=lock_digest,
+        torch=torch,
+    )
+    determinism = _configure_determinism(config, np, torch)
+    if dict(determinism) != dict(source.metadata.source.determinism):
+        raise ValueError("current determinism settings differ from the accepted run")
+    device = _resolve_device(arguments.device, torch)
+    if str(device) != source.metadata.source.requested_device:
+        raise ValueError("requested device must match the accepted run device cuda:0")
+
+    from torchvision.models import ResNet50_Weights
+
+    from inspectrt.features import (
+        build_resnet50_layer2_extractor,
+    )
+    from inspectrt.retrieval import exact_top1_squared_l2
+
+    weights = ResNet50_Weights.IMAGENET1K_V2
+    if str(weights) != source.metadata.source.weight_enum:
+        raise ValueError("resolved weight enum differs from the accepted run")
+    extractor = build_resnet50_layer2_extractor(weights=weights).to(device).eval()
+    if (
+        _cached_weight_sha256(weights.url, torch)
+        != source.metadata.source.weight_file_sha256
+    ):
+        raise ValueError("cached official weight changed during model construction")
+    queries_device = reconstruct_fixture_query(source.image_path, extractor, device)
+    bank_device = source.memory_bank.to(device)
+    distances, indices = exact_top1_squared_l2(
+        queries_device,
+        bank_device,
+        bank_chunk_size=config.bank_chunk_size,
+    )
+    queries = queries_device.cpu().contiguous()
+    distances = distances.cpu().contiguous()
+    indices = indices.cpu().contiguous()
+    destination, loaded = publish_accepted_run_fixture(
+        source, queries, distances, indices, arguments.output_root
+    )
+    workload = loaded.manifest["workload"]
+    payload = loaded.manifest["payload"]
+    print(f"fixture_id={loaded.metadata.fixture_id}")
+    print(f"fixture_class={loaded.metadata.fixture_class}")
+    print(f"fixture_path={destination}")
+    print(f"source_run={source.metadata.source.accepted_run_id}")
+    print(f"sample_id={source.metadata.source.sample_id}")
+    for name in ("Q", "M", "D", "k"):
+        print(f"{name}={workload[name]}")
+    print(f"payload_bytes={payload['nbytes']}")
+    print(f"payload_sha256={payload['sha256']}")
+    print(f"fixture_digest={loaded.fixture_digest}")
     print("indices=exact")
     print("distances=exact")
     print("status=accepted")

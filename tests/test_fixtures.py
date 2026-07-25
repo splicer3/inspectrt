@@ -2,11 +2,14 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import inspectrt.fixtures as fixtures
 from inspectrt.fixtures import (
+    AcceptedRunFixtureSource,
     FixtureGenerator,
     RealApplicationFixtureSource,
     RetrievalFixture,
@@ -14,6 +17,8 @@ from inspectrt.fixtures import (
     SyntheticFixtureSource,
     encode_retrieval_fixture,
     load_retrieval_fixture,
+    prepare_accepted_run_fixture,
+    publish_accepted_run_fixture,
     real_fixture_id,
     write_retrieval_fixture,
 )
@@ -206,6 +211,214 @@ def _write_case(tmp_path: Path, name: str) -> Path:
     directory = tmp_path / name
     write_retrieval_fixture(_synthetic_fixture(), directory)
     return directory
+
+
+def _tiny_accepted_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> SimpleNamespace:
+    import torch
+
+    monkeypatch.setattr(fixtures, "_REAL_Q", 2)
+    monkeypatch.setattr(fixtures, "_REAL_M", 3)
+    monkeypatch.setattr(fixtures, "_REAL_D", 2)
+    monkeypatch.setattr(fixtures, "_REAL_CHUNK_SIZE", 2)
+    repository = tmp_path / "repository"
+    run = repository / "run"
+    dataset = repository / "dataset"
+    config = repository / "configs" / "baseline.toml"
+    cache = repository / "cache" / "checkpoints"
+    run.mkdir(parents=True)
+    config.parent.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    image = dataset / "bottle" / "test" / "broken_large" / "000.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"controlled image bytes")
+    config_bytes = b"controlled committed baseline\n"
+    config.write_bytes(config_bytes)
+    weight = cache / "resnet50-11ad3fa6.pth"
+    weight.write_bytes(b"controlled cached weight")
+    monkeypatch.setattr(torch.hub, "get_dir", lambda: str(cache.parent))
+    monkeypatch.setattr(fixtures, "_git_blob", lambda *args: config_bytes)
+
+    records = [
+        {
+            "category": "bottle",
+            "defect_type": "broken_large",
+            "image_relpath": "bottle/test/broken_large/000.png",
+            "is_anomalous": True,
+            "mask_relpath": "bottle/ground_truth/broken_large/000_mask.png",
+            "sample_id": _SAMPLE_ID,
+            "split": "test",
+        },
+        {
+            "category": "bottle",
+            "defect_type": "good",
+            "image_relpath": "bottle/test/good/000.png",
+            "is_anomalous": False,
+            "mask_relpath": None,
+            "sample_id": "mvtec_ad/bottle/test/good/000.png",
+            "split": "test",
+        },
+        {
+            "category": "bottle",
+            "defect_type": "good",
+            "image_relpath": "bottle/train/good/000.png",
+            "is_anomalous": False,
+            "mask_relpath": None,
+            "sample_id": "mvtec_ad/bottle/train/good/000.png",
+            "split": "train",
+        },
+    ]
+    samples = b"".join(_canonical(record) for record in records)
+    (run / "samples.jsonl").write_bytes(samples)
+    bank = torch.tensor(((0, 0), (1, 0), (0, 2)), dtype=torch.float32)
+    distances = torch.tensor(((1, 1), (2, 2)), dtype=torch.float32)
+    indices = torch.tensor(((0, 1), (0, 0)), dtype=torch.int64)
+    torch.save(
+        {
+            "dtype": "float32",
+            "embedding_dimension": 2,
+            "memory_bank": bank,
+            "patches_per_training_sample": 2,
+            "shape": [3, 2],
+        },
+        run / "memory_bank.pt",
+    )
+    torch.save(
+        {
+            "nearest_bank_indices": indices,
+            "patch_distances": distances,
+            "test_sample_ids": [
+                _SAMPLE_ID,
+                "mvtec_ad/bottle/test/good/000.png",
+            ],
+        },
+        run / "retrieval.pt",
+    )
+    for name in ("anomaly_maps.pt", "metrics.json", "predictions.jsonl"):
+        (run / name).write_bytes(b"controlled")
+
+    lock_digest = "a" * 64
+    dependency_versions = dict(_DEPENDENCIES)
+    run_record = {
+        "bank_chunk_size": 2,
+        "batch_size": 1,
+        "benchmark": {
+            "artifact": "benchmark.json",
+            "schema_version": 1,
+            "timing_device": "cuda:0",
+        },
+        "category": "bottle",
+        "dataset_root": "dataset",
+        "determinism": dict(_DETERMINISM),
+        "device": "cuda:0",
+        "environment": {
+            "created_at_utc": "2026-07-15T20:28:46.302048Z",
+            "dependency_versions": dependency_versions,
+            "platform_description": "test platform",
+            "python_version": "3.11.15",
+        },
+        "feature_extractor": "ResNet-50",
+        "feature_layer": "layer2",
+        "inventory": {
+            "anomalous_test_sample_count": 1,
+            "sample_inventory_sha256": hashlib.sha256(samples).hexdigest(),
+            "test_good_sample_count": 1,
+            "test_sample_count": 2,
+            "total_sample_count": 3,
+            "training_sample_count": 1,
+        },
+        "map_interpolation": {},
+        "preprocessing_profile": "inspectrt_resize256_v1",
+        "profile_id": "inspectrt_feature_memory_v1",
+        "retrieval_semantics": "exact top-1 squared L2",
+        "run_id": "run",
+        "schema_version": 1,
+        "source": {
+            "dirty": False,
+            "git_commit": _COMMIT,
+            "uv_lock_sha256": lock_digest,
+        },
+        "tensors": {
+            "anomaly_maps": {},
+            "evaluation_masks": {},
+            "image_scores": {},
+            "memory_bank": {
+                "byte_count": 24,
+                "dtype": "float32",
+                "shape": [3, 2],
+            },
+            "nearest_bank_indices": {"dtype": "int64", "shape": [2, 2]},
+            "patch_distances": {"dtype": "float32", "shape": [2, 2]},
+            "test_labels": {},
+        },
+        "weights": {
+            "cached_file_sha256": hashlib.sha256(weight.read_bytes()).hexdigest(),
+            "enum": "ResNet50_Weights.IMAGENET1K_V2",
+            "source_url": "https://download.pytorch.org/models/resnet50-11ad3fa6.pth",
+        },
+    }
+    benchmark_record = {
+        "benchmark_sample_id": _SAMPLE_ID,
+        "category": "bottle",
+        "created_at_utc": "2026-07-15T20:28:46.302048Z",
+        "device": "cuda:0",
+        "environment": {
+            "cuda_compute_capability": [7, 5],
+            "cuda_device_name": "test GPU",
+            "pytorch_cuda_runtime_version": "13.0",
+        },
+        "methodology": {},
+        "profile_id": "inspectrt_feature_memory_v1",
+        "results": {},
+        "run_id": "run",
+        "schema_version": 1,
+        "workload": {
+            "D": 2,
+            "M": 3,
+            "Q": 2,
+            "bank_bytes": 24,
+            "bank_chunk_size": 2,
+            "bank_shape": [3, 2],
+            "batch_size": 1,
+            "dtype": "float32",
+            "k": 1,
+            "tensor_layout": {},
+            "test_sample_count": 2,
+            "training_sample_count": 1,
+        },
+    }
+    (run / "run.json").write_bytes(_canonical(run_record))
+    (run / "benchmark.json").write_bytes(_canonical(benchmark_record))
+    return SimpleNamespace(
+        repository=repository,
+        run=run,
+        dataset=dataset,
+        config=config,
+        cache=cache,
+        image=image,
+        bank=bank,
+        distances=distances[0],
+        indices=indices[0],
+        lock_digest=lock_digest,
+        run_record=run_record,
+        benchmark_record=benchmark_record,
+        torch=torch,
+    )
+
+
+def _prepare_tiny(bundle: SimpleNamespace) -> AcceptedRunFixtureSource:
+    return prepare_accepted_run_fixture(
+        run_directory=bundle.run,
+        dataset_root=bundle.dataset,
+        sample_id=_SAMPLE_ID,
+        config_path=bundle.config,
+        repository_root=bundle.repository,
+        generator_commit="f" * 40,
+        generator_dirty=False,
+        current_lock_sha256=bundle.lock_digest,
+        torch=bundle.torch,
+    )
 
 
 def test_committed_fixture_has_canonical_identity_workload_and_values() -> None:
@@ -754,3 +967,328 @@ def test_requires_exactly_two_regular_files_and_never_overwrites(
     (symlink / "manifest.json").symlink_to(tmp_path / "missing-target")
     with pytest.raises(ValueError, match="regular"):
         load_retrieval_fixture(symlink)
+
+
+def test_valid_tiny_benchmark_bundle_is_accepted_as_export_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    source = _prepare_tiny(bundle)
+    assert source.metadata.fixture_id == "bottle-broken-large-000-bc330b9070c5"
+    assert source.image_path == bundle.image
+    assert source.memory_bank is bundle.bank or bundle.torch.equal(
+        source.memory_bank, bundle.bank
+    )
+    assert bundle.torch.equal(source.expected_squared_l2_distances, bundle.distances)
+    assert bundle.torch.equal(source.expected_indices, bundle.indices)
+    assert set(source.source_hashes) == {
+        "run.json",
+        "samples.jsonl",
+        "memory_bank.pt",
+        "retrieval.pt",
+        "benchmark.json",
+    }
+    real_source = source.metadata.source
+    assert isinstance(real_source, RealApplicationFixtureSource)
+    assert (
+        real_source.source_image_sha256
+        == hashlib.sha256(bundle.image.read_bytes()).hexdigest()
+    )
+    assert (
+        real_source.configuration_sha256
+        == hashlib.sha256(bundle.config.read_bytes()).hexdigest()
+    )
+
+
+@pytest.mark.parametrize("case", ("evaluation-only", "missing", "unexpected"))
+def test_rejects_incomplete_or_unexpected_source_file_sets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    if case == "evaluation-only":
+        (bundle.run / "benchmark.json").unlink()
+    elif case == "missing":
+        (bundle.run / "retrieval.pt").unlink()
+    else:
+        (bundle.run / "extra").write_bytes(b"unexpected")
+    with pytest.raises(ValueError, match="source run files"):
+        _prepare_tiny(bundle)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("dirty", True, "clean"),
+        ("lock", "b" * 64, "uv.lock"),
+        ("profile", "other", "frozen"),
+        ("preprocessing", "other", "frozen"),
+        ("weight", "ResNet50_Weights.DEFAULT", "weight"),
+    ),
+)
+def test_rejects_invalid_accepted_source_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    run = bundle.run_record
+    if field == "dirty":
+        run["source"]["dirty"] = value
+    elif field == "lock":
+        run["source"]["uv_lock_sha256"] = value
+    elif field == "profile":
+        run["profile_id"] = value
+    elif field == "preprocessing":
+        run["preprocessing_profile"] = value
+    else:
+        run["weights"]["enum"] = value
+    (bundle.run / "run.json").write_bytes(_canonical(run))
+    with pytest.raises(ValueError, match=message):
+        _prepare_tiny(bundle)
+
+
+def test_rejects_inventory_weight_and_configuration_digest_mismatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    bundle.run_record["inventory"]["sample_inventory_sha256"] = "0" * 64
+    (bundle.run / "run.json").write_bytes(_canonical(bundle.run_record))
+    with pytest.raises(ValueError, match="inventory"):
+        _prepare_tiny(bundle)
+
+    bundle = _tiny_accepted_bundle(tmp_path / "weight", monkeypatch)
+    (bundle.cache / "resnet50-11ad3fa6.pth").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="weight SHA-256"):
+        _prepare_tiny(bundle)
+
+    bundle = _tiny_accepted_bundle(tmp_path / "config", monkeypatch)
+    monkeypatch.setattr(fixtures, "_git_blob", lambda *args: b"different")
+    with pytest.raises(ValueError, match="configuration"):
+        _prepare_tiny(bundle)
+
+
+def test_requested_sample_must_match_benchmark_and_one_retrieval_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    bundle.benchmark_record["benchmark_sample_id"] = "mvtec_ad/bottle/test/good/000.png"
+    (bundle.run / "benchmark.json").write_bytes(_canonical(bundle.benchmark_record))
+    with pytest.raises(ValueError, match="benchmark sample"):
+        _prepare_tiny(bundle)
+
+    bundle = _tiny_accepted_bundle(tmp_path / "duplicate", monkeypatch)
+    payload = bundle.torch.load(
+        bundle.run / "retrieval.pt", map_location="cpu", weights_only=True
+    )
+    payload["test_sample_ids"][1] = _SAMPLE_ID
+    bundle.torch.save(payload, bundle.run / "retrieval.pt")
+    with pytest.raises(ValueError, match="exactly once"):
+        _prepare_tiny(bundle)
+
+
+@pytest.mark.parametrize("case", ("bank-shape", "bank-dtype", "bank-layout"))
+def test_rejects_invalid_bank_tensor_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    payload = bundle.torch.load(
+        bundle.run / "memory_bank.pt", map_location="cpu", weights_only=True
+    )
+    if case == "bank-shape":
+        payload["memory_bank"] = bundle.torch.zeros((2, 2))
+    elif case == "bank-dtype":
+        payload["memory_bank"] = bundle.bank.to(bundle.torch.float64)
+    else:
+        payload["memory_bank"] = bundle.torch.zeros((2, 3)).T
+    bundle.torch.save(payload, bundle.run / "memory_bank.pt")
+    with pytest.raises((TypeError, ValueError)):
+        _prepare_tiny(bundle)
+
+
+@pytest.mark.parametrize(
+    "case", ("distance-shape", "distance-dtype", "index-dtype", "index-range")
+)
+def test_rejects_invalid_retrieval_tensor_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    payload = bundle.torch.load(
+        bundle.run / "retrieval.pt", map_location="cpu", weights_only=True
+    )
+    if case == "distance-shape":
+        payload["patch_distances"] = bundle.torch.zeros((2, 3))
+    elif case == "distance-dtype":
+        payload["patch_distances"] = payload["patch_distances"].double()
+    elif case == "index-dtype":
+        payload["nearest_bank_indices"] = payload["nearest_bank_indices"].int()
+    else:
+        payload["nearest_bank_indices"][0, 0] = 3
+    bundle.torch.save(payload, bundle.run / "retrieval.pt")
+    with pytest.raises((TypeError, ValueError)):
+        _prepare_tiny(bundle)
+
+
+def test_controlled_query_reconstruction_uses_existing_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+
+    import inspectrt.features as feature_module
+    import inspectrt.preprocessing as preprocessing
+
+    closed: list[bool] = []
+    decoded = SimpleNamespace(image=SimpleNamespace(close=lambda: closed.append(True)))
+    image = torch.zeros((3, 256, 256), dtype=torch.float32)
+    expected = torch.tensor(((1, 2), (3, 4)), dtype=torch.float32)
+    monkeypatch.setattr(preprocessing, "decode_image", lambda path: decoded)
+    monkeypatch.setattr(preprocessing, "preprocess_decoded_image", lambda value: image)
+    monkeypatch.setattr(
+        feature_module,
+        "extract_patch_embeddings",
+        lambda extractor, batch: expected.unsqueeze(0),
+    )
+    actual = fixtures.reconstruct_fixture_query(
+        tmp_path / "image.png", object(), torch.device("cpu")
+    )
+    assert torch.equal(actual, expected)
+    assert actual.shape == (2, 2)
+    assert actual.is_contiguous()
+    assert closed == [True]
+
+
+def test_exact_parity_is_required_before_atomic_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    source = _prepare_tiny(bundle)
+    queries = bundle.torch.tensor(((0, 1), (2, 0)), dtype=bundle.torch.float32)
+    with pytest.raises(ValueError, match="index mismatch"):
+        publish_accepted_run_fixture(
+            source,
+            queries,
+            bundle.distances,
+            bundle.torch.tensor((1, 1), dtype=bundle.torch.int64),
+            tmp_path / "bad-index",
+        )
+    with pytest.raises(ValueError, match="distance mismatch"):
+        publish_accepted_run_fixture(
+            source,
+            queries,
+            bundle.torch.tensor((2, 1), dtype=bundle.torch.float32),
+            bundle.indices,
+            tmp_path / "bad-distance",
+        )
+    assert not (tmp_path / "bad-index").exists()
+    assert not (tmp_path / "bad-distance").exists()
+
+
+def test_real_export_is_deterministic_two_file_and_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    source = _prepare_tiny(bundle)
+    before = {path.name: path.read_bytes() for path in bundle.run.iterdir()}
+    queries = bundle.torch.tensor(((0, 1), (2, 0)), dtype=bundle.torch.float32)
+    first, first_loaded = publish_accepted_run_fixture(
+        source, queries, bundle.distances, bundle.indices, tmp_path / "first"
+    )
+    second, second_loaded = publish_accepted_run_fixture(
+        source, queries, bundle.distances, bundle.indices, tmp_path / "second"
+    )
+    assert {path.name for path in first.iterdir()} == {"manifest.json", "tensors.bin"}
+    for name in ("manifest.json", "tensors.bin"):
+        assert (first / name).read_bytes() == (second / name).read_bytes()
+    assert first_loaded.fixture_digest == second_loaded.fixture_digest
+    assert {path.name: path.read_bytes() for path in bundle.run.iterdir()} == before
+    assert first_loaded.memory_bank.shape == (3, 2)
+
+
+def test_existing_destination_and_late_failure_leave_no_partial_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import inspectrt.artifacts as artifacts
+
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    source = _prepare_tiny(bundle)
+    queries = bundle.torch.tensor(((0, 1), (2, 0)), dtype=bundle.torch.float32)
+    parent = tmp_path / "outputs" / "fixtures" / "inspectrt_retrieval_fixture_v1"
+    destination = parent / source.metadata.fixture_id
+    destination.mkdir(parents=True)
+    marker = destination / "keep"
+    marker.write_bytes(b"unchanged")
+    with pytest.raises(FileExistsError):
+        publish_accepted_run_fixture(
+            source, queries, bundle.distances, bundle.indices, tmp_path / "outputs"
+        )
+    assert marker.read_bytes() == b"unchanged"
+
+    marker.unlink()
+    destination.rmdir()
+    monkeypatch.setattr(
+        artifacts,
+        "_rename_without_overwrite",
+        lambda *args: (_ for _ in ()).throw(OSError("late failure")),
+    )
+    with pytest.raises(OSError, match="late failure"):
+        publish_accepted_run_fixture(
+            source, queries, bundle.distances, bundle.indices, tmp_path / "outputs"
+        )
+    assert not destination.exists()
+    assert not list(parent.glob(f".{source.metadata.fixture_id}.tmp-*"))
+
+
+def test_source_change_during_export_prevents_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    source = _prepare_tiny(bundle)
+    queries = bundle.torch.tensor(((0, 1), (2, 0)), dtype=bundle.torch.float32)
+    original = fixtures._source_hashes
+
+    def changed(directory: Path) -> dict[str, str]:
+        result = original(directory)
+        result["run.json"] = "0" * 64
+        return result
+
+    monkeypatch.setattr(fixtures, "_source_hashes", changed)
+    with pytest.raises(ValueError, match="changed during"):
+        publish_accepted_run_fixture(
+            source, queries, bundle.distances, bundle.indices, tmp_path / "outputs"
+        )
+    parent = tmp_path / "outputs" / "fixtures" / "inspectrt_retrieval_fixture_v1"
+    assert not (parent / source.metadata.fixture_id).exists()
+    assert not list(parent.glob(".*.tmp-*"))
+
+
+def test_raw_reload_and_structural_environment_comparison_need_no_torch_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _tiny_accepted_bundle(tmp_path, monkeypatch)
+    source = _prepare_tiny(bundle)
+    queries = bundle.torch.tensor(((0, 1), (2, 0)), dtype=bundle.torch.float32)
+    destination, _ = publish_accepted_run_fixture(
+        source, queries, bundle.distances, bundle.indices, tmp_path / "outputs"
+    )
+    monkeypatch.setattr(
+        bundle.torch,
+        "load",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("torch.load")),
+    )
+    loaded = load_retrieval_fixture(destination)
+    assert loaded.metadata.fixture_class == "real_application"
+    real_source = loaded.metadata.source
+    assert isinstance(real_source, RealApplicationFixtureSource)
+    assert fixtures.basic_environment_mismatches(
+        real_source,
+        requested_device="cpu",
+        current_lock_sha256=real_source.uv_lock_sha256,
+        python_version=real_source.python_version,
+        dependency_versions=real_source.dependency_versions,
+        platform_description=real_source.platform_description,
+    ) == ["requested_device"]
