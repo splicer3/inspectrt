@@ -15,7 +15,12 @@ from inspectrt.fixtures import (
     RetrievalFixture,
     RetrievalFixtureMetadata,
     SyntheticFixtureSource,
+    canonical_retrieval_workload_matrix,
+    counter_fp32_block,
+    counter_fp32_value,
+    encode_retrieval_workload_matrix,
     encode_retrieval_fixture,
+    load_retrieval_workload_matrix,
     load_retrieval_fixture,
     prepare_accepted_run_fixture,
     publish_accepted_run_fixture,
@@ -25,7 +30,16 @@ from inspectrt.fixtures import (
 
 _COMMIT = "bc330b9070c5ca8db9cb7cfbb27617256388536b"
 _FIXTURE_GENERATOR_COMMIT = "de731ee404e2ab1cd381230ec042496282413662"
+_REPOSITORY_ROOT = Path(__file__).parents[1]
 _COMMITTED_FIXTURE = Path(__file__).parent / "fixtures" / "retrieval_v1"
+_WORKLOAD_MATRIX = _REPOSITORY_ROOT / "configs" / "retrieval_workloads.json"
+_REAL_FIXTURE = (
+    _REPOSITORY_ROOT
+    / "outputs"
+    / "fixtures"
+    / "inspectrt_retrieval_fixture_v1"
+    / "bottle-broken-large-000-bc330b9070c5"
+)
 _SAMPLE_ID = "mvtec_ad/bottle/test/broken_large/000.png"
 _TENSOR_NAMES = [
     "queries",
@@ -419,6 +433,381 @@ def _prepare_tiny(bundle: SimpleNamespace) -> AcceptedRunFixtureSource:
         current_lock_sha256=bundle.lock_digest,
         torch=bundle.torch,
     )
+
+
+def test_committed_workload_matrix_is_canonical_and_regenerates(
+    tmp_path: Path,
+) -> None:
+    assert _WORKLOAD_MATRIX.is_file()
+    committed = _WORKLOAD_MATRIX.read_bytes()
+    matrix = load_retrieval_workload_matrix(_WORKLOAD_MATRIX)
+    regenerated = encode_retrieval_workload_matrix(
+        canonical_retrieval_workload_matrix()
+    )
+    temporary = tmp_path / "retrieval_workloads.json"
+    temporary.write_bytes(regenerated)
+
+    assert committed == regenerated == encode_retrieval_workload_matrix(matrix)
+    assert temporary.read_bytes() == committed
+    assert committed.endswith(b"\n") and not committed.endswith(b"\n\n")
+    assert b"\r" not in committed
+    assert committed == _canonical(json.loads(committed))
+    assert matrix.schema_version == 1
+    assert matrix.matrix_id == "inspectrt-retrieval-workloads-v1"
+    assert matrix.milestone == "inspectrt_retrieval_fixture_v1"
+    assert set(json.loads(committed)) == {
+        "schema_version",
+        "matrix_id",
+        "milestone",
+        "retrieval_contract",
+        "synthetic_generator",
+        "workloads",
+        "scaling_axes",
+    }
+    with pytest.raises(ValueError):
+        encode_retrieval_workload_matrix(replace(matrix, schema_version=True))
+
+
+def test_workload_matrix_has_exact_contract_workloads_and_fixture_evidence() -> None:
+    matrix = load_retrieval_workload_matrix(_WORKLOAD_MATRIX)
+    assert matrix.retrieval_contract == {
+        "distance_output": "raw_squared_l2",
+        "float_dtype": "float32",
+        "index_dtype": "int64",
+        "index_scope": "global_bank_row",
+        "k": 1,
+        "layout": "c_contiguous_row_major",
+        "operation": "exact_top1_squared_l2",
+        "tie_rule": "lower_global_index_for_exact_computed_tie",
+    }
+    expected = (
+        ("synthetic-correctness", "correctness", (4, 7, 5), "committed_fixture"),
+        (
+            "synthetic-development-small",
+            "development",
+            (32, 4096, 512),
+            "counter_fp32_v1",
+        ),
+        (
+            "synthetic-development-medium",
+            "development",
+            (256, 65536, 512),
+            "counter_fp32_v1",
+        ),
+        (
+            "mvtec-bottle-image",
+            "application",
+            (1024, 214016, 512),
+            "accepted_real_fixture",
+        ),
+        (
+            "mvtec-leather-image",
+            "application",
+            (1024, 250880, 512),
+            "accepted_baseline_shape",
+        ),
+    )
+    assert (
+        tuple(
+            (
+                item["workload_id"],
+                item["class"],
+                (item["Q"], item["M"], item["D"]),
+                item["source"],
+            )
+            for item in matrix.workloads
+        )
+        == expected
+    )
+    assert tuple(item["purpose"] for item in matrix.workloads) == (
+        "format, multi-chunk, non-divisible final chunk and exact-tie correctness",
+        "fast parser and integration checks",
+        "material chunking without a complete application bank",
+        "accepted real application workload",
+        "accepted larger application shape and storage boundary",
+    )
+    assert len({item["workload_id"] for item in matrix.workloads}) == 5
+    assert all(
+        item["k"] == 1
+        and item["dtype"] == "float32"
+        and item["layout"] == "c_contiguous_row_major"
+        for item in matrix.workloads
+    )
+    assert all(item["D"] == 512 for item in matrix.workloads[1:])
+
+    synthetic_manifest = json.loads((_COMMITTED_FIXTURE / "manifest.json").read_bytes())
+    correctness = matrix.workloads[0]
+    assert correctness["fixture_id"] == synthetic_manifest["fixture_id"]
+    assert tuple(correctness[name] for name in ("Q", "M", "D", "k")) == tuple(
+        synthetic_manifest["workload"][name] for name in ("Q", "M", "D", "k")
+    )
+    assert (
+        hashlib.sha256((_COMMITTED_FIXTURE / "manifest.json").read_bytes()).hexdigest()
+        == "9e72d4238ee0cae7f8236a82e50acf8f811c0e3f7b5e2815a11c56a9e1193c12"
+    )
+    assert (
+        hashlib.sha256((_COMMITTED_FIXTURE / "tensors.bin").read_bytes()).hexdigest()
+        == "18c2c4333a060ff25b7304dd396cf4b292617c4593d7cbfc2576b406ed5a14bb"
+    )
+
+    bottle, leather = matrix.workloads[3:]
+    assert bottle["bank_bytes"] == bottle["M"] * bottle["D"] * 4 == 438304768
+    assert leather["bank_bytes"] == leather["M"] * leather["D"] * 4 == 513802240
+    assert bottle["fixture_id"] == "bottle-broken-large-000-bc330b9070c5"
+    assert "fixture_id" not in leather
+    assert leather["category"] == "leather"
+
+
+def test_workload_matrix_has_exact_generator_and_bounded_scaling_axes() -> None:
+    matrix = load_retrieval_workload_matrix(_WORKLOAD_MATRIX)
+    generator = matrix.synthetic_generator
+    assert generator["generator_id"] == "counter_fp32_v1"
+    assert generator["formula"] == {
+        "n": "(a * (i + 1) + b * (j + 1) + salt) mod 16777213",
+        "s": "int64(n) - 8388606",
+        "value": "float32(s) / 262144",
+    }
+    assert tuple(
+        generator[name]
+        for name in ("arithmetic", "remainder", "modulus", "center", "divisor")
+    ) == (
+        "unsigned_64_bit_integer",
+        "nonnegative_mathematical_remainder",
+        16777213,
+        8388606,
+        262144,
+    )
+    assert generator["query_coefficients"] == {"a": 131071, "b": 524287, "salt": 17}
+    assert generator["bank_coefficients"] == {"a": 104729, "b": 130363, "salt": 31}
+    assert generator["query_coefficients"] != generator["bank_coefficients"]
+    assert generator["index_origin"] == "zero_based"
+    assert generator["division_power_of_two"] == 18
+    assert generator["finite_values"] is True
+    assert generator["materialized_layout"] == "c_contiguous_row_major"
+    assert generator["deterministic"] is True
+    assert generator["uses_random_number_library"] is False
+    assert generator["distinct_stream_coefficients"] is True
+
+    query_axis, bank_axis = matrix.scaling_axes
+    assert (query_axis["axis_id"], query_axis["vary"], query_axis["values"]) == (
+        "query-scaling",
+        "Q",
+        [1, 32, 256, 1024, 4096],
+    )
+    assert query_axis["fixed"] == {
+        "M": 214016,
+        "D": 512,
+        "k": 1,
+        "dtype": "float32",
+        "layout": "c_contiguous_row_major",
+    }
+    assert query_axis["application_anchor"] == "mvtec-bottle-image"
+    assert (bank_axis["axis_id"], bank_axis["vary"], bank_axis["values"]) == (
+        "bank-scaling",
+        "M",
+        [4096, 16384, 65536, 214016, 250880],
+    )
+    assert bank_axis["fixed"] == {
+        "Q": 1024,
+        "D": 512,
+        "k": 1,
+        "dtype": "float32",
+        "layout": "c_contiguous_row_major",
+    }
+    assert bank_axis["application_anchors"] == [
+        "mvtec-bottle-image",
+        "mvtec-leather-image",
+    ]
+    assert all(axis["generator"] == "counter_fp32_v1" for axis in matrix.scaling_axes)
+
+
+def test_workload_matrix_contains_no_execution_or_measurement_metadata() -> None:
+    record = json.loads(_WORKLOAD_MATRIX.read_bytes())
+
+    def keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | set().union(*(keys(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(keys(item) for item in value))
+        return set()
+
+    forbidden = {
+        "cuda",
+        "device",
+        "environment",
+        "hardware",
+        "measurement",
+        "profiler",
+        "speedup",
+        "tensor_hash",
+        "timing",
+    }
+    assert keys(record).isdisjoint(
+        forbidden | {"queries", "memory_bank", "generated_tensors"}
+    )
+
+
+def test_ignored_real_fixture_manifest_matches_bottle_metadata_when_present() -> None:
+    manifest_path = _REAL_FIXTURE / "manifest.json"
+    if not manifest_path.exists():
+        pytest.skip("accepted ignored real fixture is not present")
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    bottle = load_retrieval_workload_matrix(_WORKLOAD_MATRIX).workloads[3]
+    assert hashlib.sha256(manifest_bytes).hexdigest() == (
+        "631cebdd895dd15ff510c900f10d73e446c7f974f15d351f4417e39c64f0336c"
+    )
+    assert manifest["fixture_id"] == bottle["fixture_id"]
+    assert tuple(manifest["workload"][name] for name in ("Q", "M", "D", "k")) == (
+        bottle["Q"],
+        bottle["M"],
+        bottle["D"],
+        bottle["k"],
+    )
+    bank = next(item for item in manifest["tensors"] if item["name"] == "memory_bank")
+    assert bank["nbytes"] == bottle["bank_bytes"]
+    with (_REAL_FIXTURE / "tensors.bin").open("rb") as stream:
+        assert hashlib.file_digest(stream, "sha256").hexdigest() == (
+            "99cf70cd3a1cfd4555fb3d705b34916b6f6608c332ca0664921db3e0db8c70b1"
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        (("schema_version",), 2),
+        (("schema_version",), True),
+        (("matrix_id",), "Unsafe_ID"),
+        (("milestone",), "other"),
+        (("unknown",), {}),
+        (("workloads", 0, "timing"), 1.0),
+        (("workloads", 0, "purpose"), None),
+        (("workloads", 1, "workload_id"), "synthetic-correctness"),
+        (("workloads", 1, "workload_id"), "Unsafe_ID"),
+        (("workloads", 1, "class"), "benchmark"),
+        (("workloads", 1, "Q"), True),
+        (("workloads", 1, "M"), 0),
+        (("workloads", 1, "D"), 5),
+        (("workloads", 0, "Q"), 5),
+        (("workloads", 2, "k"), 2),
+        (("workloads", 2, "layout"), "C"),
+        (("workloads", 2, "source"), "random"),
+        (("workloads", 3, "bank_bytes"), 438304764),
+        (("workloads", 4, "fixture_id"), "unaccepted"),
+        (("synthetic_generator", "modulus"), 16777214),
+        (
+            ("synthetic_generator", "bank_coefficients"),
+            {"a": 131071, "b": 524287, "salt": 17},
+        ),
+        (("scaling_axes", 0, "values"), []),
+        (("scaling_axes", 0, "values"), [32, 1, 256, 1024, 4096]),
+        (("scaling_axes", 1, "values"), [4096, 4096, 65536, 214016, 250880]),
+        (("scaling_axes", 0, "values"), [1, 32, 256, 1024, 4097]),
+        (("scaling_axes", 0, "vary"), "M"),
+        (("scaling_axes", 0, "fixed", "Q"), 1),
+        (("scaling_axes", 1, "axis_id"), "query-scaling"),
+        (("scaling_axes", 1, "application_anchors"), ["mvtec-bottle-image"]),
+    ),
+)
+def test_workload_matrix_validation_rejects_contract_changes(
+    tmp_path: Path, path: tuple[str | int, ...], replacement: object
+) -> None:
+    record = json.loads(_WORKLOAD_MATRIX.read_bytes())
+    target = record
+    for component in path[:-1]:
+        target = target[component]
+    if replacement is None:
+        target.pop(path[-1])
+    else:
+        target[path[-1]] = replacement
+    case_path = tmp_path / "malformed.json"
+    case_path.write_bytes(_canonical(record))
+    with pytest.raises((TypeError, ValueError)):
+        load_retrieval_workload_matrix(case_path)
+
+
+def test_workload_matrix_rejects_noncanonical_duplicate_and_nonfinite_json(
+    tmp_path: Path,
+) -> None:
+    payload = _WORKLOAD_MATRIX.read_bytes()
+    cases = (
+        b" " + payload,
+        payload.removesuffix(b"\n"),
+        payload.replace(
+            b'"schema_version":1', b'"schema_version":1,"schema_version":1'
+        ),
+        payload.replace(b'"schema_version":1', b'"schema_version":NaN'),
+    )
+    for index, malformed in enumerate(cases):
+        path = tmp_path / f"malformed-{index}.json"
+        path.write_bytes(malformed)
+        with pytest.raises(ValueError):
+            load_retrieval_workload_matrix(path)
+
+
+@pytest.mark.parametrize(
+    ("stream", "row", "dimension", "centered", "bits"),
+    (
+        ("query", 0, 0, -7733231, 0xC1EBFFDE),
+        ("query", 7, 13, -3, 0xB7400000),
+        ("query", 31, 511, -4194781, 0xC18003BA),
+        ("query", 4095, 511, 8384160, 0x41FFDD40),
+        ("bank", 0, 0, -8153483, 0xC1F8D316),
+        ("bank", 7, 13, -5725661, 0xC1AEBBBA),
+        ("bank", 214015, 511, 7350738, 0x41E053A4),
+        ("bank", 250879, 511, -7455609, 0xC1E386F2),
+    ),
+)
+def test_counter_fp32_known_values_are_exact_finite_binary32(
+    stream: str, row: int, dimension: int, centered: int, bits: int
+) -> None:
+    value = counter_fp32_value(stream, row, dimension)
+    assert isinstance(value, np.float32)
+    assert np.isfinite(value)
+    assert value.view(np.uint32).item() == bits
+    assert np.float32(value * np.float32(262144)) == np.float32(centered)
+    assert counter_fp32_value(stream, row, dimension) == value
+
+
+def test_counter_fp32_small_block_is_bounded_c_order_and_rng_independent() -> None:
+    np.random.seed(123)
+    before = np.random.get_state()
+    block = counter_fp32_block("query", 0, 2, 0, 3)
+    after = np.random.get_state()
+    expected_bits = np.array(
+        (
+            (0xC1EBFFDE, 0xC1DBFFE0, 0xC1CBFFE2),
+            (0xC1E7FFE0, 0xC1D7FFE2, 0xC1C7FFE4),
+        ),
+        dtype="<u4",
+    )
+    np.testing.assert_array_equal(block.view("<u4"), expected_bits)
+    assert block.shape == (2, 3)
+    assert block.dtype == np.dtype("<f4")
+    assert block.flags.c_contiguous
+    assert before[0] == after[0]
+    np.testing.assert_array_equal(before[1], after[1])
+    assert before[2:] == after[2:]
+    assert counter_fp32_value("query", 0, 0) != counter_fp32_value("bank", 0, 0)
+    assert 131071 * 4096 + 524287 * 512 + 17 == 805301777 < 2**64
+    assert 104729 * 250880 + 130363 * 512 + 31 == 26341157407 < 2**64
+
+
+@pytest.mark.parametrize(
+    "call",
+    (
+        lambda: counter_fp32_value("query", True, 0),
+        lambda: counter_fp32_value("query", 4096, 0),
+        lambda: counter_fp32_value("bank", 250880, 0),
+        lambda: counter_fp32_value("bank", 0, 512),
+        lambda: counter_fp32_value("other", 0, 0),
+        lambda: counter_fp32_block("query", 0, 65, 0, 64),
+        lambda: counter_fp32_block("query", 0, 0, 0, 1),
+    ),
+)
+def test_counter_fp32_rejects_invalid_or_unbounded_requests(call: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        call()
 
 
 def test_committed_fixture_has_canonical_identity_workload_and_values() -> None:

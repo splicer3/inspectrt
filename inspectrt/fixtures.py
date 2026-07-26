@@ -58,6 +58,14 @@ _REAL_D = 512
 _REAL_CHUNK_SIZE = 16384
 _WEIGHT_ENUM = "ResNet50_Weights.IMAGENET1K_V2"
 _WEIGHT_URL = "https://download.pytorch.org/models/resnet50-11ad3fa6.pth"
+_WORKLOAD_MATRIX_ID = "inspectrt-retrieval-workloads-v1"
+_COUNTER_GENERATOR_ID = "counter_fp32_v1"
+_COUNTER_MODULUS = 16777213
+_COUNTER_CENTER = 8388606
+_COUNTER_DIVISOR = 262144
+_COUNTER_MAX_DIMENSION = 511
+_COUNTER_BLOCK_MAX_VALUES = 4096
+_UINT64_MAX = (1 << 64) - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +152,19 @@ class AcceptedRunFixtureSource:
     source_hashes: Mapping[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class RetrievalWorkloadMatrix:
+    """Typed, ordered schema-1 retrieval handoff workload matrix."""
+
+    schema_version: int
+    matrix_id: str
+    milestone: str
+    retrieval_contract: Mapping[str, object]
+    synthetic_generator: Mapping[str, object]
+    workloads: tuple[Mapping[str, object], ...]
+    scaling_axes: tuple[Mapping[str, object], ...]
+
+
 def real_fixture_id(category: str, sample_id: str, source_commit: str) -> str:
     _component(category, "category")
     _relative_posix(sample_id, "sample_id")
@@ -157,6 +178,245 @@ def real_fixture_id(category: str, sample_id: str, source_commit: str) -> str:
     if len(fixture_id.encode("ascii")) > 96:
         raise ValueError("fixture_id must be at most 96 bytes")
     return fixture_id
+
+
+def canonical_retrieval_workload_matrix() -> RetrievalWorkloadMatrix:
+    """Construct the frozen schema-1 workload matrix as typed Python data."""
+
+    common = {"dtype": "float32", "k": 1, "layout": "c_contiguous_row_major"}
+    workload_rows = (
+        (
+            "synthetic-correctness",
+            "correctness",
+            4,
+            7,
+            5,
+            "committed_fixture",
+            "format, multi-chunk, non-divisible final chunk and exact-tie correctness",
+            {"fixture_id": "synthetic-correctness-v1"},
+        ),
+        (
+            "synthetic-development-small",
+            "development",
+            32,
+            4096,
+            512,
+            _COUNTER_GENERATOR_ID,
+            "fast parser and integration checks",
+            {},
+        ),
+        (
+            "synthetic-development-medium",
+            "development",
+            256,
+            65536,
+            512,
+            _COUNTER_GENERATOR_ID,
+            "material chunking without a complete application bank",
+            {},
+        ),
+        (
+            "mvtec-bottle-image",
+            "application",
+            1024,
+            214016,
+            512,
+            "accepted_real_fixture",
+            "accepted real application workload",
+            {
+                "bank_bytes": 438304768,
+                "category": "bottle",
+                "fixture_id": "bottle-broken-large-000-bc330b9070c5",
+            },
+        ),
+        (
+            "mvtec-leather-image",
+            "application",
+            1024,
+            250880,
+            512,
+            "accepted_baseline_shape",
+            "accepted larger application shape and storage boundary",
+            {"bank_bytes": 513802240, "category": "leather"},
+        ),
+    )
+
+    return RetrievalWorkloadMatrix(
+        schema_version=1,
+        matrix_id=_WORKLOAD_MATRIX_ID,
+        milestone=_MILESTONE,
+        retrieval_contract={
+            "distance_output": "raw_squared_l2",
+            "float_dtype": "float32",
+            "index_dtype": "int64",
+            "index_scope": "global_bank_row",
+            "k": 1,
+            "layout": "c_contiguous_row_major",
+            "operation": "exact_top1_squared_l2",
+            "tie_rule": "lower_global_index_for_exact_computed_tie",
+        },
+        synthetic_generator={
+            "arithmetic": "unsigned_64_bit_integer",
+            "bank_coefficients": {"a": 104729, "b": 130363, "salt": 31},
+            "center": _COUNTER_CENTER,
+            "conversion": (
+                "signed_centered_integer_to_ieee754_binary32_before_division"
+            ),
+            "deterministic": True,
+            "distinct_stream_coefficients": True,
+            "division_power_of_two": 18,
+            "divisor": _COUNTER_DIVISOR,
+            "finite_values": True,
+            "formula": {
+                "n": (f"(a * (i + 1) + b * (j + 1) + salt) mod {_COUNTER_MODULUS}"),
+                "s": f"int64(n) - {_COUNTER_CENTER}",
+                "value": f"float32(s) / {_COUNTER_DIVISOR}",
+            },
+            "generator_id": _COUNTER_GENERATOR_ID,
+            "index_origin": "zero_based",
+            "materialized_layout": "c_contiguous_row_major",
+            "modulus": _COUNTER_MODULUS,
+            "query_coefficients": {"a": 131071, "b": 524287, "salt": 17},
+            "remainder": "nonnegative_mathematical_remainder",
+            "uses_random_number_library": False,
+        },
+        workloads=tuple(
+            {
+                "D": d,
+                "M": m,
+                "Q": q,
+                "class": workload_class,
+                **common,
+                "purpose": purpose,
+                "source": source,
+                "workload_id": workload_id,
+                **extra,
+            }
+            for workload_id, workload_class, q, m, d, source, purpose, extra in (
+                workload_rows
+            )
+        ),
+        scaling_axes=(
+            {
+                "application_anchor": "mvtec-bottle-image",
+                "axis_id": "query-scaling",
+                "fixed": {"D": 512, "M": 214016, **common},
+                "generator": _COUNTER_GENERATOR_ID,
+                "purpose": (
+                    "future study of small-workload overhead, scaling and "
+                    "saturation while holding the bottle-size bank fixed"
+                ),
+                "values": [1, 32, 256, 1024, 4096],
+                "vary": "Q",
+            },
+            {
+                "application_anchors": [
+                    "mvtec-bottle-image",
+                    "mvtec-leather-image",
+                ],
+                "axis_id": "bank-scaling",
+                "fixed": {"D": 512, "Q": 1024, **common},
+                "generator": _COUNTER_GENERATOR_ID,
+                "purpose": (
+                    "future study of bank scaling and temporary-memory pressure "
+                    "at one-image query volume"
+                ),
+                "values": [4096, 16384, 65536, 214016, 250880],
+                "vary": "M",
+            },
+        ),
+    )
+
+
+def validate_retrieval_workload_matrix(matrix: RetrievalWorkloadMatrix) -> None:
+    """Fail closed unless *matrix* is the complete frozen schema-1 contract."""
+
+    if not isinstance(matrix, RetrievalWorkloadMatrix):
+        raise TypeError("matrix must be RetrievalWorkloadMatrix")
+    actual = _canonical_json(_retrieval_workload_matrix_record(matrix))
+    expected = _canonical_json(
+        _retrieval_workload_matrix_record(canonical_retrieval_workload_matrix())
+    )
+    if actual != expected:
+        raise ValueError("retrieval workload matrix differs from the schema-1 contract")
+
+
+def encode_retrieval_workload_matrix(matrix: RetrievalWorkloadMatrix) -> bytes:
+    """Encode one strictly validated matrix with the canonical JSON policy."""
+
+    validate_retrieval_workload_matrix(matrix)
+    return _canonical_json(_retrieval_workload_matrix_record(matrix))
+
+
+def load_retrieval_workload_matrix(path: Path) -> RetrievalWorkloadMatrix:
+    """Load one canonical workload matrix and strictly validate every field."""
+
+    if not isinstance(path, Path):
+        raise TypeError("path must be a pathlib.Path")
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("workload matrix path must be a regular file")
+    payload = path.read_bytes()
+    _parse_manifest(payload)
+    matrix = canonical_retrieval_workload_matrix()
+    if payload != encode_retrieval_workload_matrix(matrix):
+        raise ValueError("retrieval workload matrix differs from the schema-1 contract")
+    return matrix
+
+
+def counter_fp32_value(stream: str, row: int, dimension: int) -> np.float32:
+    """Evaluate one bounded counter_fp32_v1 value without allocating a tensor."""
+
+    if not isinstance(stream, str):
+        raise TypeError("stream must be 'query' or 'bank'")
+    row = _integer(row, "row")
+    dimension = _integer(dimension, "dimension")
+    if stream == "query":
+        a, b, salt, max_row = 131071, 524287, 17, 4095
+    elif stream == "bank":
+        a, b, salt, max_row = 104729, 130363, 31, 250879
+    else:
+        raise ValueError("stream must be 'query' or 'bank'")
+    if row > max_row or dimension > _COUNTER_MAX_DIMENSION:
+        raise ValueError("counter coordinate exceeds the bounded workload matrix")
+    intermediate = a * (row + 1) + b * (dimension + 1) + salt
+    if intermediate > _UINT64_MAX:
+        raise OverflowError("counter intermediate exceeds unsigned 64-bit range")
+    centered = intermediate % _COUNTER_MODULUS - _COUNTER_CENTER
+    value = np.float32(np.float32(centered) / np.float32(_COUNTER_DIVISOR))
+    if not np.isfinite(value):
+        raise ValueError("counter_fp32_v1 produced a non-finite value")
+    return value
+
+
+def counter_fp32_block(
+    stream: str,
+    row_start: int,
+    row_count: int,
+    dimension_start: int,
+    dimension_count: int,
+) -> NDArray[np.float32]:
+    """Materialize at most 4,096 explicitly requested counter values."""
+
+    row_start = _integer(row_start, "row_start")
+    row_count = _integer(row_count, "row_count", positive=True)
+    dimension_start = _integer(dimension_start, "dimension_start")
+    dimension_count = _integer(dimension_count, "dimension_count", positive=True)
+    if row_count * dimension_count > _COUNTER_BLOCK_MAX_VALUES:
+        raise ValueError("counter block exceeds 4,096 values")
+    counter_fp32_value(
+        stream,
+        row_start + row_count - 1,
+        dimension_start + dimension_count - 1,
+    )
+    result = np.empty((row_count, dimension_count), dtype=_FLOAT32, order="C")
+    for row_offset in range(row_count):
+        for dimension_offset in range(dimension_count):
+            result[row_offset, dimension_offset] = counter_fp32_value(
+                stream,
+                row_start + row_offset,
+                dimension_start + dimension_offset,
+            )
+    return result
 
 
 def encode_retrieval_fixture(fixture: RetrievalFixture) -> tuple[bytes, bytes]:
@@ -1306,6 +1566,32 @@ def _generator_record(generator: object) -> dict[str, object]:
         "git_commit": generator.git_commit,
         "milestone_id": generator.milestone_id,
         "schema_version": generator.schema_version,
+    }
+
+
+def _retrieval_workload_matrix_record(
+    matrix: RetrievalWorkloadMatrix,
+) -> dict[str, object]:
+    if not isinstance(matrix.retrieval_contract, Mapping) or not isinstance(
+        matrix.synthetic_generator, Mapping
+    ):
+        raise TypeError("matrix contracts must be mappings")
+    for name, values in (
+        ("workloads", matrix.workloads),
+        ("scaling_axes", matrix.scaling_axes),
+    ):
+        if not isinstance(values, tuple) or any(
+            not isinstance(value, Mapping) for value in values
+        ):
+            raise TypeError(f"matrix {name} must be a tuple of mappings")
+    return {
+        "matrix_id": matrix.matrix_id,
+        "milestone": matrix.milestone,
+        "retrieval_contract": dict(matrix.retrieval_contract),
+        "scaling_axes": [dict(value) for value in matrix.scaling_axes],
+        "schema_version": matrix.schema_version,
+        "synthetic_generator": dict(matrix.synthetic_generator),
+        "workloads": [dict(value) for value in matrix.workloads],
     }
 
 
