@@ -8,8 +8,11 @@ runtime behavior and has no hard-real-time guarantees.
 
 The implemented profile, `inspectrt_feature_memory_v1`, uses a frozen ResNet-50
 feature extractor, a complete nominal patch bank, exact nearest-neighbor
-retrieval, raw anomaly maps, and threshold-free metrics. The CLI currently
-supports complete `evaluate` and `benchmark` runs.
+retrieval, raw anomaly maps, and threshold-free metrics. The CLI supports
+complete `evaluate` and `benchmark` runs. It also exports and validates
+binary exact-retrieval fixture files; see
+[docs/retrieval-fixtures.md](docs/retrieval-fixtures.md) for the format,
+commands, and validation limits.
 
 The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 running the
 current locked Linux stack with a Quadro T1000. Other systems will get benchmarked in the future. See the measured results and method contract in [docs/baseline.md](docs/baseline.md).
