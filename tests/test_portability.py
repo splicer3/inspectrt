@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError, fields, replace
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -19,10 +20,25 @@ from inspectrt.metrics import compute_threshold_free_metrics
 from inspectrt.portability import (
     BundleMetrics,
     BundleValidationError,
+    CandidateComparability,
+    CandidateScientificResult,
     ComparableBundle,
+    ComparisonValidationError,
+    DiscreteComponentComparison,
+    FloatingComponentComparison,
+    FloatingStatistics,
+    IndexMismatch,
     MemoryBankMetadata,
+    MetricDelta,
     PredictionRecord,
+    ScientificBundleDescriptor,
+    ScientificComparison,
+    ScientificExecutionAttempt,
+    ScientificGenerator,
+    ScientificRunIdentity,
     SourceFileSnapshot,
+    compare_scientific_bundles,
+    encode_scientific_comparison,
     load_comparable_bundle,
 )
 
@@ -46,6 +62,13 @@ _REPEATED_STAGES = (
 )
 _DELETE = object()
 _EXECUTED_UNSAFE_PAYLOAD = False
+_SCIENTIFIC_SOURCE_COMMIT = "bc330b9070c5ca8db9cb7cfbb27617256388536b"
+_ACCEPTED_LOCK_SHA256 = (
+    "ddaddc99b318a1c3a04d5d7cc433cf736d321b56f98a8ae8b532e71e19e6d76b"
+)
+_ACCEPTED_WEIGHT_SHA256 = (
+    "11ad3fa62ca79e40addfd354a8ec4b7c75143b3038b8d2a807fbc68deab379ca"
+)
 
 
 def _observation(
@@ -135,10 +158,10 @@ def _metadata(run_id: str, device: str = "cpu") -> BaselineRunMetadata:
         created_at_utc="2026-07-15T12:00:00Z",
         dataset_root="/private/mvtec-ad",
         requested_device=device,
-        bank_chunk_size=4096,
-        git_commit="c" * 40,
+        bank_chunk_size=16_384,
+        git_commit=_SCIENTIFIC_SOURCE_COMMIT,
         git_dirty=False,
-        uv_lock_sha256="a" * 64,
+        uv_lock_sha256=_ACCEPTED_LOCK_SHA256,
         python_version="3.11.15",
         platform_description="Linux-test",
         dependency_versions={
@@ -163,7 +186,7 @@ def _metadata(run_id: str, device: str = "cpu") -> BaselineRunMetadata:
         },
         weight_enum="ResNet50_Weights.IMAGENET1K_V2",
         weight_source_url=("https://download.pytorch.org/models/resnet50-11ad3fa6.pth"),
-        weight_file_sha256="b" * 64,
+        weight_file_sha256=_ACCEPTED_WEIGHT_SHA256,
     )
 
 
@@ -503,10 +526,25 @@ def test_public_records_have_only_the_loader_contract_fields() -> None:
     assert portability.__all__ == (
         "BundleMetrics",
         "BundleValidationError",
+        "CandidateComparability",
+        "CandidateScientificResult",
         "ComparableBundle",
+        "ComparisonValidationError",
+        "DiscreteComponentComparison",
+        "FloatingComponentComparison",
+        "FloatingStatistics",
+        "IndexMismatch",
         "MemoryBankMetadata",
+        "MetricDelta",
         "PredictionRecord",
+        "ScientificBundleDescriptor",
+        "ScientificComparison",
+        "ScientificExecutionAttempt",
+        "ScientificGenerator",
+        "ScientificRunIdentity",
         "SourceFileSnapshot",
+        "compare_scientific_bundles",
+        "encode_scientific_comparison",
         "load_comparable_bundle",
     )
     assert tuple(field.name for field in fields(SourceFileSnapshot)) == (
@@ -556,6 +594,98 @@ def test_public_records_have_only_the_loader_contract_fields() -> None:
         "anomaly_maps",
         "evaluation_masks",
         "metrics",
+    )
+    assert tuple(field.name for field in fields(ScientificBundleDescriptor)) == (
+        "bundle",
+        "environment_id",
+        "policy_role",
+        "os_label",
+        "execution_layer",
+        "hardware_label",
+        "requested_device",
+    )
+    assert tuple(field.name for field in fields(ScientificExecutionAttempt)) == (
+        "environment_id",
+        "status",
+        "reason_code",
+        "stage_code",
+    )
+    assert tuple(field.name for field in fields(ScientificGenerator)) == (
+        "source_commit",
+        "dirty",
+    )
+    assert tuple(field.name for field in fields(ScientificRunIdentity)) == (
+        "environment_id",
+        "policy_role",
+        "bundle_kind",
+        "os_label",
+        "execution_layer",
+        "hardware_label",
+        "requested_device",
+        "run",
+        "source_files",
+        "benchmark_workload",
+        "benchmark_methodology",
+    )
+    assert tuple(field.name for field in fields(CandidateComparability)) == (
+        "environment_id",
+        "comparable",
+        "gates",
+        "structural_components",
+    )
+    assert tuple(field.name for field in fields(FloatingStatistics)) == (
+        "element_count",
+        "exact_count",
+        "differing_count",
+        "maximum_absolute_error",
+        "mean_absolute_error",
+        "root_mean_square_error",
+        "maximum_relative_error",
+        "zero_reference_count",
+    )
+    assert tuple(field.name for field in fields(FloatingComponentComparison)) == (
+        "name",
+        "statistics",
+    )
+    assert tuple(field.name for field in fields(IndexMismatch)) == (
+        "coordinate",
+        "reference_value",
+        "candidate_value",
+    )
+    assert tuple(field.name for field in fields(DiscreteComponentComparison)) == (
+        "name",
+        "exact",
+        "element_count",
+        "exact_count",
+        "mismatch_count",
+        "mismatch_rate",
+        "first_mismatches",
+    )
+    assert tuple(field.name for field in fields(MetricDelta)) == (
+        "metric_name",
+        "reference_value",
+        "candidate_value",
+        "absolute_delta",
+    )
+    assert tuple(field.name for field in fields(CandidateScientificResult)) == (
+        "environment_id",
+        "status",
+        "floating_components",
+        "discrete_components",
+        "metrics",
+    )
+    assert tuple(field.name for field in fields(ScientificComparison)) == (
+        "schema_version",
+        "schema_id",
+        "milestone_id",
+        "comparison_id",
+        "generator",
+        "reference",
+        "candidates",
+        "attempts",
+        "comparability",
+        "scientific_results",
+        "limitations",
     )
 
 
@@ -1467,3 +1597,1031 @@ def test_rejects_invalid_cuda_benchmark_environment_or_allocator(
 
     with pytest.raises(BundleValidationError):
         load_comparable_bundle(bundle)
+
+
+_A2_GENERATOR = ScientificGenerator("d" * 40, False)
+_A2_GATE_NAMES = (
+    "run_schema",
+    "profile",
+    "category",
+    "preprocessing",
+    "feature_contract",
+    "weight_identity",
+    "configuration",
+    "lock_identity",
+    "clean_source",
+    "scientific_source_commit",
+    "inventory_identity",
+    "samples_source",
+    "ordered_sample_ids",
+    "ordered_sample_metadata",
+    "ordered_training_ids",
+    "ordered_test_sample_ids",
+    "ordered_labels",
+    "sample_counts",
+    "memory_bank_contract",
+    "patch_distance_contract",
+    "image_score_contract",
+    "nearest_index_contract",
+    "test_label_contract",
+    "anomaly_map_contract",
+    "mask_contract",
+    "retrieval_semantics",
+    "image_score_semantics",
+    "anomaly_map_semantics",
+    "metric_fields",
+)
+
+
+@pytest.fixture(scope="module")
+def _a2_bundles(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, ComparableBundle]:
+    root = tmp_path_factory.mktemp("portability-science")
+    return {
+        "evaluation": load_comparable_bundle(_bundle(root / "evaluation")),
+        "benchmark": load_comparable_bundle(
+            _bundle(root / "benchmark", benchmark=True)
+        ),
+        "mps": load_comparable_bundle(_bundle(root / "mps", device="mps")),
+    }
+
+
+def _descriptor(
+    bundle: ComparableBundle,
+    environment_id: str,
+    policy_role: str,
+    *,
+    execution_layer: str = "native",
+    os_label: str = "Test OS",
+    hardware_label: str = "Synthetic device",
+) -> ScientificBundleDescriptor:
+    return ScientificBundleDescriptor(
+        bundle=bundle,
+        environment_id=environment_id,
+        policy_role=policy_role,  # type: ignore[arg-type]
+        os_label=os_label,
+        execution_layer=execution_layer,  # type: ignore[arg-type]
+        hardware_label=hardware_label,
+        requested_device=str(bundle.run_metadata["device"]),
+    )
+
+
+def _comparison(
+    reference: ComparableBundle,
+    *candidates: ComparableBundle,
+    attempts: tuple[ScientificExecutionAttempt, ...] = (),
+    candidate_roles: tuple[str, ...] = (),
+) -> ScientificComparison:
+    roles = candidate_roles or ("holdout",) * len(candidates)
+    return compare_scientific_bundles(
+        _descriptor(reference, "reference-env", "reference"),
+        tuple(
+            _descriptor(candidate, f"candidate-{index}", role)
+            for index, (candidate, role) in enumerate(
+                zip(candidates, roles, strict=True), start=1
+            )
+        ),
+        generator=_A2_GENERATOR,
+        attempts=attempts,
+    )
+
+
+def _run_variant(
+    bundle: ComparableBundle, path: tuple[str, ...], value: object
+) -> ComparableBundle:
+    run = portability._thaw_comparison_json(bundle.run_metadata)
+    assert isinstance(run, dict)
+    _set_path(run, path, value)
+    frozen = portability._freeze_json(run)
+    assert isinstance(frozen, dict | portability.MappingProxyType)
+    return replace(bundle, run_metadata=frozen)
+
+
+def _tensor_variant(
+    bundle: ComparableBundle,
+    name: str,
+    index: object,
+    value: float | int,
+) -> ComparableBundle:
+    tensor = getattr(bundle, name).clone()
+    tensor[index] = value
+    return replace(bundle, **{name: tensor})
+
+
+def _floating(
+    comparison: ScientificComparison, name: str, candidate_index: int = 0
+) -> FloatingStatistics:
+    components = comparison.scientific_results[candidate_index].floating_components
+    assert components is not None
+    return next(item.statistics for item in components if item.name == name)
+
+
+def _discrete(
+    comparison: ScientificComparison, name: str, candidate_index: int = 0
+) -> DiscreteComponentComparison:
+    components = comparison.scientific_results[candidate_index].discrete_components
+    assert components is not None
+    return next(item for item in components if item.name == name)
+
+
+def _larger_bank_variant(bundle: ComparableBundle) -> ComparableBundle:
+    added_sample = MvtecSample(
+        "mvtec_ad/bottle/train/good/003.png",
+        "bottle",
+        "train",
+        "good",
+        False,
+        "bottle/train/good/003.png",
+        None,
+    )
+    run = portability._thaw_comparison_json(bundle.run_metadata)
+    assert isinstance(run, dict)
+    run["inventory"]["training_sample_count"] = 2
+    run["inventory"]["total_sample_count"] = 4
+    run["inventory"]["sample_inventory_sha256"] = "0" * 64
+    run["tensors"]["memory_bank"]["shape"] = [2048, 512]
+    run["tensors"]["memory_bank"]["byte_count"] = 2048 * 512 * 4
+    frozen = portability._freeze_json(run)
+    assert isinstance(frozen, dict | portability.MappingProxyType)
+    return replace(
+        bundle,
+        run_metadata=frozen,
+        samples=tuple(
+            sorted((*bundle.samples, added_sample), key=lambda item: item.sample_id)
+        ),
+        memory_bank_metadata=MemoryBankMetadata("float32", (2048, 512), 512, 1024),
+        memory_bank=torch.zeros((2048, 512), dtype=torch.float32),
+        metrics=replace(bundle.metrics, training_sample_count=2),
+    )
+
+
+@pytest.fixture(scope="module")
+def _exact_scientific(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> ScientificComparison:
+    bundle = _a2_bundles["evaluation"]
+    return _comparison(bundle, bundle)
+
+
+@pytest.mark.parametrize(
+    ("reference_kind", "candidate_kind"),
+    (
+        ("evaluation", "evaluation"),
+        ("benchmark", "benchmark"),
+        ("benchmark", "evaluation"),
+        ("evaluation", "benchmark"),
+    ),
+)
+def test_scientific_comparison_supports_all_bundle_kind_pairs(
+    _a2_bundles: dict[str, ComparableBundle],
+    reference_kind: str,
+    candidate_kind: str,
+) -> None:
+    comparison = _comparison(_a2_bundles[reference_kind], _a2_bundles[candidate_kind])
+
+    assert comparison.comparability[0].comparable
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+    assert comparison.reference.bundle_kind == reference_kind
+    assert comparison.candidates[0].bundle_kind == candidate_kind
+    assert tuple(name for name, _ in comparison.comparability[0].gates) == (
+        _A2_GATE_NAMES
+    )
+    assert all(value for _, value in comparison.comparability[0].gates)
+    assert all(
+        component.exact
+        for component in comparison.comparability[0].structural_components
+    )
+
+
+def test_scientific_comparison_preserves_explicit_candidate_order(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    reference = _descriptor(bundle, "reference-env", "reference")
+    candidates = (
+        _descriptor(bundle, "z-candidate", "holdout"),
+        _descriptor(bundle, "a-candidate", "same_stack_control"),
+    )
+
+    comparison = compare_scientific_bundles(
+        reference, candidates, generator=_A2_GENERATOR
+    )
+    document = json.loads(encode_scientific_comparison(comparison))
+
+    assert tuple(item.environment_id for item in comparison.candidates) == (
+        "z-candidate",
+        "a-candidate",
+    )
+    assert tuple(item.environment_id for item in comparison.comparability) == (
+        "z-candidate",
+        "a-candidate",
+    )
+    assert tuple(item.environment_id for item in comparison.scientific_results) == (
+        "z-candidate",
+        "a-candidate",
+    )
+    assert [item["environment_id"] for item in document["candidates"]] == [
+        "z-candidate",
+        "a-candidate",
+    ]
+
+
+@pytest.mark.parametrize("case", ("reference-candidate", "candidate-candidate"))
+def test_scientific_comparison_rejects_duplicate_environment_ids(
+    _a2_bundles: dict[str, ComparableBundle], case: str
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    reference = _descriptor(bundle, "same-env", "reference")
+    candidates = (
+        (
+            _descriptor(bundle, "same-env", "holdout"),
+            _descriptor(bundle, "other-env", "calibration"),
+        )
+        if case == "reference-candidate"
+        else (
+            _descriptor(bundle, "candidate-env", "holdout"),
+            _descriptor(bundle, "candidate-env", "calibration"),
+        )
+    )
+
+    with pytest.raises(ComparisonValidationError):
+        compare_scientific_bundles(reference, candidates, generator=_A2_GENERATOR)
+
+
+@pytest.mark.parametrize("case", ("reference-role", "candidate-role"))
+def test_scientific_comparison_rejects_invalid_bundle_roles(
+    _a2_bundles: dict[str, ComparableBundle], case: str
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    reference = _descriptor(
+        bundle, "reference-env", "holdout" if case == "reference-role" else "reference"
+    )
+    candidate = _descriptor(
+        bundle,
+        "candidate-env",
+        "reference" if case == "candidate-role" else "holdout",
+    )
+
+    with pytest.raises(ComparisonValidationError):
+        compare_scientific_bundles(reference, (candidate,), generator=_A2_GENERATOR)
+
+
+def test_scientific_descriptor_rejects_invalid_execution_layer(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    with pytest.raises(ComparisonValidationError):
+        _descriptor(
+            _a2_bundles["evaluation"],
+            "candidate-env",
+            "holdout",
+            execution_layer="container",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("environment_id", "../private"),
+        ("environment_id", "a" * 65),
+        ("os_label", "/home/alice"),
+        ("os_label", "line\nbreak"),
+        ("hardware_label", "alice@example"),
+        ("hardware_label", "x" * 121),
+        ("requested_device", "cuda"),
+    ),
+)
+def test_scientific_descriptor_rejects_private_or_malformed_identity(
+    _a2_bundles: dict[str, ComparableBundle], field: str, value: str
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    values = {
+        "bundle": bundle,
+        "environment_id": "candidate-env",
+        "policy_role": "holdout",
+        "os_label": "Test OS",
+        "execution_layer": "native",
+        "hardware_label": "Synthetic device",
+        "requested_device": "cpu",
+    }
+    values[field] = value
+
+    with pytest.raises(ComparisonValidationError):
+        ScientificBundleDescriptor(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("name", "index", "value"),
+    (
+        ("memory_bank", (0, 0), 1.0),
+        ("patch_distances", (0, 0), 1.0),
+        ("image_scores", 0, 1.0),
+        ("anomaly_maps", (0, 0, 0), 2.0),
+    ),
+)
+def test_scientific_comparison_observes_one_element_floating_drift(
+    _a2_bundles: dict[str, ComparableBundle],
+    name: str,
+    index: object,
+    value: float,
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    candidate = _tensor_variant(reference, name, index, value)
+
+    comparison = _comparison(reference, candidate)
+    changed = _floating(comparison, name)
+
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+    assert changed.differing_count == 1
+    assert changed.exact_count == changed.element_count - 1
+    assert changed.maximum_absolute_error > 0.0
+    assert changed.mean_absolute_error > 0.0
+    assert changed.root_mean_square_error > 0.0
+    assert all(
+        _floating(comparison, other).differing_count == 0
+        for other in (
+            "memory_bank",
+            "patch_distances",
+            "image_scores",
+            "anomaly_maps",
+        )
+        if other != name
+    )
+
+
+def test_floating_drift_exactly_at_chunk_boundary(
+    _a2_bundles: dict[str, ComparableBundle],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    chunk_size = 257_000
+    candidate_bank = reference.memory_bank.clone()
+    candidate_bank.reshape(-1)[chunk_size] = 1.0
+    candidate = replace(reference, memory_bank=candidate_bank)
+    monkeypatch.setattr(portability, "_FLOAT_CHUNK_SIZE", chunk_size)
+
+    statistics = _floating(_comparison(reference, candidate), "memory_bank")
+
+    assert statistics.differing_count == 1
+    assert statistics.exact_count == reference.memory_bank.numel() - 1
+
+
+def test_floating_difference_allocation_is_bounded_to_multiple_chunks(
+    _a2_bundles: dict[str, ComparableBundle],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    chunk_size = 100_000
+    subtraction_sizes: list[int] = []
+    original = torch.Tensor.sub
+
+    def guarded_sub(
+        tensor: torch.Tensor, other: object, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        if isinstance(other, torch.Tensor):
+            subtraction_sizes.append(tensor.numel())
+            assert tensor.numel() <= chunk_size
+            assert other.numel() <= chunk_size
+        return original(tensor, other, *args, **kwargs)
+
+    monkeypatch.setattr(portability, "_FLOAT_CHUNK_SIZE", chunk_size)
+    monkeypatch.setattr(torch.Tensor, "sub", guarded_sub)
+
+    comparison = _comparison(bundle, bundle)
+
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+    assert len(subtraction_sizes) > 4
+    assert max(subtraction_sizes) <= chunk_size
+
+
+def test_floating_statistics_count_exact_zero_references(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    distances = bundle.patch_distances.clone()
+    distances[0, 0] = 0.0
+    reference = replace(bundle, patch_distances=distances)
+
+    statistics = _floating(_comparison(reference, reference), "patch_distances")
+
+    assert statistics.zero_reference_count == 1
+    assert statistics.differing_count == 0
+    assert statistics.maximum_relative_error == 0.0
+
+
+def test_floating_drift_at_zero_reference_is_excluded_from_relative_maximum(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    reference_distances = bundle.patch_distances.clone()
+    candidate_distances = reference_distances.clone()
+    reference_distances[0, 0] = 0.0
+    candidate_distances[0, 0] = 1.0
+    reference = replace(bundle, patch_distances=reference_distances)
+    candidate = replace(bundle, patch_distances=candidate_distances)
+
+    statistics = _floating(_comparison(reference, candidate), "patch_distances")
+
+    assert statistics.zero_reference_count == 1
+    assert statistics.differing_count == 1
+    assert statistics.maximum_absolute_error == 1.0
+    assert statistics.maximum_relative_error == 0.0
+
+
+def test_all_zero_reference_has_null_relative_error(
+    _exact_scientific: ScientificComparison,
+) -> None:
+    statistics = _floating(_exact_scientific, "memory_bank")
+
+    assert statistics.zero_reference_count == statistics.element_count
+    assert statistics.maximum_relative_error is None
+    document = json.loads(encode_scientific_comparison(_exact_scientific))
+    assert (
+        document["scientific_results"]["candidate-1"]["floating_components"][
+            "memory_bank"
+        ]["maximum_relative_error"]
+        is None
+    )
+
+
+def test_binary64_accumulation_handles_large_finite_float32_values(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    maximum = torch.finfo(torch.float32).max
+    reference_bank = bundle.memory_bank.clone()
+    candidate_bank = bundle.memory_bank.clone()
+    reference_bank[0, 0] = maximum
+    candidate_bank[0, 0] = -maximum
+    reference = replace(bundle, memory_bank=reference_bank)
+    candidate = replace(bundle, memory_bank=candidate_bank)
+
+    statistics = _floating(_comparison(reference, candidate), "memory_bank")
+
+    assert statistics.differing_count == 1
+    assert statistics.maximum_absolute_error == pytest.approx(2.0 * maximum)
+    assert math.isfinite(statistics.root_mean_square_error)
+    assert statistics.maximum_relative_error == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    ("side", "name"),
+    (
+        ("reference", "memory_bank"),
+        ("candidate", "anomaly_maps"),
+    ),
+)
+def test_scientific_comparison_rejects_mutated_nonfinite_tensors(
+    _a2_bundles: dict[str, ComparableBundle], side: str, name: str
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    invalid = _tensor_variant(bundle, name, (0,) * getattr(bundle, name).ndim, math.nan)
+    reference, candidate = (
+        (invalid, bundle) if side == "reference" else (bundle, invalid)
+    )
+
+    with pytest.raises(ComparisonValidationError):
+        _comparison(reference, candidate)
+
+
+def test_scientific_comparison_rejects_mutated_nonfinite_metric(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    candidate = replace(
+        bundle, metrics=replace(bundle.metrics, image_auroc=float("nan"))
+    )
+
+    with pytest.raises(ComparisonValidationError):
+        _comparison(bundle, candidate)
+
+
+@pytest.mark.parametrize("case", ("shape", "dtype"))
+def test_scientific_comparison_rejects_tensor_contract_mutation_after_loading(
+    _a2_bundles: dict[str, ComparableBundle], case: str
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    bank = (
+        bundle.memory_bank.clone().reshape(-1)
+        if case == "shape"
+        else bundle.memory_bank.clone().to(torch.float64)
+    )
+    candidate = replace(bundle, memory_bank=bank)
+
+    with pytest.raises(ComparisonValidationError):
+        _comparison(bundle, candidate)
+
+
+@pytest.mark.parametrize("case", ("index-range", "binary-mask"))
+def test_scientific_comparison_revalidates_discrete_tensor_values(
+    _a2_bundles: dict[str, ComparableBundle], case: str
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    candidate = (
+        _tensor_variant(bundle, "nearest_bank_indices", (0, 0), -1)
+        if case == "index-range"
+        else _tensor_variant(bundle, "evaluation_masks", (0, 0, 0), 2)
+    )
+
+    with pytest.raises(ComparisonValidationError):
+        _comparison(bundle, candidate)
+
+
+def test_nearest_indices_exact_pair(
+    _exact_scientific: ScientificComparison,
+) -> None:
+    component = _discrete(_exact_scientific, "nearest_bank_indices")
+
+    assert component.exact
+    assert component.exact_count == component.element_count
+    assert component.mismatch_count == 0
+    assert component.mismatch_rate == 0.0
+    assert component.first_mismatches == ()
+
+
+def test_nearest_index_mismatch_records_values_and_coordinate(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    candidate = _tensor_variant(bundle, "nearest_bank_indices", (0, 0), 1)
+
+    component = _discrete(_comparison(bundle, candidate), "nearest_bank_indices")
+
+    assert not component.exact
+    assert component.mismatch_count == 1
+    assert component.exact_count == component.element_count - 1
+    assert component.mismatch_rate == pytest.approx(1 / component.element_count)
+    assert component.first_mismatches == (IndexMismatch((0, 0), 0, 1),)
+
+
+def test_nearest_index_mismatch_cap_preserves_row_major_order_and_total(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    indices = bundle.nearest_bank_indices.clone()
+    mismatch_count = portability._INDEX_MISMATCH_LIMIT + 3
+    indices.reshape(-1)[:mismatch_count].add_(1)
+    candidate = replace(bundle, nearest_bank_indices=indices)
+
+    component = _discrete(_comparison(bundle, candidate), "nearest_bank_indices")
+
+    assert component.mismatch_count == mismatch_count
+    assert len(component.first_mismatches) == portability._INDEX_MISMATCH_LIMIT
+    assert tuple(item.coordinate for item in component.first_mismatches) == tuple(
+        (0, column) for column in range(portability._INDEX_MISMATCH_LIMIT)
+    )
+    assert all(
+        item.reference_value == index and item.candidate_value == index + 1
+        for index, item in enumerate(component.first_mismatches)
+    )
+
+
+def test_mask_mismatch_count_is_complete_without_coordinate_payload(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    masks = bundle.evaluation_masks.clone()
+    masks[0, 0, 1] = 1
+    candidate = replace(
+        bundle,
+        evaluation_masks=masks,
+        metrics=replace(bundle.metrics, anomalous_pixel_count=2),
+    )
+
+    component = _discrete(_comparison(bundle, candidate), "evaluation_masks")
+
+    assert not component.exact
+    assert component.mismatch_count == 1
+    assert component.exact_count == component.element_count - 1
+    assert component.first_mismatches == ()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_false"),
+    (
+        ("category", ("category",)),
+        ("profile", ("profile",)),
+        (
+            "source",
+            ("clean_source", "scientific_source_commit"),
+        ),
+        ("lock", ("lock_identity",)),
+        ("weight", ("weight_identity",)),
+        ("inventory", ("inventory_identity",)),
+        ("ordered-ids", ("ordered_test_sample_ids",)),
+        ("ordered-labels", ("ordered_labels",)),
+        (
+            "tensor-contract",
+            ("memory_bank_contract",),
+        ),
+    ),
+)
+def test_structurally_incomparable_candidates_expose_all_failed_gates_and_no_drift(
+    _a2_bundles: dict[str, ComparableBundle],
+    case: str,
+    expected_false: tuple[str, ...],
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    if case == "category":
+        candidate = _run_variant(reference, ("category",), "capsule")
+    elif case == "profile":
+        candidate = _run_variant(reference, ("profile_id",), "other-profile")
+    elif case == "source":
+        candidate = _run_variant(reference, ("source", "dirty"), True)
+        candidate = _run_variant(candidate, ("source", "git_commit"), "e" * 40)
+    elif case == "lock":
+        candidate = _run_variant(reference, ("source", "uv_lock_sha256"), "e" * 64)
+    elif case == "weight":
+        candidate = _run_variant(reference, ("weights", "cached_file_sha256"), "e" * 64)
+    elif case == "inventory":
+        candidate = _run_variant(
+            reference, ("inventory", "sample_inventory_sha256"), "e" * 64
+        )
+    elif case == "ordered-ids":
+        candidate = replace(
+            reference, test_sample_ids=tuple(reversed(reference.test_sample_ids))
+        )
+    elif case == "ordered-labels":
+        candidate = replace(reference, test_labels=reference.test_labels.flip(0))
+    else:
+        candidate = _larger_bank_variant(reference)
+
+    comparison = _comparison(reference, candidate)
+    comparability = comparison.comparability[0]
+    result = comparison.scientific_results[0]
+    failed = {name for name, exact in comparability.gates if not exact}
+
+    assert not comparability.comparable
+    assert set(expected_false) <= failed
+    assert result.status == "structurally_incomparable"
+    assert result.floating_components is None
+    assert result.discrete_components is None
+    assert result.metrics is None
+    document = json.loads(encode_scientific_comparison(comparison))
+    assert document["scientific_results"]["candidate-1"] == {
+        "status": "structurally_incomparable"
+    }
+    structural = {item.name: item for item in comparability.structural_components}
+    if case == "ordered-ids":
+        assert structural["test_sample_ids"].mismatch_count == 2
+        assert not structural["test_sample_ids"].exact
+    if case == "ordered-labels":
+        assert structural["test_labels"].mismatch_count == 2
+        assert not structural["test_labels"].exact
+
+
+def test_scientific_gates_report_every_independent_incompatibility(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    candidate = _run_variant(reference, ("category",), "capsule")
+    candidate = _run_variant(candidate, ("profile_id",), "other-profile")
+    candidate = _run_variant(candidate, ("source", "uv_lock_sha256"), "e" * 64)
+
+    failed = {
+        name
+        for name, exact in _comparison(reference, candidate).comparability[0].gates
+        if not exact
+    }
+
+    assert {"category", "profile", "lock_identity"} <= failed
+
+
+def test_sha256_identity_is_case_insensitive(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    candidate = _run_variant(
+        reference, ("source", "uv_lock_sha256"), _ACCEPTED_LOCK_SHA256.upper()
+    )
+    candidate = _run_variant(
+        candidate,
+        ("weights", "cached_file_sha256"),
+        _ACCEPTED_WEIGHT_SHA256.upper(),
+    )
+
+    comparison = _comparison(reference, candidate)
+
+    assert comparison.comparability[0].comparable
+    assert comparison.candidates[0].run["source"]["uv_lock_sha256"] == (
+        _ACCEPTED_LOCK_SHA256
+    )
+    assert comparison.candidates[0].run["weights"]["cached_file_sha256"] == (
+        _ACCEPTED_WEIGHT_SHA256
+    )
+
+
+def test_expected_platform_varying_identities_are_not_scientific_gates(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    candidate = _run_variant(reference, ("run_id",), "different-run")
+    candidate = _run_variant(
+        candidate, ("environment", "python_version"), "3.11.15-platform-build"
+    )
+    candidate = _run_variant(
+        candidate,
+        ("environment", "dependency_versions", "torch"),
+        "2.13.0+platform",
+    )
+    candidate = _run_variant(
+        candidate,
+        ("environment", "platform_description"),
+        "Private host diagnostic",
+    )
+
+    comparison = _comparison(reference, candidate)
+    encoded = encode_scientific_comparison(comparison)
+
+    assert comparison.comparability[0].comparable
+    assert b"Private host diagnostic" not in encoded
+    assert b"platform_description" not in encoded
+
+
+def test_metric_deltas_use_frozen_order_and_exact_values(
+    _exact_scientific: ScientificComparison,
+) -> None:
+    metrics = _exact_scientific.scientific_results[0].metrics
+    assert metrics is not None
+
+    assert tuple(item.metric_name for item in metrics) == (
+        "image_auroc",
+        "image_average_precision",
+        "pixel_auroc",
+    )
+    assert all(
+        item.reference_value == 1.0
+        and item.candidate_value == 1.0
+        and item.absolute_delta == 0.0
+        for item in metrics
+    )
+
+
+def test_metric_delta_observes_controlled_nonzero_change(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    candidate = replace(bundle, metrics=replace(bundle.metrics, image_auroc=0.75))
+
+    comparison = _comparison(bundle, candidate)
+    metrics = comparison.scientific_results[0].metrics
+    assert metrics is not None
+
+    assert metrics[0] == MetricDelta("image_auroc", 1.0, 0.75, 0.25)
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+
+
+def test_exact_pair_remains_unclassified_and_has_no_policy_fields(
+    _exact_scientific: ScientificComparison,
+) -> None:
+    document = json.loads(encode_scientific_comparison(_exact_scientific))
+
+    assert _exact_scientific.scientific_results[0].status == ("observed_unclassified")
+    assert "policy" not in document
+    assert document["scientific_results"]["candidate-1"]["status"] not in {
+        "accepted",
+        "within_policy",
+        "drift_detected",
+        "passed",
+        "failed",
+    }
+    assert b"policy_violation" not in encode_scientific_comparison(_exact_scientific)
+
+
+def test_completed_mps_execution_is_a_normal_post_policy_candidate(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    candidate = _a2_bundles["mps"]
+
+    comparison = _comparison(
+        reference,
+        candidate,
+        candidate_roles=("post_policy_attempt",),
+    )
+
+    assert comparison.candidates[0].policy_role == "post_policy_attempt"
+    assert comparison.candidates[0].requested_device == "mps"
+    assert comparison.attempts == ()
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+
+
+@pytest.mark.parametrize(
+    ("status", "reason_code", "stage_code"),
+    (
+        ("unsupported", "mps_backend_unavailable", "device_resolution"),
+        ("execution_failed", "operator_unsupported", "evaluation"),
+    ),
+)
+def test_non_gating_execution_attempt_outcomes_are_separate_from_candidates(
+    _a2_bundles: dict[str, ComparableBundle],
+    status: str,
+    reason_code: str,
+    stage_code: str,
+) -> None:
+    attempt = ScientificExecutionAttempt(
+        "mps-attempt",
+        status,  # type: ignore[arg-type]
+        reason_code,
+        stage_code,
+    )
+    bundle = _a2_bundles["evaluation"]
+
+    comparison = _comparison(bundle, bundle, attempts=(attempt,))
+
+    assert comparison.attempts == (attempt,)
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+    document = json.loads(encode_scientific_comparison(comparison))
+    assert document["attempts"] == [
+        {
+            "environment_id": "mps-attempt",
+            "gating": False,
+            "policy_role": "post_policy_attempt",
+            "reason_code": reason_code,
+            "stage_code": stage_code,
+            "status": status,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("reason_code", "RuntimeError: /Users/alice"),
+        ("reason_code", "driver\nfailed"),
+        ("reason_code", "a" * 65),
+        ("stage_code", "model load"),
+        ("stage_code", "../evaluation"),
+        ("status", "completed"),
+    ),
+)
+def test_execution_attempt_rejects_raw_or_impossible_values(
+    field: str, value: object
+) -> None:
+    values = {
+        "environment_id": "mps-attempt",
+        "status": "unsupported",
+        "reason_code": "mps_backend_unavailable",
+        "stage_code": "device_resolution",
+    }
+    values[field] = value
+
+    with pytest.raises(ComparisonValidationError):
+        ScientificExecutionAttempt(**values)  # type: ignore[arg-type]
+
+
+def test_candidate_and_attempt_environment_collision_is_rejected(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    attempt = ScientificExecutionAttempt(
+        "candidate-env",
+        "unsupported",
+        "mps_backend_unavailable",
+        "device_resolution",
+    )
+
+    with pytest.raises(ComparisonValidationError):
+        compare_scientific_bundles(
+            _descriptor(bundle, "reference-env", "reference"),
+            (_descriptor(bundle, "candidate-env", "holdout"),),
+            generator=_A2_GENERATOR,
+            attempts=(attempt,),
+        )
+
+
+def test_comparison_id_is_deterministic_and_input_sensitive(
+    _a2_bundles: dict[str, ComparableBundle],
+    _exact_scientific: ScientificComparison,
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    repeated = _comparison(bundle, bundle)
+    changed_generator = compare_scientific_bundles(
+        _descriptor(bundle, "reference-env", "reference"),
+        (_descriptor(bundle, "candidate-1", "holdout"),),
+        generator=ScientificGenerator("e" * 40, False),
+    )
+
+    assert repeated.comparison_id == _exact_scientific.comparison_id
+    assert changed_generator.comparison_id != repeated.comparison_id
+    assert len(repeated.comparison_id) == 64
+    assert all(character in "0123456789abcdef" for character in repeated.comparison_id)
+
+
+def test_repeated_canonical_encoding_is_byte_identical_and_reloadable(
+    _exact_scientific: ScientificComparison,
+) -> None:
+    first = encode_scientific_comparison(_exact_scientific)
+    second = encode_scientific_comparison(_exact_scientific)
+
+    assert first == second
+    assert json.loads(first) == json.loads(second)
+    assert first == _canonical(json.loads(first))
+    assert first.count(b"\n") == 1
+    assert first.endswith(b"\n")
+
+
+def test_equivalent_reconstructed_records_encode_identically(
+    tmp_path: Path,
+) -> None:
+    left = load_comparable_bundle(_bundle(tmp_path / "left"))
+    right = load_comparable_bundle(_bundle(tmp_path / "right"))
+
+    left_comparison = _comparison(left, left)
+    right_comparison = _comparison(right, right)
+
+    assert left is not right
+    assert left.source_files == right.source_files
+    assert left_comparison.comparison_id == right_comparison.comparison_id
+    assert encode_scientific_comparison(left_comparison) == (
+        encode_scientific_comparison(right_comparison)
+    )
+
+
+def test_canonical_output_contains_no_absolute_or_private_bundle_path(
+    _a2_bundles: dict[str, ComparableBundle],
+    _exact_scientific: ScientificComparison,
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    encoded = encode_scientific_comparison(_exact_scientific)
+
+    assert str(bundle.path).encode() not in encoded
+    assert str(bundle.path.parent).encode() not in encoded
+    assert b"/private/mvtec-ad" not in encoded
+    assert b"dataset_root" not in encoded
+    assert b"benchmark" not in json.loads(encoded)["reference"]
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        (
+            ("environment", "python_version"),
+            "Python (/usr/local/bin/python3)",
+        ),
+        (
+            ("environment", "dependency_versions", "inspectrt"),
+            "editable install /home/alice/private-project",
+        ),
+    ),
+)
+def test_scientific_identity_rejects_embedded_private_paths(
+    _a2_bundles: dict[str, ComparableBundle],
+    path: tuple[str, ...],
+    value: str,
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    candidate = _run_variant(bundle, path, value)
+
+    with pytest.raises(ComparisonValidationError):
+        _comparison(bundle, candidate)
+
+
+def test_comparison_and_encoding_leave_source_files_tensors_and_records_unchanged(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    source_state = _source_state(bundle.path)
+    tensor_state = {
+        name: getattr(bundle, name).clone()
+        for name in (
+            "test_labels",
+            "image_scores",
+            "memory_bank",
+            "patch_distances",
+            "nearest_bank_indices",
+            "anomaly_maps",
+            "evaluation_masks",
+        )
+    }
+    tensor_ids = {name: id(getattr(bundle, name)) for name in tensor_state}
+    record_state = (
+        bundle.source_files,
+        bundle.samples,
+        bundle.predictions,
+        bundle.test_sample_ids,
+        bundle.memory_bank_metadata,
+        bundle.metrics,
+    )
+
+    comparison = _comparison(bundle, bundle)
+    encode_scientific_comparison(comparison)
+
+    assert _source_state(bundle.path) == source_state
+    assert all(
+        id(getattr(bundle, name)) == tensor_ids[name]
+        and torch.equal(getattr(bundle, name), before)
+        for name, before in tensor_state.items()
+    )
+    assert (
+        bundle.source_files,
+        bundle.samples,
+        bundle.predictions,
+        bundle.test_sample_ids,
+        bundle.memory_bank_metadata,
+        bundle.metrics,
+    ) == record_state
+    with pytest.raises(FrozenInstanceError):
+        comparison.schema_version = 2  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        comparison.reference.run["category"] = "changed"  # type: ignore[index]

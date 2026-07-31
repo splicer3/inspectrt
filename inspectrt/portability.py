@@ -1,6 +1,6 @@
 """Strict loading of frozen schema-1 baseline run bundles."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -28,10 +28,25 @@ from inspectrt.metrics import (
 __all__ = (
     "BundleMetrics",
     "BundleValidationError",
+    "CandidateComparability",
+    "CandidateScientificResult",
     "ComparableBundle",
+    "ComparisonValidationError",
+    "DiscreteComponentComparison",
+    "FloatingComponentComparison",
+    "FloatingStatistics",
+    "IndexMismatch",
     "MemoryBankMetadata",
+    "MetricDelta",
     "PredictionRecord",
+    "ScientificBundleDescriptor",
+    "ScientificComparison",
+    "ScientificExecutionAttempt",
+    "ScientificGenerator",
+    "ScientificRunIdentity",
     "SourceFileSnapshot",
+    "compare_scientific_bundles",
+    "encode_scientific_comparison",
     "load_comparable_bundle",
 )
 
@@ -152,10 +167,52 @@ _EMBEDDING_DIMENSION = 512
 _MAP_SIZE = (256, 256)
 _WEIGHT_ENUM = "ResNet50_Weights.IMAGENET1K_V2"
 _WEIGHT_URL = "https://download.pytorch.org/models/resnet50-11ad3fa6.pth"
+_SCIENTIFIC_SOURCE_COMMIT = "bc330b9070c5ca8db9cb7cfbb27617256388536b"
+_ACCEPTED_LOCK_SHA256 = (
+    "ddaddc99b318a1c3a04d5d7cc433cf736d321b56f98a8ae8b532e71e19e6d76b"
+)
+_ACCEPTED_WEIGHT_SHA256 = (
+    "11ad3fa62ca79e40addfd354a8ec4b7c75143b3038b8d2a807fbc68deab379ca"
+)
+_SCHEMA_ID = "inspectrt_portability_comparison_v1"
+_MILESTONE_ID = "inspectrt_cross_platform_evidence_v1"
+_FLOAT_CHUNK_SIZE = 65_536
+_INDEX_MISMATCH_LIMIT = 16
+_SCIENTIFIC_METRICS = (
+    "image_auroc",
+    "image_average_precision",
+    "pixel_auroc",
+)
+_IMAGE_SCORE_SEMANTICS = "maximum patch distance"
+_POLICY_ROLES = {
+    "reference",
+    "same_stack_control",
+    "calibration",
+    "holdout",
+    "post_policy_attempt",
+}
+_CANDIDATE_ROLES = _POLICY_ROLES - {"reference"}
+_EXECUTION_LAYERS = {"native", "wsl2"}
+_ATTEMPT_STATUSES = {"unsupported", "execution_failed"}
+_CANDIDATE_STATUSES = {"structurally_incomparable", "observed_unclassified"}
+_ENVIRONMENT_ID = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
+_MACHINE_CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+_REQUESTED_DEVICE = re.compile(r"(?:cpu|mps|cuda:[0-9]+)")
+_MAP_INTERPOLATION = {
+    "align_corners": False,
+    "input_size": [32, 32],
+    "mode": "bilinear",
+    "output_size": [256, 256],
+    "values": "raw squared-L2 patch distances",
+}
 
 
 class BundleValidationError(ValueError):
     """A comparable bundle violates the frozen schema-1 contract."""
+
+
+class ComparisonValidationError(BundleValidationError):
+    """A scientific comparison input or record is invalid."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +285,214 @@ class ComparableBundle:
     anomaly_maps: Tensor
     evaluation_masks: Tensor
     metrics: BundleMetrics
+
+
+@dataclass(frozen=True, slots=True)
+class ScientificBundleDescriptor:
+    """One loaded bundle plus caller-supplied sanitized public identity."""
+
+    bundle: ComparableBundle
+    environment_id: str
+    policy_role: Literal[
+        "reference",
+        "same_stack_control",
+        "calibration",
+        "holdout",
+        "post_policy_attempt",
+    ]
+    os_label: str
+    execution_layer: Literal["native", "wsl2"]
+    hardware_label: str
+    requested_device: str
+
+    def __post_init__(self) -> None:
+        if type(self.bundle) is not ComparableBundle:
+            raise ComparisonValidationError(
+                "bundle descriptor must contain a ComparableBundle"
+            )
+        _environment_id(self.environment_id, "environment_id")
+        if type(self.policy_role) is not str or self.policy_role not in _POLICY_ROLES:
+            raise ComparisonValidationError("policy_role is invalid")
+        _public_label(self.os_label, "os_label")
+        if (
+            type(self.execution_layer) is not str
+            or self.execution_layer not in _EXECUTION_LAYERS
+        ):
+            raise ComparisonValidationError("execution_layer is invalid")
+        _public_label(self.hardware_label, "hardware_label")
+        if type(self.requested_device) is not str or not _REQUESTED_DEVICE.fullmatch(
+            self.requested_device
+        ):
+            raise ComparisonValidationError("requested_device is invalid")
+        if self.requested_device == "mps" and self.policy_role != "post_policy_attempt":
+            raise ComparisonValidationError(
+                "MPS bundles must use policy_role post_policy_attempt"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ScientificExecutionAttempt:
+    """Sanitized non-gating execution outcome that produced no bundle."""
+
+    environment_id: str
+    status: Literal["unsupported", "execution_failed"]
+    reason_code: str
+    stage_code: str
+
+    def __post_init__(self) -> None:
+        _environment_id(self.environment_id, "attempt.environment_id")
+        if type(self.status) is not str or self.status not in _ATTEMPT_STATUSES:
+            raise ComparisonValidationError("attempt status is invalid")
+        _machine_code(self.reason_code, "attempt.reason_code")
+        _machine_code(self.stage_code, "attempt.stage_code")
+
+
+@dataclass(frozen=True, slots=True)
+class ScientificGenerator:
+    """Explicit sanitized identity of the comparison implementation."""
+
+    source_commit: str
+    dirty: bool
+
+    def __post_init__(self) -> None:
+        if type(self.source_commit) is not str or not _COMMIT.fullmatch(
+            self.source_commit
+        ):
+            raise ComparisonValidationError(
+                "generator source_commit must be a full lowercase commit hash"
+            )
+        if type(self.dirty) is not bool:
+            raise ComparisonValidationError("generator dirty must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class ScientificRunIdentity:
+    """Sanitized portable identity projected from one loaded bundle."""
+
+    environment_id: str
+    policy_role: str
+    bundle_kind: Literal["evaluation", "benchmark"]
+    os_label: str
+    execution_layer: Literal["native", "wsl2"]
+    hardware_label: str
+    requested_device: str
+    run: Mapping[str, object]
+    source_files: tuple[SourceFileSnapshot, ...]
+    benchmark_workload: Mapping[str, object] | None
+    benchmark_methodology: Mapping[str, object] | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run", _freeze_comparison_json(self.run))
+        if self.benchmark_workload is not None:
+            object.__setattr__(
+                self,
+                "benchmark_workload",
+                _freeze_comparison_json(self.benchmark_workload),
+            )
+        if self.benchmark_methodology is not None:
+            object.__setattr__(
+                self,
+                "benchmark_methodology",
+                _freeze_comparison_json(self.benchmark_methodology),
+            )
+        _validate_scientific_run_identity(self)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateComparability:
+    """Every exact scientific compatibility gate for one candidate."""
+
+    environment_id: str
+    comparable: bool
+    gates: tuple[tuple[str, bool], ...]
+    structural_components: tuple["DiscreteComponentComparison", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FloatingStatistics:
+    """Chunked drift.
+
+    ``maximum_relative_error`` is ``abs(candidate-reference) / abs(reference)``
+    over nonzero reference values. Zero references are counted and excluded;
+    the field is ``None`` when every reference value is zero.
+    """
+
+    element_count: int
+    exact_count: int
+    differing_count: int
+    maximum_absolute_error: float
+    mean_absolute_error: float
+    root_mean_square_error: float
+    maximum_relative_error: float | None
+    zero_reference_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FloatingComponentComparison:
+    """Named floating artifact comparison."""
+
+    name: str
+    statistics: FloatingStatistics
+
+
+@dataclass(frozen=True, slots=True)
+class IndexMismatch:
+    """One bounded row-major nearest-index mismatch."""
+
+    coordinate: tuple[int, int]
+    reference_value: int
+    candidate_value: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiscreteComponentComparison:
+    """Named exact discrete comparison and optional bounded index diagnostics."""
+
+    name: str
+    exact: bool
+    element_count: int
+    exact_count: int
+    mismatch_count: int
+    mismatch_rate: float
+    first_mismatches: tuple[IndexMismatch, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MetricDelta:
+    """One frozen metric observation in contract order."""
+
+    metric_name: str
+    reference_value: float
+    candidate_value: float
+    absolute_delta: float
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateScientificResult:
+    """Observation-only result for one completed candidate bundle."""
+
+    environment_id: str
+    status: Literal["structurally_incomparable", "observed_unclassified"]
+    floating_components: tuple[FloatingComponentComparison, ...] | None
+    discrete_components: tuple[DiscreteComponentComparison, ...] | None
+    metrics: tuple[MetricDelta, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScientificComparison:
+    """Immutable schema-1 scientific comparison record."""
+
+    schema_version: int
+    schema_id: str
+    milestone_id: str
+    comparison_id: str
+    generator: ScientificGenerator
+    reference: ScientificRunIdentity
+    candidates: tuple[ScientificRunIdentity, ...]
+    attempts: tuple[ScientificExecutionAttempt, ...]
+    comparability: tuple[CandidateComparability, ...]
+    scientific_results: tuple[CandidateScientificResult, ...]
+    limitations: tuple[str, ...]
 
 
 def load_comparable_bundle(bundle_path: Path) -> ComparableBundle:
@@ -344,6 +609,208 @@ def load_comparable_bundle(bundle_path: Path) -> ComparableBundle:
         evaluation_masks=evaluation_masks,
         metrics=metrics,
     )
+
+
+def compare_scientific_bundles(
+    reference: ScientificBundleDescriptor,
+    candidates: Sequence[ScientificBundleDescriptor],
+    *,
+    generator: ScientificGenerator,
+    attempts: Sequence[ScientificExecutionAttempt] = (),
+) -> ScientificComparison:
+    """Compare one frozen reference with candidates without applying a policy."""
+    if type(reference) is not ScientificBundleDescriptor:
+        raise ComparisonValidationError(
+            "reference must be a ScientificBundleDescriptor"
+        )
+    if type(generator) is not ScientificGenerator:
+        raise ComparisonValidationError("generator must be a ScientificGenerator")
+    candidate_records = _comparison_sequence(
+        candidates, ScientificBundleDescriptor, "candidates"
+    )
+    if not candidate_records:
+        raise ComparisonValidationError("at least one candidate is required")
+    attempt_records = _comparison_sequence(
+        attempts, ScientificExecutionAttempt, "attempts"
+    )
+    if reference.policy_role != "reference":
+        raise ComparisonValidationError("reference policy_role must be reference")
+    if any(
+        candidate.policy_role not in _CANDIDATE_ROLES for candidate in candidate_records
+    ):
+        raise ComparisonValidationError("candidate policy_role must not be reference")
+
+    environment_ids = (
+        reference.environment_id,
+        *(candidate.environment_id for candidate in candidate_records),
+        *(attempt.environment_id for attempt in attempt_records),
+    )
+    if len(environment_ids) != len(set(environment_ids)):
+        raise ComparisonValidationError(
+            "environment IDs must be unique across bundles and attempts"
+        )
+
+    descriptors = (reference, *candidate_records)
+    for descriptor in descriptors:
+        _revalidate_comparable_bundle(descriptor.bundle)
+        recorded_device = _comparison_string(
+            _comparison_mapping(
+                descriptor.bundle.run_metadata, "bundle.run_metadata"
+            ).get("device"),
+            "bundle.run_metadata.device",
+        )
+        if descriptor.requested_device != recorded_device:
+            raise ComparisonValidationError(
+                f"{descriptor.environment_id}: requested_device differs from the bundle"
+            )
+
+    reference_identity = _scientific_run_identity(reference)
+    candidate_identities = tuple(
+        _scientific_run_identity(candidate) for candidate in candidate_records
+    )
+    identity_payload = {
+        "attempts": [_attempt_value(attempt) for attempt in attempt_records],
+        "candidates": [
+            _run_identity_value(identity) for identity in candidate_identities
+        ],
+        "generator": _generator_value(generator),
+        "milestone_id": _MILESTONE_ID,
+        "reference": _run_identity_value(reference_identity),
+        "schema_id": _SCHEMA_ID,
+        "schema_version": 1,
+    }
+    # The ID is the full SHA-256 of this canonical identity payload; it excludes
+    # itself and all measured results.
+    comparison_id = hashlib.sha256(_canonical_json(identity_payload)).hexdigest()
+
+    comparability = []
+    results = []
+    for candidate in candidate_records:
+        gates = _scientific_gates(reference.bundle, candidate.bundle)
+        comparable = all(result for _, result in gates)
+        structural_components = (
+            _structural_sequence_discrete(
+                "test_sample_ids",
+                reference.bundle.test_sample_ids,
+                candidate.bundle.test_sample_ids,
+            ),
+            _structural_tensor_discrete(
+                "test_labels",
+                reference.bundle.test_labels,
+                candidate.bundle.test_labels,
+            ),
+        )
+        comparability.append(
+            CandidateComparability(
+                candidate.environment_id,
+                comparable,
+                gates,
+                structural_components,
+            )
+        )
+        if not comparable:
+            results.append(
+                CandidateScientificResult(
+                    candidate.environment_id,
+                    "structurally_incomparable",
+                    None,
+                    None,
+                    None,
+                )
+            )
+            continue
+
+        floating = tuple(
+            FloatingComponentComparison(
+                name,
+                _floating_statistics(
+                    getattr(reference.bundle, name),
+                    getattr(candidate.bundle, name),
+                    name,
+                ),
+            )
+            for name in (
+                "memory_bank",
+                "patch_distances",
+                "image_scores",
+                "anomaly_maps",
+            )
+        )
+        discrete = (
+            _sequence_discrete(
+                "test_sample_ids",
+                reference.bundle.test_sample_ids,
+                candidate.bundle.test_sample_ids,
+            ),
+            _tensor_discrete(
+                "test_labels",
+                reference.bundle.test_labels,
+                candidate.bundle.test_labels,
+            ),
+            _tensor_discrete(
+                "evaluation_masks",
+                reference.bundle.evaluation_masks,
+                candidate.bundle.evaluation_masks,
+            ),
+            _nearest_index_comparison(
+                reference.bundle.nearest_bank_indices,
+                candidate.bundle.nearest_bank_indices,
+            ),
+        )
+        metrics = tuple(
+            MetricDelta(
+                metric_name=name,
+                reference_value=getattr(reference.bundle.metrics, name),
+                candidate_value=getattr(candidate.bundle.metrics, name),
+                absolute_delta=abs(
+                    getattr(candidate.bundle.metrics, name)
+                    - getattr(reference.bundle.metrics, name)
+                ),
+            )
+            for name in _SCIENTIFIC_METRICS
+        )
+        results.append(
+            CandidateScientificResult(
+                candidate.environment_id,
+                "observed_unclassified",
+                floating,
+                discrete,
+                metrics,
+            )
+        )
+
+    return ScientificComparison(
+        schema_version=1,
+        schema_id=_SCHEMA_ID,
+        milestone_id=_MILESTONE_ID,
+        comparison_id=comparison_id,
+        generator=generator,
+        reference=reference_identity,
+        candidates=candidate_identities,
+        attempts=attempt_records,
+        comparability=tuple(comparability),
+        scientific_results=tuple(results),
+        limitations=(
+            "observation_only_no_policy",
+            "nominal_memory_bank_and_downstream_artifacts_only",
+            "source_hashes_are_current_bundle_snapshots",
+        ),
+    )
+
+
+def encode_scientific_comparison(comparison: ScientificComparison) -> bytes:
+    """Return canonical in-memory ``scientific.json`` UTF-8 bytes."""
+    if type(comparison) is not ScientificComparison:
+        raise ComparisonValidationError(
+            "comparison must be a ScientificComparison record"
+        )
+    _validate_scientific_comparison(comparison)
+    try:
+        return _canonical_json(_scientific_comparison_value(comparison))
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise ComparisonValidationError(
+            "scientific comparison cannot be canonically encoded"
+        ) from error
 
 
 def _validate_bundle_directory(path: Path) -> Path:
@@ -688,14 +1155,7 @@ def _validate_run(
     _equals(weights["source_url"], _WEIGHT_URL, "run.json.weights.source_url")
 
     interpolation = _object(run["map_interpolation"], "run.json.map_interpolation")
-    expected_interpolation = {
-        "align_corners": False,
-        "input_size": [32, 32],
-        "mode": "bilinear",
-        "output_size": [256, 256],
-        "values": "raw squared-L2 patch distances",
-    }
-    if _canonical_json(interpolation) != _canonical_json(expected_interpolation):
+    if _canonical_json(interpolation) != _canonical_json(_MAP_INTERPOLATION):
         raise BundleValidationError("run.json.map_interpolation is invalid")
 
     inventory = _object(run["inventory"], "run.json.inventory")
@@ -1523,3 +1983,1197 @@ def _freeze_json(value: object) -> object:
     if type(value) is list:
         return tuple(_freeze_json(item) for item in value)
     return value
+
+
+def _comparison_sequence(
+    value: object, expected_type: type, name: str
+) -> tuple[object, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ComparisonValidationError(f"{name} must be an ordered collection")
+    result = tuple(value)
+    if any(type(item) is not expected_type for item in result):
+        raise ComparisonValidationError(
+            f"{name} contains an invalid {expected_type.__name__} record"
+        )
+    return result
+
+
+def _environment_id(value: object, name: str) -> str:
+    if type(value) is not str or not _ENVIRONMENT_ID.fullmatch(value) or "--" in value:
+        raise ComparisonValidationError(
+            f"{name} must be a bounded lowercase kebab-case token"
+        )
+    return value
+
+
+def _machine_code(value: object, name: str) -> str:
+    if type(value) is not str or len(value) > 64 or not _MACHINE_CODE.fullmatch(value):
+        raise ComparisonValidationError(
+            f"{name} must be a bounded lowercase snake-case token"
+        )
+    return value
+
+
+def _public_label(value: object, name: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > 120
+        or any(ord(character) < 32 for character in value)
+        or any(fragment in value for fragment in ("/", "\\", "@", "://", "~"))
+    ):
+        raise ComparisonValidationError(f"{name} is not a sanitized public label")
+    return value
+
+
+def _comparison_mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or any(type(key) is not str for key in value):
+        raise ComparisonValidationError(f"{name} must be a string-keyed mapping")
+    return value
+
+
+def _comparison_string(value: object, name: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ComparisonValidationError(f"{name} must be a nonempty string")
+    return value
+
+
+def _comparison_integer(value: object, name: str, *, positive: bool = False) -> int:
+    if type(value) is not int or value < int(positive):
+        qualifier = "positive" if positive else "nonnegative"
+        raise ComparisonValidationError(f"{name} must be a {qualifier} integer")
+    return value
+
+
+def _comparison_boolean(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise ComparisonValidationError(f"{name} must be a boolean")
+    return value
+
+
+def _comparison_sha256(value: object, name: str) -> str:
+    result = _comparison_string(value, name)
+    if not _SHA256.fullmatch(result):
+        raise ComparisonValidationError(f"{name} must be a SHA-256 hex digest")
+    return result.lower()
+
+
+def _comparison_commit(value: object, name: str) -> str:
+    result = _comparison_string(value, name)
+    if not _COMMIT.fullmatch(result):
+        raise ComparisonValidationError(f"{name} must be a full lowercase commit hash")
+    return result
+
+
+def _comparison_tensor(
+    value: object,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    finite: bool = False,
+) -> Tensor:
+    if type(value) is not Tensor:
+        raise ComparisonValidationError(f"{name} must be a base torch.Tensor")
+    if value.device.type != "cpu":
+        raise ComparisonValidationError(f"{name} must be on the CPU")
+    if value.is_nested or value.layout is not torch.strided:
+        raise ComparisonValidationError(f"{name} must use dense strided storage")
+    if value.dtype != dtype:
+        raise ComparisonValidationError(f"{name} must use {dtype}")
+    if tuple(value.shape) != shape:
+        raise ComparisonValidationError(f"{name} must have shape {shape}")
+    if not value.is_contiguous():
+        raise ComparisonValidationError(f"{name} must be contiguous")
+    if finite:
+        flattened = value.reshape(-1)
+        for start in range(0, flattened.numel(), _FLOAT_CHUNK_SIZE):
+            if (
+                not torch.isfinite(flattened[start : start + _FLOAT_CHUNK_SIZE])
+                .all()
+                .item()
+            ):
+                raise ComparisonValidationError(
+                    f"{name} must contain only finite values"
+                )
+    return value
+
+
+def _revalidate_comparable_bundle(bundle: ComparableBundle) -> None:
+    """Recheck mutable payloads of an already loaded bundle."""
+    if type(bundle) is not ComparableBundle:
+        raise ComparisonValidationError("comparison bundle must be ComparableBundle")
+    test_count = len(bundle.test_sample_ids)
+    bank_shape = bundle.memory_bank_metadata.shape
+    rows = bank_shape[0]
+    _comparison_tensor(
+        bundle.memory_bank,
+        "bundle.memory_bank",
+        bank_shape,
+        torch.float32,
+        finite=True,
+    )
+    retrieval_shape = (test_count, _PATCH_COUNT)
+    distances = _comparison_tensor(
+        bundle.patch_distances,
+        "bundle.patch_distances",
+        retrieval_shape,
+        torch.float32,
+        finite=True,
+    )
+    if torch.lt(distances, 0).any().item():
+        raise ComparisonValidationError("bundle.patch_distances must be nonnegative")
+    indices = _comparison_tensor(
+        bundle.nearest_bank_indices,
+        "bundle.nearest_bank_indices",
+        retrieval_shape,
+        torch.int64,
+    )
+    if torch.lt(indices, 0).any().item() or torch.ge(indices, rows).any().item():
+        raise ComparisonValidationError(
+            "bundle nearest indices lie outside the memory bank"
+        )
+    labels = _comparison_tensor(
+        bundle.test_labels,
+        "bundle.test_labels",
+        (test_count,),
+        torch.uint8,
+    )
+    if not torch.logical_or(labels == 0, labels == 1).all().item():
+        raise ComparisonValidationError("bundle.test_labels must be binary")
+    _comparison_tensor(
+        bundle.image_scores,
+        "bundle.image_scores",
+        (test_count,),
+        torch.float32,
+        finite=True,
+    )
+    map_shape = (test_count, *_MAP_SIZE)
+    _comparison_tensor(
+        bundle.anomaly_maps,
+        "bundle.anomaly_maps",
+        map_shape,
+        torch.float32,
+        finite=True,
+    )
+    masks = _comparison_tensor(
+        bundle.evaluation_masks,
+        "bundle.evaluation_masks",
+        map_shape,
+        torch.uint8,
+    )
+    if not torch.logical_or(masks == 0, masks == 1).all().item():
+        raise ComparisonValidationError("bundle.evaluation_masks must be binary")
+
+    if type(bundle.metrics) is not BundleMetrics:
+        raise ComparisonValidationError("bundle metrics are invalid")
+    for name in _SCIENTIFIC_METRICS:
+        value = getattr(bundle.metrics, name)
+        if type(value) is not float or not math.isfinite(value):
+            raise ComparisonValidationError(
+                f"bundle.metrics.{name} must be a finite float"
+            )
+
+
+def _scientific_run_identity(
+    descriptor: ScientificBundleDescriptor,
+) -> ScientificRunIdentity:
+    bundle = descriptor.bundle
+    run = _comparison_mapping(bundle.run_metadata, "bundle.run_metadata")
+    source = _comparison_mapping(run["source"], "bundle.run_metadata.source")
+    environment = _comparison_mapping(
+        run["environment"], "bundle.run_metadata.environment"
+    )
+    weights = _comparison_mapping(run["weights"], "bundle.run_metadata.weights")
+    inventory = _normalized_inventory(bundle)
+    scientific_workload = {
+        "bank_chunk_size": run["bank_chunk_size"],
+        "batch_size": run["batch_size"],
+        "determinism": _thaw_comparison_json(run["determinism"]),
+        "feature_extractor": run["feature_extractor"],
+        "feature_layer": run["feature_layer"],
+        "image_score_semantics": _IMAGE_SCORE_SEMANTICS,
+        "map_interpolation": _thaw_comparison_json(run["map_interpolation"]),
+        "metric_fields": list(_SCIENTIFIC_METRICS),
+        "preprocessing_profile": run["preprocessing_profile"],
+        "retrieval_semantics": run["retrieval_semantics"],
+        "tensors": _thaw_comparison_json(run["tensors"]),
+    }
+    run_identity = {
+        "category": run["category"],
+        "dependency_versions": _thaw_comparison_json(
+            environment["dependency_versions"]
+        ),
+        "inventory": inventory,
+        "profile_id": run["profile_id"],
+        "python_version": environment["python_version"],
+        "run_id": run["run_id"],
+        "schema_version": run["schema_version"],
+        "scientific_workload": scientific_workload,
+        "source": {
+            "dirty": source["dirty"],
+            "git_commit": source["git_commit"],
+            "uv_lock_sha256": _comparison_sha256(
+                source["uv_lock_sha256"],
+                "bundle.run_metadata.source.uv_lock_sha256",
+            ),
+        },
+        "weights": {
+            "cached_file_sha256": _comparison_sha256(
+                weights["cached_file_sha256"],
+                "bundle.run_metadata.weights.cached_file_sha256",
+            ),
+            "enum": weights["enum"],
+        },
+    }
+    workload = None
+    methodology = None
+    if bundle.kind == "benchmark":
+        benchmark = _comparison_mapping(
+            bundle.benchmark_metadata, "bundle.benchmark_metadata"
+        )
+        run_identity["benchmark_identity"] = {
+            "benchmark_sample_id": benchmark["benchmark_sample_id"],
+            "schema_version": benchmark["schema_version"],
+        }
+        workload = _thaw_comparison_json(benchmark["workload"])
+        methodology = _thaw_comparison_json(benchmark["methodology"])
+    return ScientificRunIdentity(
+        environment_id=descriptor.environment_id,
+        policy_role=descriptor.policy_role,
+        bundle_kind=bundle.kind,
+        os_label=descriptor.os_label,
+        execution_layer=descriptor.execution_layer,
+        hardware_label=descriptor.hardware_label,
+        requested_device=descriptor.requested_device,
+        run=run_identity,
+        source_files=bundle.source_files,
+        benchmark_workload=workload,  # type: ignore[arg-type]
+        benchmark_methodology=methodology,  # type: ignore[arg-type]
+    )
+
+
+def _normalized_inventory(bundle: ComparableBundle) -> dict[str, object]:
+    run = _comparison_mapping(bundle.run_metadata, "bundle.run_metadata")
+    inventory = _comparison_mapping(run["inventory"], "bundle.run_metadata.inventory")
+    result = _thaw_comparison_json(inventory)
+    if type(result) is not dict:
+        raise ComparisonValidationError("bundle inventory projection is invalid")
+    result["sample_inventory_sha256"] = _comparison_sha256(
+        inventory["sample_inventory_sha256"],
+        "bundle.run_metadata.inventory.sample_inventory_sha256",
+    )
+    return result
+
+
+def _scientific_gates(
+    reference: ComparableBundle, candidate: ComparableBundle
+) -> tuple[tuple[str, bool], ...]:
+    reference_run = _comparison_mapping(
+        reference.run_metadata, "reference.run_metadata"
+    )
+    candidate_run = _comparison_mapping(
+        candidate.run_metadata, "candidate.run_metadata"
+    )
+    reference_source = _comparison_mapping(
+        reference_run["source"], "reference.run_metadata.source"
+    )
+    candidate_source = _comparison_mapping(
+        candidate_run["source"], "candidate.run_metadata.source"
+    )
+    reference_weights = _comparison_mapping(
+        reference_run["weights"], "reference.run_metadata.weights"
+    )
+    candidate_weights = _comparison_mapping(
+        candidate_run["weights"], "candidate.run_metadata.weights"
+    )
+    reference_commit = reference_source["git_commit"]
+    candidate_commit = candidate_source["git_commit"]
+    reference_lock = _comparison_sha256(
+        reference_source["uv_lock_sha256"],
+        "reference.run_metadata.source.uv_lock_sha256",
+    )
+    candidate_lock = _comparison_sha256(
+        candidate_source["uv_lock_sha256"],
+        "candidate.run_metadata.source.uv_lock_sha256",
+    )
+    reference_weight_hash = _comparison_sha256(
+        reference_weights["cached_file_sha256"],
+        "reference.run_metadata.weights.cached_file_sha256",
+    )
+    candidate_weight_hash = _comparison_sha256(
+        candidate_weights["cached_file_sha256"],
+        "candidate.run_metadata.weights.cached_file_sha256",
+    )
+    reference_determinism = _comparison_mapping(
+        reference_run["determinism"], "reference.run_metadata.determinism"
+    )
+    candidate_determinism = _comparison_mapping(
+        candidate_run["determinism"], "candidate.run_metadata.determinism"
+    )
+    reference_configuration = {
+        "bank_chunk_size": reference_run["bank_chunk_size"],
+        "batch_size": reference_run["batch_size"],
+        "determinism": {
+            name: value
+            for name, value in reference_determinism.items()
+            if name != "torch_cuda_seed_all"
+        },
+    }
+    candidate_configuration = {
+        "bank_chunk_size": candidate_run["bank_chunk_size"],
+        "batch_size": candidate_run["batch_size"],
+        "determinism": {
+            name: value
+            for name, value in candidate_determinism.items()
+            if name != "torch_cuda_seed_all"
+        },
+    }
+    reference_sample_snapshot = _source_snapshot(reference, "samples.jsonl")
+    candidate_sample_snapshot = _source_snapshot(candidate, "samples.jsonl")
+    reference_tensors = _comparison_mapping(
+        reference_run["tensors"], "reference.run_metadata.tensors"
+    )
+    candidate_tensors = _comparison_mapping(
+        candidate_run["tensors"], "candidate.run_metadata.tensors"
+    )
+    reference_sample_ids = tuple(sample.sample_id for sample in reference.samples)
+    candidate_sample_ids = tuple(sample.sample_id for sample in candidate.samples)
+    reference_training_ids = tuple(
+        sample.sample_id for sample in reference.samples if sample.split == "train"
+    )
+    candidate_training_ids = tuple(
+        sample.sample_id for sample in candidate.samples if sample.split == "train"
+    )
+    return (
+        (
+            "run_schema",
+            reference_run["schema_version"] == candidate_run["schema_version"] == 1,
+        ),
+        (
+            "profile",
+            reference_run["profile_id"]
+            == candidate_run["profile_id"]
+            == "inspectrt_feature_memory_v1",
+        ),
+        ("category", reference_run["category"] == candidate_run["category"]),
+        (
+            "preprocessing",
+            reference_run["preprocessing_profile"]
+            == candidate_run["preprocessing_profile"]
+            == "inspectrt_resize256_v1",
+        ),
+        (
+            "feature_contract",
+            (
+                reference_run["feature_extractor"],
+                reference_run["feature_layer"],
+                reference.memory_bank_metadata.embedding_dimension,
+                reference.memory_bank_metadata.patches_per_training_sample,
+            )
+            == (
+                candidate_run["feature_extractor"],
+                candidate_run["feature_layer"],
+                candidate.memory_bank_metadata.embedding_dimension,
+                candidate.memory_bank_metadata.patches_per_training_sample,
+            )
+            == ("ResNet-50", "layer2", _EMBEDDING_DIMENSION, _PATCH_COUNT),
+        ),
+        (
+            "weight_identity",
+            (
+                reference_weights["enum"],
+                reference_weights["source_url"],
+                reference_weight_hash,
+            )
+            == (
+                candidate_weights["enum"],
+                candidate_weights["source_url"],
+                candidate_weight_hash,
+            )
+            == (_WEIGHT_ENUM, _WEIGHT_URL, _ACCEPTED_WEIGHT_SHA256),
+        ),
+        (
+            "configuration",
+            reference_configuration
+            == candidate_configuration
+            == {
+                "bank_chunk_size": 16_384,
+                "batch_size": 1,
+                "determinism": _DETERMINISM,
+            },
+        ),
+        (
+            "lock_identity",
+            reference_lock == candidate_lock == _ACCEPTED_LOCK_SHA256,
+        ),
+        (
+            "clean_source",
+            reference_source["dirty"] is False and candidate_source["dirty"] is False,
+        ),
+        (
+            "scientific_source_commit",
+            reference_commit == candidate_commit == _SCIENTIFIC_SOURCE_COMMIT,
+        ),
+        (
+            "inventory_identity",
+            _normalized_inventory(reference) == _normalized_inventory(candidate),
+        ),
+        (
+            "samples_source",
+            reference_sample_snapshot.byte_count == candidate_sample_snapshot.byte_count
+            and reference_sample_snapshot.sha256.lower()
+            == candidate_sample_snapshot.sha256.lower(),
+        ),
+        ("ordered_sample_ids", reference_sample_ids == candidate_sample_ids),
+        ("ordered_sample_metadata", reference.samples == candidate.samples),
+        ("ordered_training_ids", reference_training_ids == candidate_training_ids),
+        (
+            "ordered_test_sample_ids",
+            reference.test_sample_ids == candidate.test_sample_ids,
+        ),
+        (
+            "ordered_labels",
+            torch.equal(reference.test_labels, candidate.test_labels),
+        ),
+        (
+            "sample_counts",
+            _sample_counts(reference) == _sample_counts(candidate),
+        ),
+        (
+            "memory_bank_contract",
+            reference.memory_bank_metadata == candidate.memory_bank_metadata
+            and reference_tensors["memory_bank"] == candidate_tensors["memory_bank"],
+        ),
+        (
+            "patch_distance_contract",
+            reference_tensors["patch_distances"]
+            == candidate_tensors["patch_distances"],
+        ),
+        (
+            "image_score_contract",
+            reference_tensors["image_scores"] == candidate_tensors["image_scores"],
+        ),
+        (
+            "nearest_index_contract",
+            reference_tensors["nearest_bank_indices"]
+            == candidate_tensors["nearest_bank_indices"],
+        ),
+        (
+            "test_label_contract",
+            reference_tensors["test_labels"] == candidate_tensors["test_labels"],
+        ),
+        (
+            "anomaly_map_contract",
+            reference_tensors["anomaly_maps"] == candidate_tensors["anomaly_maps"],
+        ),
+        (
+            "mask_contract",
+            reference_tensors["evaluation_masks"]
+            == candidate_tensors["evaluation_masks"],
+        ),
+        (
+            "retrieval_semantics",
+            reference_run["retrieval_semantics"]
+            == candidate_run["retrieval_semantics"]
+            == "exact top-1 squared L2",
+        ),
+        (
+            "image_score_semantics",
+            True,
+        ),
+        (
+            "anomaly_map_semantics",
+            reference_run["map_interpolation"]
+            == candidate_run["map_interpolation"]
+            == _freeze_json(_MAP_INTERPOLATION),
+        ),
+        (
+            "metric_fields",
+            True,
+        ),
+    )
+
+
+def _source_snapshot(bundle: ComparableBundle, name: str) -> SourceFileSnapshot:
+    try:
+        return next(
+            snapshot for snapshot in bundle.source_files if snapshot.name == name
+        )
+    except StopIteration as error:
+        raise ComparisonValidationError(
+            f"bundle source snapshot {name!r} is missing"
+        ) from error
+
+
+def _sample_counts(bundle: ComparableBundle) -> tuple[int, ...]:
+    inventory = _normalized_inventory(bundle)
+    return tuple(
+        int(inventory[name])
+        for name in (
+            "training_sample_count",
+            "test_sample_count",
+            "test_good_sample_count",
+            "anomalous_test_sample_count",
+            "total_sample_count",
+        )
+    )
+
+
+def _floating_statistics(
+    reference: Tensor, candidate: Tensor, name: str
+) -> FloatingStatistics:
+    reference_values = reference.reshape(-1)
+    candidate_values = candidate.reshape(-1)
+    element_count = reference_values.numel()
+    exact_count = 0
+    zero_reference_count = 0
+    absolute_sum = 0.0
+    squared_sum = 0.0
+    maximum_absolute_error = 0.0
+    maximum_relative_error: float | None = None
+    for start in range(0, element_count, _FLOAT_CHUNK_SIZE):
+        stop = min(start + _FLOAT_CHUNK_SIZE, element_count)
+        reference_chunk = reference_values[start:stop]
+        candidate_chunk = candidate_values[start:stop]
+        exact_count += int(reference_chunk.eq(candidate_chunk).sum().item())
+        reference64 = reference_chunk.to(dtype=torch.float64)
+        candidate64 = candidate_chunk.to(dtype=torch.float64)
+        absolute_error = candidate64.sub(reference64).abs()
+        absolute_sum += float(absolute_error.sum(dtype=torch.float64).item())
+        squared_sum += float(absolute_error.square().sum(dtype=torch.float64).item())
+        maximum_absolute_error = max(
+            maximum_absolute_error, float(absolute_error.max().item())
+        )
+        nonzero = reference64.ne(0)
+        nonzero_count = int(nonzero.sum().item())
+        zero_reference_count += stop - start - nonzero_count
+        if nonzero_count:
+            relative_maximum = float(
+                absolute_error[nonzero].div(reference64[nonzero].abs()).max().item()
+            )
+            maximum_relative_error = (
+                relative_maximum
+                if maximum_relative_error is None
+                else max(maximum_relative_error, relative_maximum)
+            )
+    return FloatingStatistics(
+        element_count=element_count,
+        exact_count=exact_count,
+        differing_count=element_count - exact_count,
+        maximum_absolute_error=maximum_absolute_error,
+        mean_absolute_error=absolute_sum / element_count,
+        root_mean_square_error=math.sqrt(squared_sum / element_count),
+        maximum_relative_error=maximum_relative_error,
+        zero_reference_count=zero_reference_count,
+    )
+
+
+def _sequence_discrete(
+    name: str, reference: Sequence[object], candidate: Sequence[object]
+) -> DiscreteComponentComparison:
+    if len(reference) != len(candidate):
+        raise ComparisonValidationError(f"{name} lengths must match")
+    return _structural_sequence_discrete(name, reference, candidate)
+
+
+def _structural_sequence_discrete(
+    name: str, reference: Sequence[object], candidate: Sequence[object]
+) -> DiscreteComponentComparison:
+    element_count = max(len(reference), len(candidate))
+    exact_count = sum(
+        reference_value == candidate_value
+        for reference_value, candidate_value in zip(reference, candidate)
+    )
+    mismatch_count = element_count - exact_count
+    return DiscreteComponentComparison(
+        name=name,
+        exact=mismatch_count == 0,
+        element_count=element_count,
+        exact_count=exact_count,
+        mismatch_count=mismatch_count,
+        mismatch_rate=mismatch_count / element_count,
+    )
+
+
+def _structural_tensor_discrete(
+    name: str, reference: Tensor, candidate: Tensor
+) -> DiscreteComponentComparison:
+    reference_values = reference.reshape(-1)
+    candidate_values = candidate.reshape(-1)
+    common_count = min(reference_values.numel(), candidate_values.numel())
+    exact_count = 0
+    for start in range(0, common_count, _FLOAT_CHUNK_SIZE):
+        stop = min(start + _FLOAT_CHUNK_SIZE, common_count)
+        exact_count += int(
+            reference_values[start:stop].eq(candidate_values[start:stop]).sum().item()
+        )
+    element_count = max(reference_values.numel(), candidate_values.numel())
+    mismatch_count = element_count - exact_count
+    return DiscreteComponentComparison(
+        name=name,
+        exact=mismatch_count == 0,
+        element_count=element_count,
+        exact_count=exact_count,
+        mismatch_count=mismatch_count,
+        mismatch_rate=mismatch_count / element_count,
+    )
+
+
+def _tensor_discrete(
+    name: str, reference: Tensor, candidate: Tensor
+) -> DiscreteComponentComparison:
+    if reference.shape != candidate.shape or reference.dtype != candidate.dtype:
+        raise ComparisonValidationError(f"{name} tensor contracts must match")
+    return _structural_tensor_discrete(name, reference, candidate)
+
+
+def _nearest_index_comparison(
+    reference: Tensor, candidate: Tensor
+) -> DiscreteComponentComparison:
+    if (
+        reference.shape != candidate.shape
+        or reference.dtype != torch.int64
+        or candidate.dtype != torch.int64
+    ):
+        raise ComparisonValidationError(
+            "nearest_bank_indices tensor contracts must match"
+        )
+    reference_values = reference.reshape(-1)
+    candidate_values = candidate.reshape(-1)
+    element_count = reference_values.numel()
+    mismatch_count = 0
+    first_mismatches = []
+    width = reference.shape[1]
+    for start in range(0, element_count, _FLOAT_CHUNK_SIZE):
+        stop = min(start + _FLOAT_CHUNK_SIZE, element_count)
+        reference_chunk = reference_values[start:stop]
+        candidate_chunk = candidate_values[start:stop]
+        mismatch_positions = torch.nonzero(
+            reference_chunk.ne(candidate_chunk), as_tuple=False
+        ).reshape(-1)
+        mismatch_count += mismatch_positions.numel()
+        remaining = _INDEX_MISMATCH_LIMIT - len(first_mismatches)
+        for offset in mismatch_positions[:remaining].tolist():
+            flat_index = start + int(offset)
+            first_mismatches.append(
+                IndexMismatch(
+                    coordinate=divmod(flat_index, width),
+                    reference_value=int(reference_values[flat_index].item()),
+                    candidate_value=int(candidate_values[flat_index].item()),
+                )
+            )
+    return DiscreteComponentComparison(
+        name="nearest_bank_indices",
+        exact=mismatch_count == 0,
+        element_count=element_count,
+        exact_count=element_count - mismatch_count,
+        mismatch_count=mismatch_count,
+        mismatch_rate=mismatch_count / element_count,
+        first_mismatches=tuple(first_mismatches),
+    )
+
+
+def _freeze_comparison_json(value: object) -> Mapping[str, object]:
+    thawed = _thaw_comparison_json(value)
+    if type(thawed) is not dict:
+        raise ComparisonValidationError("comparison JSON projection must be an object")
+    frozen = _freeze_json(thawed)
+    if not isinstance(frozen, Mapping):
+        raise ComparisonValidationError("comparison JSON projection is invalid")
+    return frozen
+
+
+def _thaw_comparison_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        result = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ComparisonValidationError("comparison JSON keys must be strings")
+            result[key] = _thaw_comparison_json(item)
+        return result
+    if isinstance(value, (tuple, list)):
+        return [_thaw_comparison_json(item) for item in value]
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise ComparisonValidationError("comparison JSON value is invalid")
+
+
+def _generator_value(generator: ScientificGenerator) -> dict[str, object]:
+    return {"dirty": generator.dirty, "source_commit": generator.source_commit}
+
+
+def _attempt_value(attempt: ScientificExecutionAttempt) -> dict[str, object]:
+    return {
+        "environment_id": attempt.environment_id,
+        "gating": False,
+        "policy_role": "post_policy_attempt",
+        "reason_code": attempt.reason_code,
+        "stage_code": attempt.stage_code,
+        "status": attempt.status,
+    }
+
+
+def _run_identity_value(identity: ScientificRunIdentity) -> dict[str, object]:
+    value = {
+        "bundle_kind": identity.bundle_kind,
+        "environment_id": identity.environment_id,
+        "execution_layer": identity.execution_layer,
+        "hardware_label": identity.hardware_label,
+        "os_label": identity.os_label,
+        "policy_role": identity.policy_role,
+        "requested_device": identity.requested_device,
+        "run": _thaw_comparison_json(identity.run),
+        "source_files": [
+            {
+                "byte_count": snapshot.byte_count,
+                "name": snapshot.name,
+                "sha256": snapshot.sha256.lower(),
+            }
+            for snapshot in identity.source_files
+        ],
+    }
+    if identity.bundle_kind == "benchmark":
+        value["benchmark"] = {
+            "methodology": _thaw_comparison_json(identity.benchmark_methodology),
+            "workload": _thaw_comparison_json(identity.benchmark_workload),
+        }
+    return value
+
+
+def _floating_statistics_value(value: FloatingStatistics) -> dict[str, object]:
+    return {
+        "differing_count": value.differing_count,
+        "element_count": value.element_count,
+        "exact_count": value.exact_count,
+        "maximum_absolute_error": value.maximum_absolute_error,
+        "maximum_relative_error": value.maximum_relative_error,
+        "mean_absolute_error": value.mean_absolute_error,
+        "root_mean_square_error": value.root_mean_square_error,
+        "zero_reference_count": value.zero_reference_count,
+    }
+
+
+def _discrete_component_value(
+    value: DiscreteComponentComparison,
+) -> dict[str, object]:
+    result = {
+        "element_count": value.element_count,
+        "exact": value.exact,
+        "exact_count": value.exact_count,
+        "mismatch_count": value.mismatch_count,
+        "mismatch_rate": value.mismatch_rate,
+    }
+    if value.name == "nearest_bank_indices":
+        result["first_mismatches"] = [
+            {
+                "candidate_value": mismatch.candidate_value,
+                "coordinate": list(mismatch.coordinate),
+                "reference_value": mismatch.reference_value,
+            }
+            for mismatch in value.first_mismatches
+        ]
+    return result
+
+
+def _scientific_result_value(
+    result: CandidateScientificResult,
+) -> dict[str, object]:
+    value: dict[str, object] = {"status": result.status}
+    if result.status == "observed_unclassified":
+        assert result.floating_components is not None
+        assert result.discrete_components is not None
+        assert result.metrics is not None
+        value["floating_components"] = {
+            component.name: _floating_statistics_value(component.statistics)
+            for component in result.floating_components
+        }
+        value["discrete_components"] = {
+            component.name: _discrete_component_value(component)
+            for component in result.discrete_components
+        }
+        value["metrics"] = [
+            {
+                "absolute_delta": metric.absolute_delta,
+                "candidate_value": metric.candidate_value,
+                "metric_name": metric.metric_name,
+                "reference_value": metric.reference_value,
+            }
+            for metric in result.metrics
+        ]
+    return value
+
+
+def _scientific_comparison_value(
+    comparison: ScientificComparison,
+) -> dict[str, object]:
+    return {
+        "attempts": [_attempt_value(attempt) for attempt in comparison.attempts],
+        "candidates": [
+            _run_identity_value(candidate) for candidate in comparison.candidates
+        ],
+        "comparability": {
+            item.environment_id: {
+                "comparable": item.comparable,
+                "gates": dict(item.gates),
+                "structural_components": {
+                    component.name: _discrete_component_value(component)
+                    for component in item.structural_components
+                },
+            }
+            for item in comparison.comparability
+        },
+        "comparison_id": comparison.comparison_id,
+        "generator": _generator_value(comparison.generator),
+        "limitations": list(comparison.limitations),
+        "milestone_id": comparison.milestone_id,
+        "reference": _run_identity_value(comparison.reference),
+        "schema_id": comparison.schema_id,
+        "schema_version": comparison.schema_version,
+        "scientific_results": {
+            item.environment_id: _scientific_result_value(item)
+            for item in comparison.scientific_results
+        },
+    }
+
+
+def _validate_scientific_run_identity(identity: ScientificRunIdentity) -> None:
+    _environment_id(identity.environment_id, "run identity environment_id")
+    if (
+        type(identity.policy_role) is not str
+        or identity.policy_role not in _POLICY_ROLES
+    ):
+        raise ComparisonValidationError("run identity policy_role is invalid")
+    if type(identity.bundle_kind) is not str or identity.bundle_kind not in {
+        "evaluation",
+        "benchmark",
+    }:
+        raise ComparisonValidationError("run identity bundle_kind is invalid")
+    _public_label(identity.os_label, "run identity os_label")
+    if (
+        type(identity.execution_layer) is not str
+        or identity.execution_layer not in _EXECUTION_LAYERS
+    ):
+        raise ComparisonValidationError("run identity execution_layer is invalid")
+    _public_label(identity.hardware_label, "run identity hardware_label")
+    if type(identity.requested_device) is not str or not _REQUESTED_DEVICE.fullmatch(
+        identity.requested_device
+    ):
+        raise ComparisonValidationError("run identity requested_device is invalid")
+
+    run = _comparison_mapping(identity.run, "run identity")
+    expected_run_fields = {
+        "category",
+        "dependency_versions",
+        "inventory",
+        "profile_id",
+        "python_version",
+        "run_id",
+        "schema_version",
+        "scientific_workload",
+        "source",
+        "weights",
+    }
+    if identity.bundle_kind == "benchmark":
+        expected_run_fields.add("benchmark_identity")
+    if set(run) != expected_run_fields:
+        raise ComparisonValidationError("run identity fields are invalid")
+    category = _comparison_string(run["category"], "run identity category")
+    if "/" in category or "\\" in category:
+        raise ComparisonValidationError("run identity category is invalid")
+    run_id = _comparison_string(run["run_id"], "run identity run_id")
+    if not _RUN_ID.fullmatch(run_id):
+        raise ComparisonValidationError("run identity run_id is invalid")
+    _comparison_string(run["profile_id"], "run identity profile_id")
+    _portable_identity_string(run["python_version"], "run identity python_version")
+    dependencies = _comparison_mapping(
+        run["dependency_versions"], "run identity dependency_versions"
+    )
+    for name, version in dependencies.items():
+        _comparison_string(name, "run identity dependency name")
+        _portable_identity_string(version, f"run identity dependency {name}")
+
+    source = _comparison_mapping(run["source"], "run identity source")
+    if set(source) != {"dirty", "git_commit", "uv_lock_sha256"}:
+        raise ComparisonValidationError("run identity source fields are invalid")
+    _comparison_boolean(source["dirty"], "run identity source dirty")
+    _comparison_commit(source["git_commit"], "run identity source commit")
+    _comparison_sha256(source["uv_lock_sha256"], "run identity lock")
+    weights = _comparison_mapping(run["weights"], "run identity weights")
+    if set(weights) != {"cached_file_sha256", "enum"}:
+        raise ComparisonValidationError("run identity weight fields are invalid")
+    _comparison_sha256(weights["cached_file_sha256"], "run identity weight hash")
+    _comparison_string(weights["enum"], "run identity weight enum")
+    inventory = _comparison_mapping(run["inventory"], "run identity inventory")
+    _comparison_sha256(
+        inventory.get("sample_inventory_sha256"), "run identity inventory hash"
+    )
+    _comparison_mapping(run["scientific_workload"], "run identity scientific_workload")
+    if identity.bundle_kind == "benchmark":
+        benchmark_identity = _comparison_mapping(
+            run["benchmark_identity"], "run benchmark identity"
+        )
+        if set(benchmark_identity) != {"benchmark_sample_id", "schema_version"}:
+            raise ComparisonValidationError("run benchmark identity fields are invalid")
+        _portable_identity_string(
+            benchmark_identity["benchmark_sample_id"],
+            "run benchmark sample ID",
+        )
+        _comparison_integer(
+            benchmark_identity["schema_version"],
+            "run benchmark schema",
+            positive=True,
+        )
+    _comparison_integer(run["schema_version"], "run identity schema", positive=True)
+    _reject_absolute_identity_values(run, "run identity")
+
+    expected_files = (
+        _EVALUATION_FILES if identity.bundle_kind == "evaluation" else _BENCHMARK_FILES
+    )
+    if (
+        type(identity.source_files) is not tuple
+        or any(
+            type(snapshot) is not SourceFileSnapshot
+            for snapshot in identity.source_files
+        )
+        or tuple(snapshot.name for snapshot in identity.source_files) != expected_files
+    ):
+        raise ComparisonValidationError("run identity source files are invalid")
+    for snapshot in identity.source_files:
+        if (
+            type(snapshot.byte_count) is not int
+            or snapshot.byte_count < 0
+            or type(snapshot.sha256) is not str
+            or not _SHA256.fullmatch(snapshot.sha256)
+        ):
+            raise ComparisonValidationError("run identity source snapshot is invalid")
+    if identity.bundle_kind == "evaluation":
+        if (
+            identity.benchmark_workload is not None
+            or identity.benchmark_methodology is not None
+        ):
+            raise ComparisonValidationError(
+                "evaluation identity must omit benchmark metadata"
+            )
+    elif not isinstance(identity.benchmark_workload, Mapping) or not isinstance(
+        identity.benchmark_methodology, Mapping
+    ):
+        raise ComparisonValidationError(
+            "benchmark identity must include workload and methodology"
+        )
+    else:
+        _reject_absolute_identity_values(
+            identity.benchmark_workload, "benchmark workload"
+        )
+        _reject_absolute_identity_values(
+            identity.benchmark_methodology, "benchmark methodology"
+        )
+
+
+def _portable_identity_string(value: object, name: str) -> str:
+    result = _comparison_string(value, name)
+    if (
+        re.search(r"(?<![A-Za-z0-9_.-])/(?!/)", result)
+        or re.search(r"(?<![A-Za-z0-9_.-])~(?:[A-Za-z0-9_.-]+)?(?:[\\/]|$)", result)
+        or re.search(r"(?<![A-Za-z0-9_.-])[A-Za-z]:[\\/]", result)
+        or re.search(r"(?<![A-Za-z0-9_.-])\\", result)
+        or "\n" in result
+        or "\r" in result
+    ):
+        raise ComparisonValidationError(f"{name} contains private path-like data")
+    return result
+
+
+def _reject_absolute_identity_values(value: object, name: str) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _portable_identity_string(key, f"{name} key")
+            _reject_absolute_identity_values(item, f"{name}.{key}")
+    elif isinstance(value, (tuple, list)):
+        for index, item in enumerate(value):
+            _reject_absolute_identity_values(item, f"{name}[{index}]")
+    elif type(value) is str:
+        _portable_identity_string(value, name)
+
+
+def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
+    if (
+        comparison.schema_version != 1
+        or comparison.schema_id != _SCHEMA_ID
+        or comparison.milestone_id != _MILESTONE_ID
+        or not re.fullmatch(r"[0-9a-f]{64}", comparison.comparison_id)
+    ):
+        raise ComparisonValidationError("scientific comparison identity is invalid")
+    if type(comparison.generator) is not ScientificGenerator:
+        raise ComparisonValidationError("scientific comparison generator is invalid")
+    if (
+        type(comparison.reference) is not ScientificRunIdentity
+        or comparison.reference.policy_role != "reference"
+        or not comparison.candidates
+    ):
+        raise ComparisonValidationError("scientific comparison run roles are invalid")
+    if any(
+        type(candidate) is not ScientificRunIdentity
+        or candidate.policy_role not in _CANDIDATE_ROLES
+        for candidate in comparison.candidates
+    ):
+        raise ComparisonValidationError("scientific comparison candidates are invalid")
+    _validate_scientific_run_identity(comparison.reference)
+    for candidate in comparison.candidates:
+        _validate_scientific_run_identity(candidate)
+    candidate_ids = tuple(
+        candidate.environment_id for candidate in comparison.candidates
+    )
+    if (
+        tuple(item.environment_id for item in comparison.comparability) != candidate_ids
+        or tuple(item.environment_id for item in comparison.scientific_results)
+        != candidate_ids
+        or len(candidate_ids) != len(set(candidate_ids))
+    ):
+        raise ComparisonValidationError(
+            "scientific comparison candidate ordering is inconsistent"
+        )
+    all_ids = (
+        comparison.reference.environment_id,
+        *candidate_ids,
+        *(attempt.environment_id for attempt in comparison.attempts),
+    )
+    if len(all_ids) != len(set(all_ids)):
+        raise ComparisonValidationError(
+            "scientific comparison environment IDs are not unique"
+        )
+    for attempt in comparison.attempts:
+        if type(attempt) is not ScientificExecutionAttempt:
+            raise ComparisonValidationError("scientific comparison attempt is invalid")
+    identity_payload = {
+        "attempts": [_attempt_value(attempt) for attempt in comparison.attempts],
+        "candidates": [
+            _run_identity_value(candidate) for candidate in comparison.candidates
+        ],
+        "generator": _generator_value(comparison.generator),
+        "milestone_id": comparison.milestone_id,
+        "reference": _run_identity_value(comparison.reference),
+        "schema_id": comparison.schema_id,
+        "schema_version": comparison.schema_version,
+    }
+    expected_id = hashlib.sha256(_canonical_json(identity_payload)).hexdigest()
+    if comparison.comparison_id != expected_id:
+        raise ComparisonValidationError(
+            "scientific comparison ID differs from its canonical inputs"
+        )
+    for comparable, result in zip(
+        comparison.comparability, comparison.scientific_results, strict=True
+    ):
+        if (
+            type(comparable) is not CandidateComparability
+            or type(result) is not CandidateScientificResult
+            or comparable.comparable != all(value for _, value in comparable.gates)
+            or len(comparable.gates) != len({name for name, _ in comparable.gates})
+            or tuple(component.name for component in comparable.structural_components)
+            != ("test_sample_ids", "test_labels")
+            or type(result.status) is not str
+            or result.status not in _CANDIDATE_STATUSES
+        ):
+            raise ComparisonValidationError(
+                "scientific comparison candidate result is invalid"
+            )
+        if comparable.comparable != (result.status == "observed_unclassified"):
+            raise ComparisonValidationError(
+                "scientific comparison status differs from compatibility gates"
+            )
+        for component in comparable.structural_components:
+            if (
+                type(component) is not DiscreteComponentComparison
+                or component.element_count <= 0
+                or component.exact_count + component.mismatch_count
+                != component.element_count
+                or component.exact != (component.mismatch_count == 0)
+                or not math.isfinite(component.mismatch_rate)
+                or not 0 <= component.mismatch_rate <= 1
+            ):
+                raise ComparisonValidationError(
+                    "structural comparison statistics are invalid"
+                )
+        measured = (
+            result.floating_components,
+            result.discrete_components,
+            result.metrics,
+        )
+        if result.status == "structurally_incomparable":
+            if any(value is not None for value in measured):
+                raise ComparisonValidationError(
+                    "incomparable candidates must not contain measurements"
+                )
+            continue
+        if any(value is None for value in measured):
+            raise ComparisonValidationError(
+                "comparable candidates must contain measurements"
+            )
+        assert result.floating_components is not None
+        assert result.discrete_components is not None
+        assert result.metrics is not None
+        for component in result.floating_components:
+            statistics = component.statistics
+            numbers = (
+                statistics.maximum_absolute_error,
+                statistics.mean_absolute_error,
+                statistics.root_mean_square_error,
+            )
+            if (
+                statistics.element_count <= 0
+                or statistics.exact_count + statistics.differing_count
+                != statistics.element_count
+                or statistics.zero_reference_count > statistics.element_count
+                or any(not math.isfinite(value) or value < 0 for value in numbers)
+                or (
+                    statistics.maximum_relative_error is not None
+                    and (
+                        not math.isfinite(statistics.maximum_relative_error)
+                        or statistics.maximum_relative_error < 0
+                    )
+                )
+            ):
+                raise ComparisonValidationError(
+                    "floating comparison statistics are invalid"
+                )
+        for component in result.discrete_components:
+            if (
+                component.element_count <= 0
+                or component.exact_count + component.mismatch_count
+                != component.element_count
+                or component.exact != (component.mismatch_count == 0)
+                or not math.isfinite(component.mismatch_rate)
+                or not 0 <= component.mismatch_rate <= 1
+                or len(component.first_mismatches) > _INDEX_MISMATCH_LIMIT
+            ):
+                raise ComparisonValidationError(
+                    "discrete comparison statistics are invalid"
+                )
+        if (
+            tuple(metric.metric_name for metric in result.metrics)
+            != _SCIENTIFIC_METRICS
+        ):
+            raise ComparisonValidationError("metric comparison order is invalid")
+        if any(
+            not all(
+                math.isfinite(value)
+                for value in (
+                    metric.reference_value,
+                    metric.candidate_value,
+                    metric.absolute_delta,
+                )
+            )
+            for metric in result.metrics
+        ):
+            raise ComparisonValidationError("metric comparison values are invalid")
+    if type(comparison.limitations) is not tuple or any(
+        type(value) is not str or not value for value in comparison.limitations
+    ):
+        raise ComparisonValidationError("scientific comparison limitations are invalid")
