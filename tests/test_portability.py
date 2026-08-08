@@ -2981,6 +2981,55 @@ def test_loads_valid_policy_with_exact_source_identity(tmp_path: Path) -> None:
     )
 
 
+def test_tracked_portability_policy_is_the_reviewed_canonical_artifact() -> None:
+    path = Path(__file__).resolve().parents[1] / "configs/portability_policy.json"
+    payload = path.read_bytes()
+    value = json.loads(payload)
+    policy = load_portability_policy(path)
+
+    assert payload == _canonical(value)
+    assert policy.schema_version == 1
+    assert policy.schema_id == "inspectrt_portability_policy_v1"
+    assert policy.profile_id == "inspectrt_feature_memory_v1"
+    assert policy.category == "bottle"
+    assert policy.reference_environment_id == "p53-linux-t1000-cuda-reference"
+    assert policy.calibration_environment_ids == (
+        "p53-linux-t1000-cuda-control",
+        "p53-linux-cpu",
+        "rtx4080-wsl2-cuda",
+    )
+    assert policy.holdout_environment_ids == ("m1pro-macos-cpu",)
+    assert policy.discrete_output_requirements == (
+        "test_sample_ids",
+        "test_labels",
+        "evaluation_masks",
+        "nearest_bank_indices",
+    )
+    assert {
+        name: (limit.atol, limit.rtol)
+        for name, limit in policy.floating_component_limits.items()
+    } == {
+        "memory_bank": (0.00011, 0),
+        "patch_distances": (0.003, 0),
+        "image_scores": (0.0015, 0),
+        "anomaly_maps": (0.003, 0),
+    }
+    assert dict(policy.metric_absolute_delta_limits) == {
+        "image_auroc": 0,
+        "image_average_precision": 0,
+        "pixel_auroc": 0.000000003,
+    }
+    assert policy.derivation == PolicyDerivation(
+        "observed_envelope",
+        ("88954c93e76c58d00b0ac6df8701b100df196996998da4c6f3c7ccd1bdc4c732",),
+    )
+    assert policy.reviewed_evidence_hashes == (
+        "a14135a8c34484480503d95b77ee15607a9c2e5cf3700463834bb6bc4b672415",
+        "e82246a2fa7a3efafc8c98abcfc85535730acd1ba62350420817e5b72b194426",
+    )
+    assert b"/" not in payload and b"\\" not in payload and b"_extra" not in payload
+
+
 @pytest.mark.parametrize("case", ("spacing", "duplicate", "nan", "missing-lf"))
 def test_policy_rejects_malformed_or_noncanonical_bytes(
     tmp_path: Path, case: str
