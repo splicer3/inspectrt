@@ -2,14 +2,14 @@
 
 ## Scope
 
-A retrieval fixture captures one exact top-1 squared-L2 retrieval problem. It
-separates retrieval from image decoding, preprocessing, feature extraction,
-anomaly-map reconstruction, and PyTorch serialization.
+A retrieval fixture contains one exact top-1 squared-L2 retrieval problem. This
+keeps retrieval separate from image decoding, preprocessing, feature
+extraction, anomaly-map reconstruction, and PyTorch serialization.
 
 The fixture contains the retrieval inputs and the expected outputs needed to
 check another consumer. InspectRT currently validates those outputs with its
-existing exact PyTorch retrieval reference. The repository contains no
-alternative retrieval backend at the time of writing.
+existing exact PyTorch retrieval reference. The repository does not contain an
+alternative retrieval backend.
 
 ## Retrieval contract
 
@@ -65,7 +65,7 @@ The 64-byte offsets are a file-layout property. They do not guarantee that a
 segment will have the same in-memory alignment after a consumer loads or maps
 the file.
 
-Of course, only JSON and binary parsing capabilities are required to read the fixtures.
+You only need JSON and binary parsing to read the fixtures.
 
 ## Committed synthetic fixture
 
@@ -118,7 +118,8 @@ distances=exact
 status=accepted
 ```
 
-CPU is the canonical acceptance device for this synthetic fixture, to support pretty much any device.
+CPU is the canonical acceptance device for this synthetic fixture, so it can
+run on pretty much any device.
 
 ## Real application fixture
 
@@ -169,15 +170,16 @@ uv run inspectrt fixture export \
   --output-root outputs
 ```
 
-Export accepts a verified benchmark run and verifies its source identities and
-five recorded source-artifact hashes. It re-extracts the query tensor that is
-absent from the run bundle and recomputes retrieval with the frozen profile.
-The accepted export ran on the recorded environment: every export requires
-exact parity with the accepted run's stored distances and indices before
-writing the fixture.
+Export starts from a verified benchmark run, then checks its source identities
+and five recorded source-artifact hashes. Since the query tensor is not in the
+run bundle, export extracts it again and recomputes retrieval with the frozen
+profile. The accepted export ran on the recorded environment. Every export must
+match the accepted run's stored distances and indices exactly before it writes
+the fixture.
 
-The repository working tree must be clean. The write is atomic. **The deterministic fixture directory must not already exist** as export will refuse to overwrite it. The
-dataset and pretrained weight must be obtained manually.
+The repository working tree must be clean, and the write is atomic. The
+deterministic fixture directory must not already exist because export refuses
+to overwrite it. The dataset and pretrained weight must be obtained manually.
 
 ## Real-fixture validation
 

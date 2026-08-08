@@ -8,13 +8,14 @@ category's nominal training images.
 
 ## Method
 
-Images are decoded with Pillow and resized directly to `256 x 256` with
-bilinear interpolation and antialiasing. ImageNet normalization is applied with
-no center crop. A frozen ResNet-50 using
+Pillow decodes each image and resizes it directly to `256 x 256` with bilinear
+interpolation and antialiasing. The pipeline applies ImageNet normalization
+without a center crop. A frozen ResNet-50 using
 `ResNet50_Weights.IMAGENET1K_V2` produces `layer2` features with shape
-`[B, 512, 32, 32]`. A `3 x 3` average pool with stride 1, padding 1, and padding
-included in the average preserves that shape. Spatial positions are flattened
-in row-major `(y, x)` order to FP32 patches with shape `[B, 1024, 512]`.
+`[B, 512, 32, 32]`. A `3 x 3` average pool has stride 1 and padding 1, with the
+padding included in the average, so the shape stays the same. The pipeline then
+flattens the spatial positions in row-major `(y, x)` order into FP32 patches
+with shape `[B, 1024, 512]`.
 
 Every patch from the ordered `train/good` split enters the nominal memory bank.
 For each test patch, the implementation performs exact chunked top-1 squared-L2
@@ -23,15 +24,15 @@ index. The largest patch distance is the image score. Patch distances are
 reshaped to `32 x 32` and bilinearly interpolated with `align_corners=False` to
 a raw `256 x 256` anomaly map.
 
-The reported metrics are image AUROC, image Average Precision, and pixel AUROC.
+The baseline reports image AUROC, image Average Precision, and pixel AUROC.
 There is no crop, coreset, approximate search, score reweighting, Gaussian
 smoothing, score normalization, decision threshold, or threshold fitting.
 
 ## Dataset layout
 
-MVTec AD must be obtained from its
+Download MVTec AD from its
 [official dataset page](https://www.mvtec.com/research-teaching/datasets/mvtec-ad)
-and placed manually outside Git:
+and keep it outside Git:
 
 ```text
 datasets/mvtec_ad/
@@ -56,10 +57,10 @@ uv run inspectrt evaluate \
   --output-root outputs
 ```
 
-`--config` selects the committed profile, `--dataset-root` selects its category
-parent, `--category` selects one category, `--device` selects the PyTorch device,
-and `--output-root` selects the generated-run parent. `--run-id` is optional;
-when omitted, InspectRT generates a safe ID.
+`--config` points to the committed profile, while `--dataset-root` points to the
+category parent. `--category` chooses one category, `--device` chooses the
+PyTorch device, and `--output-root` chooses where run directories are written.
+`--run-id` is optional. InspectRT generates a safe ID when it is omitted.
 
 ## Running a benchmark
 
@@ -74,7 +75,7 @@ uv run inspectrt benchmark \
   --repeat-count 30
 ```
 
-The benchmark completes the same evaluation and adds batch-1 stage timing.
+The benchmark runs the same evaluation and adds batch-1 stage timing.
 `--warmup-count` controls excluded warm-ups, and `--repeat-count` controls the
 measured repetitions. Both values must be positive integers.
 
@@ -101,8 +102,8 @@ makes accepted runs large.
 ## Accepted results
 
 Both accepted bundles recorded `source.dirty=false` at commit
-`bc330b9070c5ca8db9cb7cfbb27617256388536b`. Results below are from the
-**ThinkPad P53, Quadro T1000, current locked Linux stack**.
+`bc330b9070c5ca8db9cb7cfbb27617256388536b`. The results below are from a
+ThinkPad P53 with a Quadro T1000 and the current locked Linux stack.
 
 | Category | Train good | Test good | Anomalous test | Bank shape | Bank size | Image AUROC | Image AP | Pixel AUROC |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -152,7 +153,7 @@ A second `bottle` evaluation on the same commit, locked stack, and T1000 had
 identical inventory bytes, ordered test IDs, FP32 bank, and nearest-bank
 indices. Maximum absolute differences were `0.0` for image scores, patch
 distances, and anomaly maps; differences for all three metrics were also `0.0`.
-This check establishes same-stack behavior only, particularly with the same host used.
+Both runs used the same host, so this only establishes same-stack behavior.
 
 ## Limitations
 

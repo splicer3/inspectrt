@@ -1,21 +1,23 @@
 # InspectRT
 
-InspectRT currently provides a reproducible reduced feature-memory baseline for
-one MVTec AD category at a time. `RT` means **Runtime**; the project measures
-runtime behavior and has no hard-real-time guarantees.
+InspectRT is currently a reproducible, reduced feature-memory baseline for one
+MVTec AD category at a time. `RT` means **Runtime**: it measures runtime
+behavior, but it does not make hard real-time guarantees.
 
 ## Status
 
-The implemented profile, `inspectrt_feature_memory_v1`, uses a frozen ResNet-50
-feature extractor, a complete nominal patch bank, exact nearest-neighbor
-retrieval, raw anomaly maps, and threshold-free metrics. The CLI supports
-complete `evaluate` and `benchmark` runs. It also exports and validates
-binary exact-retrieval fixture files; see
+`inspectrt_feature_memory_v1` is the implemented profile. It uses a frozen
+ResNet-50 feature extractor, a complete nominal patch bank, exact
+nearest-neighbor retrieval, raw anomaly maps, and threshold-free metrics. The
+CLI can run complete `evaluate` and `benchmark` jobs, and it can export and
+validate binary exact-retrieval fixtures. See
 [docs/retrieval-fixtures.md](docs/retrieval-fixtures.md) for the format,
 commands, and validation limits.
 
 The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 running the
-current locked Linux stack with a Quadro T1000. Other systems will get benchmarked in the future. See the measured results and method contract in [docs/baseline.md](docs/baseline.md).
+current locked Linux stack with a Quadro T1000. It does not cover other systems
+yet; they will be benchmarked separately. See the measured results and method
+contract in [docs/baseline.md](docs/baseline.md).
 
 ## Installation
 
@@ -26,7 +28,7 @@ for its locked environment:
 uv sync --locked
 ```
 
-The repository checks run with:
+Run the repository checks with:
 
 ```bash
 uv run pytest
@@ -71,7 +73,7 @@ uv run inspectrt benchmark \
   --repeat-count 30
 ```
 
-Both commands create `outputs/runs/<generated-run-id>/`. Evaluation runs contain
-seven files with the resolved run metadata, ordered inventory, memory bank,
-predictions, retrieval results, anomaly maps and masks, and metrics. Benchmark
-runs add `benchmark.json`. Generated runs are gitignored.
+Both commands write to `outputs/runs/<generated-run-id>/`. An evaluation run has
+seven files containing the resolved run metadata, ordered inventory, memory
+bank, predictions, retrieval results, anomaly maps and masks, and metrics. A
+benchmark run adds `benchmark.json`. Generated runs are gitignored.
