@@ -148,6 +148,20 @@ def _argument_parser() -> argparse.ArgumentParser:
     export.add_argument("--sample-id", required=True)
     export.add_argument("--device", required=True)
     export.add_argument("--output-root", required=True, type=Path)
+    portability = commands.add_parser(
+        "portability", help="compare portable run bundles"
+    )
+    portability_commands = portability.add_subparsers(
+        dest="portability_command", required=True
+    )
+    compare = portability_commands.add_parser(
+        "compare", help="publish scientific and descriptive performance records"
+    )
+    compare.add_argument("--reference-run", required=True, type=Path)
+    compare.add_argument("--candidate-run", required=True, action="append", type=Path)
+    compare.add_argument("--environment-map", required=True, type=Path)
+    compare.add_argument("--policy", type=Path)
+    compare.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -174,6 +188,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface."""
     arguments = _argument_parser().parse_args(argv)
     try:
+        if arguments.command == "portability":
+            return _compare_portability(arguments)
         if arguments.command == "fixture":
             if arguments.fixture_command == "validate":
                 return _validate_fixture(arguments)
@@ -188,8 +204,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = arguments.command
         if command == "fixture":
             command = f"{command} {arguments.fixture_command}"
+        elif command == "portability":
+            command = f"{command} {arguments.portability_command}"
         print(f"inspectrt {command} failed: {error}", file=sys.stderr)
         return 1
+
+
+def _compare_portability(arguments: argparse.Namespace) -> int:
+    from inspectrt.portability import (
+        ScientificGenerator,
+        publish_portability_comparison,
+    )
+
+    _, commit, dirty, _ = _repository_metadata(Path.cwd())
+    comparison, performance = publish_portability_comparison(
+        reference_run=arguments.reference_run,
+        candidate_runs=tuple(arguments.candidate_run),
+        environment_map_path=arguments.environment_map,
+        output=arguments.output,
+        generator=ScientificGenerator(commit, dirty),
+        policy_path=arguments.policy,
+    )
+    print(f"comparison_id={comparison.comparison_id}")
+    print(f"candidates={len(comparison.candidates)}")
+    print(f"performance_included={len(performance.included_runs)}")
+    print(f"performance_excluded={len(performance.excluded_candidates)}")
+    print(f"mode={'policy' if comparison.policy is not None else 'observation'}")
+    print("status=published")
+    return 0
 
 
 def _validate_fixture(arguments: argparse.Namespace) -> int:

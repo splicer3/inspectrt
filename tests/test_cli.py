@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tomllib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -60,6 +61,7 @@ def test_import_does_not_load_heavy_runtime_modules() -> None:
         "assert 'torch' not in sys.modules; "
         "assert 'torchvision' not in sys.modules; "
         "assert 'numpy' not in sys.modules; "
+        "assert 'inspectrt.portability' not in sys.modules; "
         "assert 'inspectrt.fixtures' not in sys.modules; "
         "assert 'inspectrt.retrieval' not in sys.modules"
     )
@@ -190,6 +192,301 @@ def test_command_help_succeeds(arguments: tuple[str, ...], expected: str) -> Non
             "--seed",
         ):
             assert forbidden not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("--help",),
+        ("portability", "--help"),
+        ("portability", "compare", "--help"),
+    ),
+)
+def test_portability_help_does_not_load_runtime_modules(
+    arguments: tuple[str, ...],
+) -> None:
+    code = f"""
+import sys
+import inspectrt.cli as cli
+try:
+    cli.main({list(arguments)!r})
+except SystemExit as error:
+    assert error.code == 0
+else:
+    raise AssertionError("help did not exit")
+for name in ("numpy", "torch", "torchvision", "inspectrt.portability"):
+    assert name not in sys.modules, name
+"""
+    result = subprocess.run(
+        (sys.executable, "-c", code),
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_portability_command_help_and_action_surface() -> None:
+    root = _console("--help")
+    group = _console("portability", "--help")
+    compare = _console("portability", "compare", "--help")
+    assert root.returncode == group.returncode == compare.returncode == 0
+    assert "portability" in root.stdout
+    assert "{compare}" in group.stdout
+    for argument in (
+        "--reference-run",
+        "--candidate-run",
+        "--environment-map",
+        "--policy",
+        "--output",
+    ):
+        assert argument in compare.stdout
+    graph = _console("portability", "graph")
+    assert graph.returncode == 2
+    assert "invalid choice" in graph.stderr
+
+
+def test_portability_compare_requires_all_four_inputs() -> None:
+    values = {
+        "--reference-run": "reference",
+        "--candidate-run": "candidate",
+        "--environment-map": "environment.json",
+        "--output": "comparison",
+    }
+    for omitted in values:
+        arguments = ["portability", "compare"]
+        for name, value in values.items():
+            if name != omitted:
+                arguments.extend((name, value))
+        result = _console(*arguments)
+        assert result.returncode == 2
+        assert omitted in result.stderr
+
+
+def test_portability_compare_requires_at_least_one_candidate() -> None:
+    result = _console(
+        "portability",
+        "compare",
+        "--reference-run",
+        "reference",
+        "--environment-map",
+        "environment.json",
+        "--output",
+        "comparison",
+    )
+    assert result.returncode == 2
+    assert "--candidate-run" in result.stderr
+
+
+def _portability_arguments(
+    reference: Path,
+    candidates: tuple[Path, ...],
+    environment_map: Path,
+    output: Path,
+    policy: Path | None = None,
+) -> list[str]:
+    arguments = [
+        "portability",
+        "compare",
+        "--reference-run",
+        str(reference),
+    ]
+    for candidate in candidates:
+        arguments.extend(("--candidate-run", str(candidate)))
+    arguments.extend(("--environment-map", str(environment_map)))
+    if policy is not None:
+        arguments.extend(("--policy", str(policy)))
+    arguments.extend(("--output", str(output)))
+    return arguments
+
+
+@pytest.fixture
+def wired_portability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> SimpleNamespace:
+    import inspectrt.portability as portability
+
+    private_root = tmp_path / "private-user" / "secret-host"
+    reference = private_root / "reference-benchmark"
+    environment_map = private_root / "environment-map.json"
+    output = private_root / "comparison"
+    records: dict[str, object] = {}
+
+    def publish_portability_comparison(
+        *,
+        reference_run: Path,
+        candidate_runs: tuple[Path, ...],
+        environment_map_path: Path,
+        output: Path,
+        generator: object,
+        policy_path: Path | None,
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
+        statuses = tuple(
+            SimpleNamespace(
+                environment_id=f"candidate-{index}",
+                status="observed_unclassified",
+            )
+            for index, _ in enumerate(candidate_runs, 1)
+        )
+        comparison = SimpleNamespace(
+            comparison_id="c" * 64,
+            candidates=tuple(object() for _ in candidate_runs),
+            policy=None
+            if policy_path is None
+            else SimpleNamespace(policy_id="reviewed"),
+            scientific_results=statuses,
+        )
+        excluded = tuple(
+            SimpleNamespace(environment_id=status.environment_id)
+            for candidate, status in zip(candidate_runs, statuses, strict=True)
+            if "evaluation" in candidate.name
+        )
+        performance = SimpleNamespace(
+            included_runs=tuple(
+                object() for _ in range(1 + len(candidate_runs) - len(excluded))
+            ),
+            excluded_candidates=excluded,
+        )
+        records.update(comparison=comparison, performance=performance)
+        return comparison, performance
+
+    publisher = Mock(side_effect=publish_portability_comparison)
+    monkeypatch.setattr(
+        portability,
+        "publish_portability_comparison",
+        publisher,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_repository_metadata",
+        lambda cwd: (_ROOT, "a" * 40, True, "b" * 64),
+    )
+
+    def run(
+        *candidates: Path,
+        policy: Path | None = None,
+        reference_run: Path = reference,
+        environment_map_path: Path = environment_map,
+        destination: Path = output,
+    ) -> int:
+        return cli.main(
+            _portability_arguments(
+                reference_run,
+                tuple(candidates),
+                environment_map_path,
+                destination,
+                policy,
+            )
+        )
+
+    return SimpleNamespace(
+        run=run,
+        publisher=publisher,
+        records=records,
+        module=portability,
+        private_root=private_root,
+        reference=reference,
+        environment_map=environment_map,
+        output=output,
+    )
+
+
+@pytest.mark.parametrize("count", (1, 3))
+def test_portability_routes_one_or_multiple_candidates_in_explicit_order(
+    wired_portability: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+    count: int,
+) -> None:
+    command = wired_portability
+    candidates = tuple(
+        command.private_root / f"candidate-{index}" for index in range(count)
+    )
+    assert command.run(*candidates) == 0
+    call = command.publisher.call_args.kwargs
+    assert call["reference_run"] == command.reference
+    assert call["candidate_runs"] == candidates
+    assert call["environment_map_path"] == command.environment_map
+    assert call["output"] == command.output
+    assert call["generator"] == command.module.ScientificGenerator("a" * 40, True)
+    assert f"candidates={count}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("policy_mode", (False, True))
+def test_portability_observation_and_policy_modes(
+    wired_portability: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+    policy_mode: bool,
+) -> None:
+    command = wired_portability
+    candidate = command.private_root / "candidate"
+    policy = command.private_root / "policy.json" if policy_mode else None
+    assert command.run(candidate, policy=policy) == 0
+    assert command.publisher.call_args.kwargs["policy_path"] == policy
+    output = capsys.readouterr().out
+    assert f"mode={'policy' if policy_mode else 'observation'}" in output
+    assert "accepted" not in output
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        ValueError("environment map JSON bytes are not canonical"),
+        ValueError("policy JSON contains a duplicate key"),
+        ValueError("reference run must be a benchmark bundle"),
+        ValueError("reference benchmark data is required"),
+        FileExistsError("output directory already exists"),
+        OSError("late publication failure"),
+        ValueError("comparison validation failed"),
+    ),
+)
+def test_portability_failures_use_one_concise_error_boundary(
+    wired_portability: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    command = wired_portability
+    command.publisher.side_effect = error
+    assert command.run(command.private_root / "candidate") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"inspectrt portability compare failed: {error}\n"
+
+
+def test_portability_keeps_evaluation_candidate_scientific_and_excludes_timing(
+    wired_portability: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command = wired_portability
+    assert command.run(command.private_root / "evaluation-candidate") == 0
+    comparison = command.records["comparison"]
+    performance = command.records["performance"]
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+    assert len(performance.included_runs) == 1
+    assert len(performance.excluded_candidates) == 1
+    output = capsys.readouterr().out
+    assert "performance_included=1" in output
+    assert "performance_excluded=1" in output
+
+
+def test_portability_success_prints_only_the_bounded_summary(
+    wired_portability: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command = wired_portability
+    candidate = command.private_root / "candidate"
+    assert command.run(candidate) == 0
+    output = capsys.readouterr().out
+    assert output.splitlines() == [
+        f"comparison_id={'c' * 64}",
+        "candidates=1",
+        "performance_included=2",
+        "performance_excluded=0",
+        "mode=observation",
+        "status=published",
+    ]
+    assert str(command.private_root) not in output
 
 
 def test_fixture_command_help_and_action_surface() -> None:

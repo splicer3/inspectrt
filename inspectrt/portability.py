@@ -5,19 +5,21 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import tempfile
 from types import MappingProxyType
 from typing import BinaryIO, Literal
 
 import torch
 from torch import Tensor
 
-from inspectrt.artifacts import _canonical_json
+from inspectrt.artifacts import _canonical_json, _rename_without_overwrite
 from inspectrt.benchmark import _methodology
 from inspectrt.data import MvtecSample
 from inspectrt.metrics import (
@@ -30,6 +32,7 @@ __all__ = (
     "BundleValidationError",
     "CandidateComparability",
     "CandidateScientificResult",
+    "CanonicalInputIdentity",
     "ComparableBundle",
     "ComparisonValidationError",
     "DiscreteComponentComparison",
@@ -38,6 +41,15 @@ __all__ = (
     "IndexMismatch",
     "MemoryBankMetadata",
     "MetricDelta",
+    "PolicyDerivation",
+    "PolicyTolerance",
+    "PortabilityEnvironmentDescriptor",
+    "PortabilityEnvironmentMap",
+    "PortabilityPerformance",
+    "PortabilityPerformanceExclusion",
+    "PortabilityPerformanceRun",
+    "PortabilityPolicy",
+    "PortabilityPolicyIdentity",
     "PredictionRecord",
     "ScientificBundleDescriptor",
     "ScientificComparison",
@@ -45,9 +57,15 @@ __all__ = (
     "ScientificGenerator",
     "ScientificRunIdentity",
     "SourceFileSnapshot",
+    "build_portability_performance",
     "compare_scientific_bundles",
+    "encode_portability_performance",
     "encode_scientific_comparison",
     "load_comparable_bundle",
+    "load_portability_environment_map",
+    "load_portability_policy",
+    "publish_portability_comparison",
+    "publish_portability_records",
 )
 
 _EVALUATION_FILES = (
@@ -176,8 +194,17 @@ _ACCEPTED_WEIGHT_SHA256 = (
 )
 _SCHEMA_ID = "inspectrt_portability_comparison_v1"
 _MILESTONE_ID = "inspectrt_cross_platform_evidence_v1"
+_ENVIRONMENT_MAP_SCHEMA_ID = "inspectrt_portability_environment_map_v1"
+_POLICY_SCHEMA_ID = "inspectrt_portability_policy_v1"
+_PERFORMANCE_SCHEMA_ID = "inspectrt_portability_performance_v1"
 _FLOAT_CHUNK_SIZE = 65_536
 _INDEX_MISMATCH_LIMIT = 16
+_FLOATING_COMPONENTS = (
+    "memory_bank",
+    "patch_distances",
+    "image_scores",
+    "anomaly_maps",
+)
 _SCIENTIFIC_METRICS = (
     "image_auroc",
     "image_average_precision",
@@ -194,10 +221,60 @@ _POLICY_ROLES = {
 _CANDIDATE_ROLES = _POLICY_ROLES - {"reference"}
 _EXECUTION_LAYERS = {"native", "wsl2"}
 _ATTEMPT_STATUSES = {"unsupported", "execution_failed"}
-_CANDIDATE_STATUSES = {"structurally_incomparable", "observed_unclassified"}
+_CANDIDATE_STATUSES = {
+    "structurally_incomparable",
+    "observed_unclassified",
+    "within_policy",
+    "drift_detected",
+}
 _ENVIRONMENT_ID = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
 _MACHINE_CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+_MACHINE_ID = re.compile(r"[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?")
 _REQUESTED_DEVICE = re.compile(r"(?:cpu|mps|cuda:[0-9]+)")
+_PROVENANCE_REQUIREMENTS = (
+    "clean_source",
+    "scientific_source_commit",
+    "lock_identity",
+    "weight_identity",
+    "inventory_identity",
+)
+_DISCRETE_REQUIREMENTS = (
+    "test_sample_ids",
+    "test_labels",
+    "evaluation_masks",
+    "nearest_bank_indices",
+)
+_SCIENTIFIC_GATE_NAMES = (
+    "run_schema",
+    "profile",
+    "category",
+    "preprocessing",
+    "feature_contract",
+    "weight_identity",
+    "configuration",
+    "lock_identity",
+    "clean_source",
+    "scientific_source_commit",
+    "inventory_identity",
+    "samples_source",
+    "ordered_sample_ids",
+    "ordered_sample_metadata",
+    "ordered_training_ids",
+    "ordered_test_sample_ids",
+    "ordered_labels",
+    "sample_counts",
+    "memory_bank_contract",
+    "patch_distance_contract",
+    "image_score_contract",
+    "nearest_index_contract",
+    "test_label_contract",
+    "anomaly_map_contract",
+    "mask_contract",
+    "retrieval_semantics",
+    "image_score_semantics",
+    "anomaly_map_semantics",
+    "metric_fields",
+)
 _MAP_INTERPOLATION = {
     "align_corners": False,
     "input_size": [32, 32],
@@ -288,6 +365,88 @@ class ComparableBundle:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalInputIdentity:
+    """Identity of one exact canonical JSON input."""
+
+    byte_count: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.byte_count) is not int or self.byte_count <= 0:
+            raise ComparisonValidationError(
+                "canonical input byte_count must be positive"
+            )
+        _comparison_sha256(self.sha256, "canonical input SHA-256")
+
+
+@dataclass(frozen=True, slots=True)
+class PortabilityEnvironmentDescriptor:
+    """Sanitized public identity bound positionally to one run bundle."""
+
+    environment_id: str
+    policy_role: Literal[
+        "reference",
+        "same_stack_control",
+        "calibration",
+        "holdout",
+        "post_policy_attempt",
+    ]
+    os_label: str
+    execution_layer: Literal["native", "wsl2"]
+    hardware_label: str
+    requested_device: str
+
+    def __post_init__(self) -> None:
+        _validate_descriptor_identity(self)
+
+
+@dataclass(frozen=True, slots=True)
+class PortabilityEnvironmentMap:
+    """Strict ordered schema-1 mapping from CLI runs to public identities."""
+
+    schema_version: int
+    schema_id: str
+    reference: PortabilityEnvironmentDescriptor
+    candidates: tuple[PortabilityEnvironmentDescriptor, ...]
+    attempts: tuple["ScientificExecutionAttempt", ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or type(self.schema_id) is not str
+            or self.schema_id != _ENVIRONMENT_MAP_SCHEMA_ID
+        ):
+            raise ComparisonValidationError("environment map identity is invalid")
+        if (
+            type(self.reference) is not PortabilityEnvironmentDescriptor
+            or self.reference.policy_role != "reference"
+            or type(self.candidates) is not tuple
+            or not self.candidates
+            or any(
+                type(candidate) is not PortabilityEnvironmentDescriptor
+                or candidate.policy_role not in _CANDIDATE_ROLES
+                for candidate in self.candidates
+            )
+            or type(self.attempts) is not tuple
+            or any(
+                type(attempt) is not ScientificExecutionAttempt
+                for attempt in self.attempts
+            )
+        ):
+            raise ComparisonValidationError("environment map run roles are invalid")
+        environment_ids = (
+            self.reference.environment_id,
+            *(candidate.environment_id for candidate in self.candidates),
+            *(attempt.environment_id for attempt in self.attempts),
+        )
+        if len(environment_ids) != len(set(environment_ids)):
+            raise ComparisonValidationError(
+                "environment map IDs must be unique across bundles and attempts"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ScientificBundleDescriptor:
     """One loaded bundle plus caller-supplied sanitized public identity."""
 
@@ -310,24 +469,7 @@ class ScientificBundleDescriptor:
             raise ComparisonValidationError(
                 "bundle descriptor must contain a ComparableBundle"
             )
-        _environment_id(self.environment_id, "environment_id")
-        if type(self.policy_role) is not str or self.policy_role not in _POLICY_ROLES:
-            raise ComparisonValidationError("policy_role is invalid")
-        _public_label(self.os_label, "os_label")
-        if (
-            type(self.execution_layer) is not str
-            or self.execution_layer not in _EXECUTION_LAYERS
-        ):
-            raise ComparisonValidationError("execution_layer is invalid")
-        _public_label(self.hardware_label, "hardware_label")
-        if type(self.requested_device) is not str or not _REQUESTED_DEVICE.fullmatch(
-            self.requested_device
-        ):
-            raise ComparisonValidationError("requested_device is invalid")
-        if self.requested_device == "mps" and self.policy_role != "post_policy_attempt":
-            raise ComparisonValidationError(
-                "MPS bundles must use policy_role post_policy_attempt"
-            )
+        _validate_descriptor_identity(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +505,88 @@ class ScientificGenerator:
             )
         if type(self.dirty) is not bool:
             raise ComparisonValidationError("generator dirty must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyTolerance:
+    """Explicit elementwise absolute and relative policy limits."""
+
+    atol: int | float
+    rtol: int | float
+
+    def __post_init__(self) -> None:
+        _nonnegative_policy_number(self.atol, "policy tolerance atol")
+        _nonnegative_policy_number(self.rtol, "policy tolerance rtol")
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyDerivation:
+    """Machine-readable record identifying reviewed derivation evidence."""
+
+    method_id: str
+    comparison_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _bounded_machine_id(self.method_id, "policy derivation method_id")
+        if (
+            type(self.comparison_ids) is not tuple
+            or not self.comparison_ids
+            or len(self.comparison_ids) != len(set(self.comparison_ids))
+        ):
+            raise ComparisonValidationError(
+                "policy derivation comparison_ids must be a nonempty unique array"
+            )
+        for value in self.comparison_ids:
+            _comparison_sha256(value, "policy derivation comparison ID")
+
+
+@dataclass(frozen=True, slots=True)
+class PortabilityPolicy:
+    """Strict reviewed schema-1 policy plus its exact source-byte identity."""
+
+    schema_version: int
+    schema_id: str
+    policy_id: str
+    profile_id: str
+    category: str
+    reference_environment_id: str
+    calibration_environment_ids: tuple[str, ...]
+    holdout_environment_ids: tuple[str, ...]
+    provenance_requirements: tuple[str, ...]
+    discrete_output_requirements: tuple[str, ...]
+    floating_component_limits: Mapping[str, PolicyTolerance]
+    metric_absolute_delta_limits: Mapping[str, int | float]
+    derivation: PolicyDerivation
+    reviewed_evidence_hashes: tuple[str, ...]
+    limitation: str
+    source: CanonicalInputIdentity
+
+    def __post_init__(self) -> None:
+        if isinstance(self.floating_component_limits, Mapping):
+            object.__setattr__(
+                self,
+                "floating_component_limits",
+                MappingProxyType(dict(self.floating_component_limits)),
+            )
+        if isinstance(self.metric_absolute_delta_limits, Mapping):
+            object.__setattr__(
+                self,
+                "metric_absolute_delta_limits",
+                MappingProxyType(dict(self.metric_absolute_delta_limits)),
+            )
+        _validate_portability_policy(self)
+
+
+@dataclass(frozen=True, slots=True)
+class PortabilityPolicyIdentity:
+    """Reviewed policy identity exposed by policy-mode scientific output."""
+
+    policy_id: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _bounded_machine_id(self.policy_id, "policy identity policy_id")
+        _comparison_sha256(self.sha256, "policy identity SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +649,7 @@ class FloatingStatistics:
     root_mean_square_error: float
     maximum_relative_error: float | None
     zero_reference_count: int
+    policy_violation_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,10 +694,15 @@ class MetricDelta:
 
 @dataclass(frozen=True, slots=True)
 class CandidateScientificResult:
-    """Observation-only result for one completed candidate bundle."""
+    """Scientific result for one completed candidate bundle."""
 
     environment_id: str
-    status: Literal["structurally_incomparable", "observed_unclassified"]
+    status: Literal[
+        "structurally_incomparable",
+        "observed_unclassified",
+        "within_policy",
+        "drift_detected",
+    ]
     floating_components: tuple[FloatingComponentComparison, ...] | None
     discrete_components: tuple[DiscreteComponentComparison, ...] | None
     metrics: tuple[MetricDelta, ...] | None
@@ -493,6 +723,102 @@ class ScientificComparison:
     comparability: tuple[CandidateComparability, ...]
     scientific_results: tuple[CandidateScientificResult, ...]
     limitations: tuple[str, ...]
+    policy: PortabilityPolicyIdentity | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PortabilityPerformanceRun:
+    """One timing-eligible run with benchmark observations copied verbatim."""
+
+    environment_id: str
+    os_label: str
+    execution_layer: Literal["native", "wsl2"]
+    hardware_label: str
+    requested_device: str
+    run_id: str
+    benchmark_sample_id: str
+    timing_methodology: Mapping[str, object]
+    measurements: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        _environment_id(self.environment_id, "performance run environment_id")
+        _public_label(self.os_label, "performance run os_label")
+        if self.execution_layer not in _EXECUTION_LAYERS:
+            raise ComparisonValidationError(
+                "performance run execution_layer is invalid"
+            )
+        _public_label(self.hardware_label, "performance run hardware_label")
+        if not _timing_device(self.requested_device):
+            raise ComparisonValidationError(
+                "performance run requested_device is not timing-valid"
+            )
+        run_id = _comparison_string(self.run_id, "performance run run_id")
+        if not _RUN_ID.fullmatch(run_id):
+            raise ComparisonValidationError("performance run run_id is invalid")
+        _portable_identity_string(
+            self.benchmark_sample_id, "performance run benchmark_sample_id"
+        )
+        object.__setattr__(
+            self,
+            "timing_methodology",
+            _freeze_comparison_json(self.timing_methodology),
+        )
+        object.__setattr__(
+            self, "measurements", _freeze_comparison_json(self.measurements)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PortabilityPerformanceExclusion:
+    """One completed scientific candidate excluded from the timing matrix."""
+
+    environment_id: str
+    reason_code: Literal[
+        "evaluation_bundle",
+        "unsupported_timing_device",
+        "workload_mismatch",
+        "methodology_mismatch",
+    ]
+
+    def __post_init__(self) -> None:
+        _environment_id(self.environment_id, "performance exclusion environment_id")
+        if self.reason_code not in {
+            "evaluation_bundle",
+            "unsupported_timing_device",
+            "workload_mismatch",
+            "methodology_mismatch",
+        }:
+            raise ComparisonValidationError(
+                "performance exclusion reason_code is invalid"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PortabilityPerformance:
+    """Immutable descriptive-only schema-1 performance record."""
+
+    schema_version: int
+    schema_id: str
+    milestone_id: str
+    status: Literal["descriptive_only"]
+    comparison_id: str
+    scientific_sha256: str
+    generator: ScientificGenerator
+    workload: Mapping[str, object]
+    timing_methodology: Mapping[str, object]
+    included_runs: tuple[PortabilityPerformanceRun, ...]
+    excluded_candidates: tuple[PortabilityPerformanceExclusion, ...]
+    attempts: tuple[ScientificExecutionAttempt, ...]
+    limitations: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "workload", _freeze_comparison_json(self.workload))
+        object.__setattr__(
+            self,
+            "timing_methodology",
+            _freeze_comparison_json(self.timing_methodology),
+        )
+        _validate_portability_performance(self)
 
 
 def load_comparable_bundle(bundle_path: Path) -> ComparableBundle:
@@ -611,20 +937,177 @@ def load_comparable_bundle(bundle_path: Path) -> ComparableBundle:
     )
 
 
+def load_portability_environment_map(path: Path) -> PortabilityEnvironmentMap:
+    """Load one exact canonical sanitized environment map."""
+    _, value = _load_canonical_input(path, "environment map")
+    _comparison_keys(
+        value,
+        {"schema_version", "schema_id", "reference", "candidates", "attempts"},
+        "environment map",
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["schema_id"]) is not str
+        or value["schema_id"] != _ENVIRONMENT_MAP_SCHEMA_ID
+    ):
+        raise ComparisonValidationError("environment map identity is invalid")
+    reference = _environment_descriptor_record(value["reference"], "reference")
+    candidate_values = _comparison_list(value["candidates"], "candidates")
+    if not candidate_values:
+        raise ComparisonValidationError(
+            "environment map must contain at least one candidate"
+        )
+    candidates = tuple(
+        _environment_descriptor_record(candidate, f"candidates[{index}]")
+        for index, candidate in enumerate(candidate_values)
+    )
+    attempt_values = _comparison_list(value["attempts"], "attempts")
+    attempts = tuple(
+        _execution_attempt_record(attempt, f"attempts[{index}]")
+        for index, attempt in enumerate(attempt_values)
+    )
+    return PortabilityEnvironmentMap(
+        schema_version=1,
+        schema_id=_ENVIRONMENT_MAP_SCHEMA_ID,
+        reference=reference,
+        candidates=candidates,
+        attempts=attempts,
+    )
+
+
+def load_portability_policy(path: Path) -> PortabilityPolicy:
+    """Load one exact canonical reviewed portability policy without tuning it."""
+    payload, value = _load_canonical_input(path, "portability policy")
+    _comparison_keys(
+        value,
+        {
+            "schema_version",
+            "schema_id",
+            "policy_id",
+            "profile_id",
+            "category",
+            "reference_environment_id",
+            "calibration_environment_ids",
+            "holdout_environment_ids",
+            "provenance_requirements",
+            "discrete_output_requirements",
+            "floating_component_limits",
+            "metric_absolute_delta_limits",
+            "derivation",
+            "reviewed_evidence_hashes",
+            "limitation",
+        },
+        "portability policy",
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["schema_id"]) is not str
+        or value["schema_id"] != _POLICY_SCHEMA_ID
+    ):
+        raise ComparisonValidationError("portability policy identity is invalid")
+
+    floating_values = _comparison_dict(
+        value["floating_component_limits"], "floating_component_limits"
+    )
+    _comparison_keys(
+        floating_values, set(_FLOATING_COMPONENTS), "floating_component_limits"
+    )
+    floating_limits = {}
+    for name in _FLOATING_COMPONENTS:
+        tolerance = _comparison_dict(
+            floating_values[name], f"floating_component_limits.{name}"
+        )
+        _comparison_keys(
+            tolerance, {"atol", "rtol"}, f"floating_component_limits.{name}"
+        )
+        floating_limits[name] = PolicyTolerance(tolerance["atol"], tolerance["rtol"])
+
+    metric_values = _comparison_dict(
+        value["metric_absolute_delta_limits"], "metric_absolute_delta_limits"
+    )
+    _comparison_keys(
+        metric_values, set(_SCIENTIFIC_METRICS), "metric_absolute_delta_limits"
+    )
+    metric_limits = {
+        name: _nonnegative_policy_number(
+            metric_values[name], f"metric_absolute_delta_limits.{name}"
+        )
+        for name in _SCIENTIFIC_METRICS
+    }
+
+    derivation_value = _comparison_dict(value["derivation"], "derivation")
+    _comparison_keys(derivation_value, {"method_id", "comparison_ids"}, "derivation")
+    derivation = PolicyDerivation(
+        _comparison_string(derivation_value["method_id"], "derivation.method_id"),
+        tuple(
+            _comparison_string(item, "derivation.comparison_ids item")
+            for item in _comparison_list(
+                derivation_value["comparison_ids"], "derivation.comparison_ids"
+            )
+        ),
+    )
+    return PortabilityPolicy(
+        schema_version=1,
+        schema_id=_POLICY_SCHEMA_ID,
+        policy_id=_comparison_string(value["policy_id"], "policy_id"),
+        profile_id=_comparison_string(value["profile_id"], "profile_id"),
+        category=_comparison_string(value["category"], "category"),
+        reference_environment_id=_comparison_string(
+            value["reference_environment_id"], "reference_environment_id"
+        ),
+        calibration_environment_ids=_environment_id_array(
+            value["calibration_environment_ids"], "calibration_environment_ids"
+        ),
+        holdout_environment_ids=_environment_id_array(
+            value["holdout_environment_ids"], "holdout_environment_ids"
+        ),
+        provenance_requirements=_exact_requirement_array(
+            value["provenance_requirements"],
+            _PROVENANCE_REQUIREMENTS,
+            "provenance_requirements",
+        ),
+        discrete_output_requirements=_exact_requirement_array(
+            value["discrete_output_requirements"],
+            _DISCRETE_REQUIREMENTS,
+            "discrete_output_requirements",
+        ),
+        floating_component_limits=MappingProxyType(floating_limits),
+        metric_absolute_delta_limits=MappingProxyType(metric_limits),
+        derivation=derivation,
+        reviewed_evidence_hashes=tuple(
+            _comparison_string(item, "reviewed_evidence_hashes item")
+            for item in _comparison_list(
+                value["reviewed_evidence_hashes"], "reviewed_evidence_hashes"
+            )
+        ),
+        limitation=_comparison_string(value["limitation"], "limitation"),
+        source=CanonicalInputIdentity(
+            len(payload), hashlib.sha256(payload).hexdigest()
+        ),
+    )
+
+
 def compare_scientific_bundles(
     reference: ScientificBundleDescriptor,
     candidates: Sequence[ScientificBundleDescriptor],
     *,
     generator: ScientificGenerator,
     attempts: Sequence[ScientificExecutionAttempt] = (),
+    policy: PortabilityPolicy | None = None,
 ) -> ScientificComparison:
-    """Compare one frozen reference with candidates without applying a policy."""
+    """Compare frozen bundles, applying only an explicitly supplied policy."""
     if type(reference) is not ScientificBundleDescriptor:
         raise ComparisonValidationError(
             "reference must be a ScientificBundleDescriptor"
         )
     if type(generator) is not ScientificGenerator:
         raise ComparisonValidationError("generator must be a ScientificGenerator")
+    if policy is not None and type(policy) is not PortabilityPolicy:
+        raise ComparisonValidationError("policy must be a PortabilityPolicy or None")
+    if policy is not None:
+        _validate_portability_policy(policy)
     candidate_records = _comparison_sequence(
         candidates, ScientificBundleDescriptor, "candidates"
     )
@@ -663,6 +1146,8 @@ def compare_scientific_bundles(
             raise ComparisonValidationError(
                 f"{descriptor.environment_id}: requested_device differs from the bundle"
             )
+    if policy is not None:
+        _validate_policy_scope(policy, reference, candidate_records)
 
     reference_identity = _scientific_run_identity(reference)
     candidate_identities = tuple(
@@ -679,6 +1164,8 @@ def compare_scientific_bundles(
         "schema_id": _SCHEMA_ID,
         "schema_version": 1,
     }
+    if policy is not None:
+        identity_payload["policy_sha256"] = policy.source.sha256
     # The ID is the full SHA-256 of this canonical identity payload; it excludes
     # itself and all measured results.
     comparison_id = hashlib.sha256(_canonical_json(identity_payload)).hexdigest()
@@ -727,14 +1214,14 @@ def compare_scientific_bundles(
                     getattr(reference.bundle, name),
                     getattr(candidate.bundle, name),
                     name,
+                    tolerance=(
+                        policy.floating_component_limits[name]
+                        if policy is not None
+                        else None
+                    ),
                 ),
             )
-            for name in (
-                "memory_bank",
-                "patch_distances",
-                "image_scores",
-                "anomaly_maps",
-            )
+            for name in _FLOATING_COMPONENTS
         )
         discrete = (
             _sequence_discrete(
@@ -769,10 +1256,27 @@ def compare_scientific_bundles(
             )
             for name in _SCIENTIFIC_METRICS
         )
+        status = "observed_unclassified"
+        if policy is not None:
+            floating_drift = any(
+                component.statistics.policy_violation_count != 0
+                for component in floating
+            )
+            discrete_drift = any(not component.exact for component in discrete)
+            metric_drift = any(
+                metric.absolute_delta
+                > policy.metric_absolute_delta_limits[metric.metric_name]
+                for metric in metrics
+            )
+            status = (
+                "drift_detected"
+                if floating_drift or discrete_drift or metric_drift
+                else "within_policy"
+            )
         results.append(
             CandidateScientificResult(
                 candidate.environment_id,
-                "observed_unclassified",
+                status,
                 floating,
                 discrete,
                 metrics,
@@ -791,9 +1295,15 @@ def compare_scientific_bundles(
         comparability=tuple(comparability),
         scientific_results=tuple(results),
         limitations=(
-            "observation_only_no_policy",
+            *(("observation_only_no_policy",) if policy is None else ()),
             "nominal_memory_bank_and_downstream_artifacts_only",
             "source_hashes_are_current_bundle_snapshots",
+            *(("reviewed_observed_envelope_not_universal",) if policy else ()),
+        ),
+        policy=(
+            PortabilityPolicyIdentity(policy.policy_id, policy.source.sha256)
+            if policy is not None
+            else None
         ),
     )
 
@@ -811,6 +1321,201 @@ def encode_scientific_comparison(comparison: ScientificComparison) -> bytes:
         raise ComparisonValidationError(
             "scientific comparison cannot be canonically encoded"
         ) from error
+
+
+def build_portability_performance(
+    comparison: ScientificComparison,
+    scientific_bytes: bytes,
+    reference: ScientificBundleDescriptor,
+    candidates: Sequence[ScientificBundleDescriptor],
+) -> PortabilityPerformance:
+    """Project validated benchmark observations without changing science."""
+    if type(comparison) is not ScientificComparison:
+        raise ComparisonValidationError("comparison must be a ScientificComparison")
+    if type(scientific_bytes) is not bytes or scientific_bytes != (
+        encode_scientific_comparison(comparison)
+    ):
+        raise ComparisonValidationError(
+            "scientific_bytes must be the exact canonical comparison bytes"
+        )
+    if type(reference) is not ScientificBundleDescriptor:
+        raise ComparisonValidationError(
+            "reference must be a ScientificBundleDescriptor"
+        )
+    candidate_records = _comparison_sequence(
+        candidates, ScientificBundleDescriptor, "performance candidates"
+    )
+    if (
+        _scientific_run_identity(reference) != comparison.reference
+        or tuple(_scientific_run_identity(candidate) for candidate in candidate_records)
+        != comparison.candidates
+    ):
+        raise ComparisonValidationError(
+            "performance descriptors differ from the scientific comparison"
+        )
+    if reference.bundle.kind != "benchmark":
+        raise ComparisonValidationError(
+            "reference run must be an eight-file benchmark bundle"
+        )
+    if not _timing_device(reference.requested_device):
+        raise ComparisonValidationError(
+            "reference requested device must be cpu or explicitly indexed CUDA"
+        )
+
+    reference_benchmark = _performance_benchmark(reference.bundle)
+    workload = _comparison_mapping(
+        reference_benchmark["workload"], "reference workload"
+    )
+    methodology = _comparison_mapping(
+        reference_benchmark["methodology"], "reference methodology"
+    )
+    _validate_timing_methodology(methodology, reference.requested_device)
+    included = [_performance_run(reference)]
+    excluded = []
+    for descriptor, candidate_identity in zip(
+        candidate_records, comparison.candidates, strict=True
+    ):
+        reason = _performance_exclusion_reason(
+            descriptor,
+            comparison.reference,
+            candidate_identity,
+            workload,
+            methodology,
+        )
+        if reason is None:
+            included.append(_performance_run(descriptor))
+        else:
+            excluded.append(
+                PortabilityPerformanceExclusion(descriptor.environment_id, reason)
+            )
+
+    return PortabilityPerformance(
+        schema_version=1,
+        schema_id=_PERFORMANCE_SCHEMA_ID,
+        milestone_id=_MILESTONE_ID,
+        status="descriptive_only",
+        comparison_id=comparison.comparison_id,
+        scientific_sha256=hashlib.sha256(scientific_bytes).hexdigest(),
+        generator=comparison.generator,
+        workload=workload,
+        timing_methodology=_methodology_compatibility_identity(methodology),
+        included_runs=tuple(included),
+        excluded_candidates=tuple(excluded),
+        attempts=comparison.attempts,
+        limitations=(
+            "benchmark_summaries_without_raw_repetitions",
+            "host_conditions_are_uncontrolled",
+            "absolute_observations_only_no_cross_machine_inference",
+        ),
+    )
+
+
+def encode_portability_performance(performance: PortabilityPerformance) -> bytes:
+    """Return canonical in-memory ``performance.json`` UTF-8 bytes."""
+    if type(performance) is not PortabilityPerformance:
+        raise ComparisonValidationError(
+            "performance must be a PortabilityPerformance record"
+        )
+    _validate_portability_performance(performance)
+    try:
+        return _canonical_json(_portability_performance_value(performance))
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise ComparisonValidationError(
+            "performance record cannot be canonically encoded"
+        ) from error
+
+
+def publish_portability_records(
+    scientific_bytes: bytes, performance_bytes: bytes, output: Path
+) -> Path:
+    """Atomically publish exactly two canonical records without overwrite."""
+    if type(scientific_bytes) is not bytes or type(performance_bytes) is not bytes:
+        raise TypeError("publication payloads must be bytes")
+    if not isinstance(output, Path):
+        raise TypeError("output must be a pathlib.Path")
+    scientific = _parse_json(scientific_bytes, "scientific.json")
+    performance = _parse_json(performance_bytes, "performance.json")
+    _reject_absolute_identity_values(scientific, "scientific.json")
+    _reject_absolute_identity_values(performance, "performance.json")
+    if (
+        performance.get("scientific_sha256")
+        != hashlib.sha256(scientific_bytes).hexdigest()
+    ):
+        raise ComparisonValidationError(
+            "performance.json does not identify the exact scientific.json bytes"
+        )
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"output directory already exists: {output}")
+    parent = output.parent
+    if not parent.is_dir() or parent.is_symlink():
+        raise ComparisonValidationError(
+            "output parent must be an existing real directory"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.tmp-", dir=parent
+    ) as temporary_name:
+        temporary = Path(temporary_name)
+        _write_portability_file(temporary / "scientific.json", scientific_bytes)
+        _write_portability_file(temporary / "performance.json", performance_bytes)
+        if tuple(sorted(path.name for path in temporary.iterdir())) != (
+            "performance.json",
+            "scientific.json",
+        ):
+            raise ComparisonValidationError("temporary output inventory is invalid")
+        _rename_without_overwrite(temporary, output)
+    return output
+
+
+def publish_portability_comparison(
+    reference_run: Path,
+    candidate_runs: Sequence[Path],
+    environment_map_path: Path,
+    output: Path,
+    *,
+    generator: ScientificGenerator,
+    policy_path: Path | None = None,
+) -> tuple[ScientificComparison, PortabilityPerformance]:
+    """Load, compare, encode, and atomically publish one CLI comparison."""
+    environment_map = load_portability_environment_map(environment_map_path)
+    run_paths = _path_sequence(candidate_runs, "candidate_runs")
+    if len(run_paths) != len(environment_map.candidates):
+        raise ComparisonValidationError(
+            "candidate run count must match the environment map candidate count"
+        )
+    reference_bundle = load_comparable_bundle(reference_run)
+    candidate_bundles = tuple(load_comparable_bundle(path) for path in run_paths)
+    if not isinstance(output, Path):
+        raise TypeError("output must be a pathlib.Path")
+    resolved_output = output.resolve(strict=False)
+    if any(
+        resolved_output.is_relative_to(bundle.path)
+        for bundle in (reference_bundle, *candidate_bundles)
+    ):
+        raise ComparisonValidationError("output must be outside source run bundles")
+    reference = _bind_environment_descriptor(
+        reference_bundle, environment_map.reference
+    )
+    candidates = tuple(
+        _bind_environment_descriptor(bundle, descriptor)
+        for bundle, descriptor in zip(
+            candidate_bundles, environment_map.candidates, strict=True
+        )
+    )
+    policy = load_portability_policy(policy_path) if policy_path is not None else None
+    comparison = compare_scientific_bundles(
+        reference,
+        candidates,
+        generator=generator,
+        attempts=environment_map.attempts,
+        policy=policy,
+    )
+    scientific_bytes = encode_scientific_comparison(comparison)
+    performance = build_portability_performance(
+        comparison, scientific_bytes, reference, candidates
+    )
+    performance_bytes = encode_portability_performance(performance)
+    publish_portability_records(scientific_bytes, performance_bytes, output)
+    return comparison, performance
 
 
 def _validate_bundle_directory(path: Path) -> Path:
@@ -1985,6 +2690,334 @@ def _freeze_json(value: object) -> object:
     return value
 
 
+def _load_canonical_input(path: Path, name: str) -> tuple[bytes, dict[str, object]]:
+    if not isinstance(path, Path):
+        raise TypeError(f"{name} path must be a pathlib.Path")
+    with _open_regular(path, name) as (stream, before):
+        try:
+            payload = stream.read()
+            after = os.fstat(stream.fileno())
+        except OSError as error:
+            raise ComparisonValidationError(f"{name} cannot be read") from error
+    if _stat_identity(before) != _stat_identity(after) or len(payload) != after.st_size:
+        raise ComparisonValidationError(f"{name} changed while reading")
+    return payload, _parse_json(payload, name)
+
+
+def _comparison_keys(
+    value: Mapping[str, object], expected: set[str], name: str
+) -> None:
+    actual = set(value)
+    missing = sorted(expected - actual)
+    if missing:
+        raise ComparisonValidationError(
+            f"{name} is missing required keys: {', '.join(missing)}"
+        )
+    unknown = sorted(actual - expected)
+    if unknown:
+        raise ComparisonValidationError(
+            f"{name} contains unknown keys: {', '.join(unknown)}"
+        )
+
+
+def _comparison_dict(value: object, name: str) -> dict[str, object]:
+    if type(value) is not dict or any(type(key) is not str for key in value):
+        raise ComparisonValidationError(f"{name} must be an object")
+    return value
+
+
+def _comparison_list(value: object, name: str) -> list[object]:
+    if type(value) is not list:
+        raise ComparisonValidationError(f"{name} must be an array")
+    return value
+
+
+def _validate_descriptor_identity(value: object) -> None:
+    for name in (
+        "environment_id",
+        "policy_role",
+        "os_label",
+        "execution_layer",
+        "hardware_label",
+        "requested_device",
+    ):
+        if not hasattr(value, name):
+            raise ComparisonValidationError("environment descriptor is invalid")
+    _environment_id(value.environment_id, "environment_id")
+    if type(value.policy_role) is not str or value.policy_role not in _POLICY_ROLES:
+        raise ComparisonValidationError("policy_role is invalid")
+    _public_label(value.os_label, "os_label")
+    if (
+        type(value.execution_layer) is not str
+        or value.execution_layer not in _EXECUTION_LAYERS
+    ):
+        raise ComparisonValidationError("execution_layer is invalid")
+    _public_label(value.hardware_label, "hardware_label")
+    if type(value.requested_device) is not str or not _REQUESTED_DEVICE.fullmatch(
+        value.requested_device
+    ):
+        raise ComparisonValidationError("requested_device is invalid")
+    if value.requested_device == "mps" and value.policy_role != "post_policy_attempt":
+        raise ComparisonValidationError(
+            "MPS bundles must use policy_role post_policy_attempt"
+        )
+
+
+def _environment_descriptor_record(
+    value: object, name: str
+) -> PortabilityEnvironmentDescriptor:
+    record = _comparison_dict(value, name)
+    fields = {
+        "environment_id",
+        "policy_role",
+        "os_label",
+        "execution_layer",
+        "hardware_label",
+        "requested_device",
+    }
+    _comparison_keys(record, fields, name)
+    return PortabilityEnvironmentDescriptor(
+        environment_id=record["environment_id"],  # type: ignore[arg-type]
+        policy_role=record["policy_role"],  # type: ignore[arg-type]
+        os_label=record["os_label"],  # type: ignore[arg-type]
+        execution_layer=record["execution_layer"],  # type: ignore[arg-type]
+        hardware_label=record["hardware_label"],  # type: ignore[arg-type]
+        requested_device=record["requested_device"],  # type: ignore[arg-type]
+    )
+
+
+def _execution_attempt_record(value: object, name: str) -> ScientificExecutionAttempt:
+    record = _comparison_dict(value, name)
+    _comparison_keys(
+        record,
+        {
+            "environment_id",
+            "gating",
+            "policy_role",
+            "reason_code",
+            "stage_code",
+            "status",
+        },
+        name,
+    )
+    if record["gating"] is not False or record["policy_role"] != "post_policy_attempt":
+        raise ComparisonValidationError(
+            f"{name} must be a canonical non-gating post-policy attempt"
+        )
+    return ScientificExecutionAttempt(
+        record["environment_id"],  # type: ignore[arg-type]
+        record["status"],  # type: ignore[arg-type]
+        record["reason_code"],  # type: ignore[arg-type]
+        record["stage_code"],  # type: ignore[arg-type]
+    )
+
+
+def _environment_id_array(value: object, name: str) -> tuple[str, ...]:
+    result = tuple(
+        _environment_id(item, f"{name} item") for item in _comparison_list(value, name)
+    )
+    if not result or len(result) != len(set(result)):
+        raise ComparisonValidationError(f"{name} must be a nonempty unique array")
+    return result
+
+
+def _exact_requirement_array(
+    value: object, expected: tuple[str, ...], name: str
+) -> tuple[str, ...]:
+    result = tuple(
+        _comparison_string(item, f"{name} item")
+        for item in _comparison_list(value, name)
+    )
+    if result != expected:
+        raise ComparisonValidationError(
+            f"{name} must contain every exact requirement in contract order"
+        )
+    return result
+
+
+def _bounded_machine_id(value: object, name: str) -> str:
+    if type(value) is not str or not _MACHINE_ID.fullmatch(value):
+        raise ComparisonValidationError(f"{name} must be a bounded machine ID")
+    return value
+
+
+def _nonnegative_policy_number(value: object, name: str) -> int | float:
+    if type(value) not in {int, float} or value < 0:
+        raise ComparisonValidationError(f"{name} must be finite and nonnegative")
+    try:
+        finite = math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        finite = False
+    if not finite:
+        raise ComparisonValidationError(f"{name} must be finite and nonnegative")
+    return value
+
+
+def _portability_policy_value(policy: PortabilityPolicy) -> dict[str, object]:
+    return {
+        "calibration_environment_ids": list(policy.calibration_environment_ids),
+        "category": policy.category,
+        "derivation": {
+            "comparison_ids": list(policy.derivation.comparison_ids),
+            "method_id": policy.derivation.method_id,
+        },
+        "discrete_output_requirements": list(policy.discrete_output_requirements),
+        "floating_component_limits": {
+            name: {
+                "atol": policy.floating_component_limits[name].atol,
+                "rtol": policy.floating_component_limits[name].rtol,
+            }
+            for name in _FLOATING_COMPONENTS
+        },
+        "holdout_environment_ids": list(policy.holdout_environment_ids),
+        "limitation": policy.limitation,
+        "metric_absolute_delta_limits": {
+            name: policy.metric_absolute_delta_limits[name]
+            for name in _SCIENTIFIC_METRICS
+        },
+        "policy_id": policy.policy_id,
+        "profile_id": policy.profile_id,
+        "provenance_requirements": list(policy.provenance_requirements),
+        "reference_environment_id": policy.reference_environment_id,
+        "reviewed_evidence_hashes": list(policy.reviewed_evidence_hashes),
+        "schema_id": policy.schema_id,
+        "schema_version": policy.schema_version,
+    }
+
+
+def _validate_portability_policy(policy: PortabilityPolicy) -> None:
+    if (
+        type(policy.schema_version) is not int
+        or policy.schema_version != 1
+        or type(policy.schema_id) is not str
+        or policy.schema_id != _POLICY_SCHEMA_ID
+    ):
+        raise ComparisonValidationError("portability policy identity is invalid")
+    _bounded_machine_id(policy.policy_id, "policy_id")
+    _bounded_machine_id(policy.profile_id, "profile_id")
+    _bounded_machine_id(policy.category, "category")
+    _environment_id(policy.reference_environment_id, "reference_environment_id")
+    calibration = _environment_id_array(
+        list(policy.calibration_environment_ids), "calibration_environment_ids"
+    )
+    holdout = _environment_id_array(
+        list(policy.holdout_environment_ids), "holdout_environment_ids"
+    )
+    if policy.reference_environment_id in {*calibration, *holdout}:
+        raise ComparisonValidationError(
+            "policy reference environment must be separate from candidates"
+        )
+    if set(calibration) & set(holdout):
+        raise ComparisonValidationError(
+            "policy calibration and holdout environments must not overlap"
+        )
+    if policy.provenance_requirements != _PROVENANCE_REQUIREMENTS:
+        raise ComparisonValidationError("policy provenance requirements are invalid")
+    if policy.discrete_output_requirements != _DISCRETE_REQUIREMENTS:
+        raise ComparisonValidationError("policy discrete requirements are invalid")
+    if set(policy.floating_component_limits) != set(_FLOATING_COMPONENTS) or any(
+        type(value) is not PolicyTolerance
+        for value in policy.floating_component_limits.values()
+    ):
+        raise ComparisonValidationError("policy floating limits are invalid")
+    if set(policy.metric_absolute_delta_limits) != set(_SCIENTIFIC_METRICS):
+        raise ComparisonValidationError("policy metric limits are invalid")
+    for name, value in policy.metric_absolute_delta_limits.items():
+        _nonnegative_policy_number(value, f"policy metric limit {name}")
+    if type(policy.derivation) is not PolicyDerivation:
+        raise ComparisonValidationError("policy derivation is invalid")
+    if (
+        type(policy.reviewed_evidence_hashes) is not tuple
+        or not policy.reviewed_evidence_hashes
+        or len(policy.reviewed_evidence_hashes)
+        != len(set(policy.reviewed_evidence_hashes))
+    ):
+        raise ComparisonValidationError(
+            "reviewed_evidence_hashes must be a nonempty unique array"
+        )
+    for value in policy.reviewed_evidence_hashes:
+        _comparison_sha256(value, "reviewed evidence hash")
+    if (
+        type(policy.limitation) is not str
+        or len(policy.limitation) > 500
+        or "observed envelope" not in policy.limitation.casefold()
+        or "not a universal guarantee" not in policy.limitation.casefold()
+        or any(ord(character) < 32 for character in policy.limitation)
+    ):
+        raise ComparisonValidationError(
+            "policy limitation must bound the observed envelope"
+        )
+    _portable_identity_string(policy.limitation, "policy limitation")
+    if type(policy.source) is not CanonicalInputIdentity:
+        raise ComparisonValidationError("policy source identity is invalid")
+    canonical = _canonical_json(_portability_policy_value(policy))
+    if (
+        policy.source.byte_count != len(canonical)
+        or policy.source.sha256 != hashlib.sha256(canonical).hexdigest()
+    ):
+        raise ComparisonValidationError(
+            "policy values differ from their canonical source identity"
+        )
+
+
+def _validate_policy_scope(
+    policy: PortabilityPolicy,
+    reference: ScientificBundleDescriptor,
+    candidates: tuple[object, ...],
+) -> None:
+    run = _comparison_mapping(reference.bundle.run_metadata, "reference run")
+    if policy.reference_environment_id != reference.environment_id:
+        raise ComparisonValidationError(
+            "policy reference environment differs from the reference descriptor"
+        )
+    if policy.profile_id != run.get("profile_id"):
+        raise ComparisonValidationError("policy profile differs from the reference")
+    if policy.category != run.get("category"):
+        raise ComparisonValidationError("policy category differs from the reference")
+    calibration = set(policy.calibration_environment_ids)
+    holdout = set(policy.holdout_environment_ids)
+    for value in candidates:
+        assert type(value) is ScientificBundleDescriptor
+        if value.policy_role == "post_policy_attempt":
+            continue
+        allowed = (
+            calibration
+            if value.policy_role
+            in {
+                "same_stack_control",
+                "calibration",
+            }
+            else holdout
+        )
+        if value.environment_id not in allowed:
+            raise ComparisonValidationError(
+                f"{value.environment_id}: candidate is outside policy scope"
+            )
+
+
+def _path_sequence(value: object, name: str) -> tuple[Path, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise TypeError(f"{name} must be an ordered collection of paths")
+    result = tuple(value)
+    if not result or any(not isinstance(path, Path) for path in result):
+        raise TypeError(f"{name} must contain at least one pathlib.Path")
+    return result
+
+
+def _bind_environment_descriptor(
+    bundle: ComparableBundle, descriptor: PortabilityEnvironmentDescriptor
+) -> ScientificBundleDescriptor:
+    return ScientificBundleDescriptor(
+        bundle=bundle,
+        environment_id=descriptor.environment_id,
+        policy_role=descriptor.policy_role,
+        os_label=descriptor.os_label,
+        execution_layer=descriptor.execution_layer,
+        hardware_label=descriptor.hardware_label,
+        requested_device=descriptor.requested_device,
+    )
+
+
 def _comparison_sequence(
     value: object, expected_type: type, name: str
 ) -> tuple[object, ...]:
@@ -2024,6 +3057,23 @@ def _public_label(value: object, name: str) -> str:
         or any(fragment in value for fragment in ("/", "\\", "@", "://", "~"))
     ):
         raise ComparisonValidationError(f"{name} is not a sanitized public label")
+    ip_tokens = re.findall(
+        r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])"
+        r"|(?<![A-Za-z0-9])\[?[0-9A-Fa-f:]{3,}\]?(?![A-Za-z0-9])",
+        value,
+    )
+    for token in ip_tokens:
+        try:
+            ipaddress.ip_address(token.strip("[]"))
+        except ValueError:
+            continue
+        raise ComparisonValidationError(f"{name} must not contain a private host IP")
+    if re.search(
+        r"(?<![A-Za-z0-9-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})\.)+"
+        r"[A-Za-z]{2,63}(?![A-Za-z0-9-])",
+        value,
+    ):
+        raise ComparisonValidationError(f"{name} must not contain a hostname")
     return value
 
 
@@ -2526,7 +3576,11 @@ def _sample_counts(bundle: ComparableBundle) -> tuple[int, ...]:
 
 
 def _floating_statistics(
-    reference: Tensor, candidate: Tensor, name: str
+    reference: Tensor,
+    candidate: Tensor,
+    name: str,
+    *,
+    tolerance: PolicyTolerance | None = None,
 ) -> FloatingStatistics:
     reference_values = reference.reshape(-1)
     candidate_values = candidate.reshape(-1)
@@ -2537,6 +3591,7 @@ def _floating_statistics(
     squared_sum = 0.0
     maximum_absolute_error = 0.0
     maximum_relative_error: float | None = None
+    policy_violation_count = 0 if tolerance is not None else None
     for start in range(0, element_count, _FLOAT_CHUNK_SIZE):
         stop = min(start + _FLOAT_CHUNK_SIZE, element_count)
         reference_chunk = reference_values[start:stop]
@@ -2545,6 +3600,12 @@ def _floating_statistics(
         reference64 = reference_chunk.to(dtype=torch.float64)
         candidate64 = candidate_chunk.to(dtype=torch.float64)
         absolute_error = candidate64.sub(reference64).abs()
+        if tolerance is not None:
+            assert policy_violation_count is not None
+            allowed = (
+                reference64.abs().mul(float(tolerance.rtol)).add(float(tolerance.atol))
+            )
+            policy_violation_count += int(absolute_error.gt(allowed).sum().item())
         absolute_sum += float(absolute_error.sum(dtype=torch.float64).item())
         squared_sum += float(absolute_error.square().sum(dtype=torch.float64).item())
         maximum_absolute_error = max(
@@ -2571,6 +3632,7 @@ def _floating_statistics(
         root_mean_square_error=math.sqrt(squared_sum / element_count),
         maximum_relative_error=maximum_relative_error,
         zero_reference_count=zero_reference_count,
+        policy_violation_count=policy_violation_count,
     )
 
 
@@ -2749,7 +3811,7 @@ def _run_identity_value(identity: ScientificRunIdentity) -> dict[str, object]:
 
 
 def _floating_statistics_value(value: FloatingStatistics) -> dict[str, object]:
-    return {
+    result = {
         "differing_count": value.differing_count,
         "element_count": value.element_count,
         "exact_count": value.exact_count,
@@ -2759,6 +3821,9 @@ def _floating_statistics_value(value: FloatingStatistics) -> dict[str, object]:
         "root_mean_square_error": value.root_mean_square_error,
         "zero_reference_count": value.zero_reference_count,
     }
+    if value.policy_violation_count is not None:
+        result["policy_violation_count"] = value.policy_violation_count
+    return result
 
 
 def _discrete_component_value(
@@ -2787,7 +3852,7 @@ def _scientific_result_value(
     result: CandidateScientificResult,
 ) -> dict[str, object]:
     value: dict[str, object] = {"status": result.status}
-    if result.status == "observed_unclassified":
+    if result.status != "structurally_incomparable":
         assert result.floating_components is not None
         assert result.discrete_components is not None
         assert result.metrics is not None
@@ -2814,7 +3879,7 @@ def _scientific_result_value(
 def _scientific_comparison_value(
     comparison: ScientificComparison,
 ) -> dict[str, object]:
-    return {
+    value = {
         "attempts": [_attempt_value(attempt) for attempt in comparison.attempts],
         "candidates": [
             _run_identity_value(candidate) for candidate in comparison.candidates
@@ -2842,6 +3907,344 @@ def _scientific_comparison_value(
             for item in comparison.scientific_results
         },
     }
+    if comparison.policy is not None:
+        value["policy"] = {
+            "policy_id": comparison.policy.policy_id,
+            "sha256": comparison.policy.sha256,
+        }
+    return value
+
+
+def _timing_device(value: object) -> bool:
+    return type(value) is str and (
+        value == "cpu" or re.fullmatch(r"cuda:[0-9]+", value) is not None
+    )
+
+
+def _performance_benchmark(bundle: ComparableBundle) -> Mapping[str, object]:
+    if bundle.kind != "benchmark" or not isinstance(bundle.benchmark_metadata, Mapping):
+        raise ComparisonValidationError("performance run has no benchmark metadata")
+    benchmark = _comparison_mapping(bundle.benchmark_metadata, "benchmark metadata")
+    payload = _canonical_json(_thaw_comparison_json(benchmark))
+    snapshot = _source_snapshot(bundle, "benchmark.json")
+    if (
+        len(payload) != snapshot.byte_count
+        or hashlib.sha256(payload).hexdigest() != snapshot.sha256.lower()
+    ):
+        raise ComparisonValidationError(
+            "benchmark metadata differs from its validated source snapshot"
+        )
+    return benchmark
+
+
+def _methodology_compatibility_identity(
+    methodology: Mapping[str, object],
+) -> dict[str, object]:
+    fields = (
+        "cpu_timing_method",
+        "repeat_count",
+        "stage_inclusion_boundaries",
+        "timing_unit",
+        "warmup_count",
+        "warmup_samples_in_statistics",
+    )
+    if any(name not in methodology for name in fields):
+        raise ComparisonValidationError("benchmark methodology identity is incomplete")
+    return {name: _thaw_comparison_json(methodology[name]) for name in fields}
+
+
+def _performance_profile_identity(
+    identity: ScientificRunIdentity,
+) -> dict[str, object]:
+    run = _comparison_mapping(identity.run, "performance profile run identity")
+    workload = _comparison_dict(
+        _thaw_comparison_json(run["scientific_workload"]),
+        "performance scientific workload",
+    )
+    determinism = _comparison_dict(workload["determinism"], "performance determinism")
+    determinism.pop("torch_cuda_seed_all", None)
+    return {
+        "benchmark_identity": _thaw_comparison_json(run["benchmark_identity"]),
+        "category": run["category"],
+        "inventory": _thaw_comparison_json(run["inventory"]),
+        "profile_id": run["profile_id"],
+        "scientific_workload": workload,
+    }
+
+
+def _validate_timing_methodology(
+    methodology: Mapping[str, object], requested_device: str
+) -> None:
+    warmups = _comparison_integer(
+        methodology.get("warmup_count"), "methodology warmup_count", positive=True
+    )
+    repeats = _comparison_integer(
+        methodology.get("repeat_count"), "methodology repeat_count", positive=True
+    )
+    expected = _methodology(torch.device(requested_device), warmups, repeats)
+    if _canonical_json(_thaw_comparison_json(methodology)) != _canonical_json(expected):
+        raise ComparisonValidationError("benchmark methodology is invalid")
+
+
+def _performance_exclusion_reason(
+    descriptor: ScientificBundleDescriptor,
+    reference_identity: ScientificRunIdentity,
+    candidate_identity: ScientificRunIdentity,
+    reference_workload: Mapping[str, object],
+    reference_methodology: Mapping[str, object],
+) -> (
+    Literal[
+        "evaluation_bundle",
+        "unsupported_timing_device",
+        "workload_mismatch",
+        "methodology_mismatch",
+    ]
+    | None
+):
+    if descriptor.bundle.kind == "evaluation":
+        return "evaluation_bundle"
+    if not _timing_device(descriptor.requested_device):
+        return "unsupported_timing_device"
+    benchmark = _performance_benchmark(descriptor.bundle)
+    workload = _comparison_mapping(benchmark.get("workload"), "candidate workload")
+    if _performance_profile_identity(
+        candidate_identity
+    ) != _performance_profile_identity(reference_identity) or _canonical_json(
+        _thaw_comparison_json(workload)
+    ) != _canonical_json(_thaw_comparison_json(reference_workload)):
+        return "workload_mismatch"
+    methodology = _comparison_mapping(
+        benchmark.get("methodology"), "candidate methodology"
+    )
+    try:
+        _validate_timing_methodology(methodology, descriptor.requested_device)
+    except ComparisonValidationError:
+        return "methodology_mismatch"
+    if _canonical_json(_methodology_compatibility_identity(methodology)) != (
+        _canonical_json(_methodology_compatibility_identity(reference_methodology))
+    ):
+        return "methodology_mismatch"
+    return None
+
+
+def _performance_run(
+    descriptor: ScientificBundleDescriptor,
+) -> PortabilityPerformanceRun:
+    benchmark = _performance_benchmark(descriptor.bundle)
+    run = _comparison_mapping(descriptor.bundle.run_metadata, "performance run")
+    return PortabilityPerformanceRun(
+        environment_id=descriptor.environment_id,
+        os_label=descriptor.os_label,
+        execution_layer=descriptor.execution_layer,
+        hardware_label=descriptor.hardware_label,
+        requested_device=descriptor.requested_device,
+        run_id=_comparison_string(run.get("run_id"), "performance run_id"),
+        benchmark_sample_id=_comparison_string(
+            benchmark.get("benchmark_sample_id"), "benchmark sample_id"
+        ),
+        timing_methodology=_comparison_mapping(
+            benchmark.get("methodology"), "benchmark methodology"
+        ),
+        measurements=_comparison_mapping(benchmark.get("results"), "benchmark results"),
+    )
+
+
+def _performance_run_value(value: PortabilityPerformanceRun) -> dict[str, object]:
+    return {
+        "benchmark_sample_id": value.benchmark_sample_id,
+        "environment_id": value.environment_id,
+        "execution_layer": value.execution_layer,
+        "hardware_label": value.hardware_label,
+        "measurements": _thaw_comparison_json(value.measurements),
+        "os_label": value.os_label,
+        "requested_device": value.requested_device,
+        "run_id": value.run_id,
+        "timing_methodology": _thaw_comparison_json(value.timing_methodology),
+    }
+
+
+def _validate_performance_measurements(
+    run: PortabilityPerformanceRun, workload: Mapping[str, object]
+) -> None:
+    repeats = _comparison_integer(
+        run.timing_methodology.get("repeat_count"),
+        "performance repeat_count",
+        positive=True,
+    )
+    bank_bytes = _comparison_integer(
+        workload.get("bank_bytes"), "performance bank_bytes", positive=True
+    )
+    results = _thaw_comparison_json(run.measurements)
+    if type(results) is not dict:
+        raise ComparisonValidationError("performance measurements are invalid")
+    _validate_benchmark_results(
+        results, repeats, bank_bytes, run.requested_device.startswith("cuda:")
+    )
+
+
+def _validate_performance_workload(workload: Mapping[str, object]) -> None:
+    fields = {
+        "D",
+        "M",
+        "Q",
+        "bank_bytes",
+        "bank_chunk_size",
+        "bank_shape",
+        "batch_size",
+        "dtype",
+        "k",
+        "tensor_layout",
+        "test_sample_count",
+        "training_sample_count",
+    }
+    if set(workload) != fields:
+        raise ComparisonValidationError("performance workload fields are invalid")
+    rows = _comparison_integer(workload["M"], "performance workload M", positive=True)
+    training = _comparison_integer(
+        workload["training_sample_count"],
+        "performance workload training_sample_count",
+        positive=True,
+    )
+    _comparison_integer(
+        workload["test_sample_count"],
+        "performance workload test_sample_count",
+        positive=True,
+    )
+    expected = {
+        "D": _EMBEDDING_DIMENSION,
+        "Q": _PATCH_COUNT,
+        "bank_bytes": rows * _EMBEDDING_DIMENSION * 4,
+        "bank_shape": [rows, _EMBEDDING_DIMENSION],
+        "batch_size": 1,
+        "dtype": "float32",
+        "k": 1,
+        "tensor_layout": {
+            "anomaly_map": "BHW contiguous row-major",
+            "image": "NCHW contiguous",
+            "memory_bank": "MD contiguous row-major",
+            "patch_embeddings": "BQD contiguous row-major",
+        },
+    }
+    if rows != training * _PATCH_COUNT or any(
+        _thaw_comparison_json(workload[name]) != value
+        for name, value in expected.items()
+    ):
+        raise ComparisonValidationError("performance workload is invalid")
+    _comparison_integer(
+        workload["bank_chunk_size"],
+        "performance workload bank_chunk_size",
+        positive=True,
+    )
+
+
+def _portability_performance_value(
+    performance: PortabilityPerformance,
+) -> dict[str, object]:
+    return {
+        "attempts": [_attempt_value(attempt) for attempt in performance.attempts],
+        "comparison_id": performance.comparison_id,
+        "excluded_candidates": [
+            {
+                "environment_id": item.environment_id,
+                "reason_code": item.reason_code,
+            }
+            for item in performance.excluded_candidates
+        ],
+        "generator": _generator_value(performance.generator),
+        "included_runs": [
+            _performance_run_value(item) for item in performance.included_runs
+        ],
+        "limitations": list(performance.limitations),
+        "milestone_id": performance.milestone_id,
+        "schema_id": performance.schema_id,
+        "schema_version": performance.schema_version,
+        "scientific_sha256": performance.scientific_sha256,
+        "status": performance.status,
+        "timing_methodology": _thaw_comparison_json(performance.timing_methodology),
+        "workload": _thaw_comparison_json(performance.workload),
+    }
+
+
+def _validate_portability_performance(performance: PortabilityPerformance) -> None:
+    if (
+        type(performance.schema_version) is not int
+        or performance.schema_version != 1
+        or type(performance.schema_id) is not str
+        or performance.schema_id != _PERFORMANCE_SCHEMA_ID
+        or type(performance.milestone_id) is not str
+        or performance.milestone_id != _MILESTONE_ID
+        or type(performance.status) is not str
+        or performance.status != "descriptive_only"
+        or not re.fullmatch(r"[0-9a-f]{64}", performance.comparison_id)
+    ):
+        raise ComparisonValidationError("performance identity is invalid")
+    _comparison_sha256(performance.scientific_sha256, "scientific_sha256")
+    if type(performance.generator) is not ScientificGenerator:
+        raise ComparisonValidationError("performance generator is invalid")
+    if not isinstance(performance.workload, Mapping) or not isinstance(
+        performance.timing_methodology, Mapping
+    ):
+        raise ComparisonValidationError("performance benchmark identity is invalid")
+    _validate_performance_workload(performance.workload)
+    methodology_fields = {
+        "cpu_timing_method",
+        "repeat_count",
+        "stage_inclusion_boundaries",
+        "timing_unit",
+        "warmup_count",
+        "warmup_samples_in_statistics",
+    }
+    if set(performance.timing_methodology) != methodology_fields:
+        raise ComparisonValidationError(
+            "performance timing methodology fields are invalid"
+        )
+    if (
+        type(performance.included_runs) is not tuple
+        or not performance.included_runs
+        or any(
+            type(item) is not PortabilityPerformanceRun
+            for item in performance.included_runs
+        )
+        or type(performance.excluded_candidates) is not tuple
+        or any(
+            type(item) is not PortabilityPerformanceExclusion
+            for item in performance.excluded_candidates
+        )
+        or type(performance.attempts) is not tuple
+        or any(
+            type(item) is not ScientificExecutionAttempt
+            for item in performance.attempts
+        )
+    ):
+        raise ComparisonValidationError("performance run records are invalid")
+    included_ids = tuple(item.environment_id for item in performance.included_runs)
+    excluded_ids = tuple(
+        item.environment_id for item in performance.excluded_candidates
+    )
+    attempt_ids = tuple(item.environment_id for item in performance.attempts)
+    all_ids = (*included_ids, *excluded_ids, *attempt_ids)
+    if len(all_ids) != len(set(all_ids)):
+        raise ComparisonValidationError("performance environment IDs are not unique")
+    for item in performance.included_runs:
+        _validate_timing_methodology(item.timing_methodology, item.requested_device)
+        if _canonical_json(
+            _methodology_compatibility_identity(item.timing_methodology)
+        ) != _canonical_json(_thaw_comparison_json(performance.timing_methodology)):
+            raise ComparisonValidationError(
+                "included run methodology differs from the common methodology"
+            )
+        _validate_performance_measurements(item, performance.workload)
+    if type(performance.limitations) is not tuple or any(
+        type(value) is not str or not value for value in performance.limitations
+    ):
+        raise ComparisonValidationError("performance limitations are invalid")
+    _reject_absolute_identity_values(
+        _portability_performance_value(performance), "performance record"
+    )
+
+
+def _write_portability_file(path: Path, payload: bytes) -> None:
+    path.write_bytes(payload)
 
 
 def _validate_scientific_run_identity(identity: ScientificRunIdentity) -> None:
@@ -3005,14 +4408,21 @@ def _reject_absolute_identity_values(value: object, name: str) -> None:
 
 def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
     if (
-        comparison.schema_version != 1
+        type(comparison.schema_version) is not int
+        or comparison.schema_version != 1
+        or type(comparison.schema_id) is not str
         or comparison.schema_id != _SCHEMA_ID
+        or type(comparison.milestone_id) is not str
         or comparison.milestone_id != _MILESTONE_ID
         or not re.fullmatch(r"[0-9a-f]{64}", comparison.comparison_id)
     ):
         raise ComparisonValidationError("scientific comparison identity is invalid")
     if type(comparison.generator) is not ScientificGenerator:
         raise ComparisonValidationError("scientific comparison generator is invalid")
+    if comparison.policy is not None and type(comparison.policy) is not (
+        PortabilityPolicyIdentity
+    ):
+        raise ComparisonValidationError("scientific comparison policy is invalid")
     if (
         type(comparison.reference) is not ScientificRunIdentity
         or comparison.reference.policy_role != "reference"
@@ -3063,6 +4473,8 @@ def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
         "schema_id": comparison.schema_id,
         "schema_version": comparison.schema_version,
     }
+    if comparison.policy is not None:
+        identity_payload["policy_sha256"] = comparison.policy.sha256
     expected_id = hashlib.sha256(_canonical_json(identity_payload)).hexdigest()
     if comparison.comparison_id != expected_id:
         raise ComparisonValidationError(
@@ -3074,8 +4486,20 @@ def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
         if (
             type(comparable) is not CandidateComparability
             or type(result) is not CandidateScientificResult
+            or type(comparable.gates) is not tuple
+            or any(
+                type(gate) is not tuple
+                or len(gate) != 2
+                or type(gate[0]) is not str
+                or type(gate[1]) is not bool
+                for gate in comparable.gates
+            )
             or comparable.comparable != all(value for _, value in comparable.gates)
-            or len(comparable.gates) != len({name for name, _ in comparable.gates})
+            or tuple(name for name, _ in comparable.gates) != _SCIENTIFIC_GATE_NAMES
+            or any(
+                type(component) is not DiscreteComponentComparison
+                for component in comparable.structural_components
+            )
             or tuple(component.name for component in comparable.structural_components)
             != ("test_sample_ids", "test_labels")
             or type(result.status) is not str
@@ -3084,9 +4508,20 @@ def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
             raise ComparisonValidationError(
                 "scientific comparison candidate result is invalid"
             )
-        if comparable.comparable != (result.status == "observed_unclassified"):
+        if comparable.comparable != (result.status != "structurally_incomparable"):
             raise ComparisonValidationError(
                 "scientific comparison status differs from compatibility gates"
+            )
+        if comparison.policy is None and result.status not in {
+            "structurally_incomparable",
+            "observed_unclassified",
+        }:
+            raise ComparisonValidationError(
+                "observation comparison contains a policy classification"
+            )
+        if comparison.policy is not None and result.status == "observed_unclassified":
+            raise ComparisonValidationError(
+                "policy comparison contains an unclassified candidate"
             )
         for component in comparable.structural_components:
             if (
@@ -3119,6 +4554,28 @@ def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
         assert result.floating_components is not None
         assert result.discrete_components is not None
         assert result.metrics is not None
+        if (
+            any(
+                type(component) is not FloatingComponentComparison
+                for component in result.floating_components
+            )
+            or tuple(component.name for component in result.floating_components)
+            != _FLOATING_COMPONENTS
+        ):
+            raise ComparisonValidationError(
+                "floating comparison component order is invalid"
+            )
+        if (
+            any(
+                type(component) is not DiscreteComponentComparison
+                for component in result.discrete_components
+            )
+            or tuple(component.name for component in result.discrete_components)
+            != _DISCRETE_REQUIREMENTS
+        ):
+            raise ComparisonValidationError(
+                "discrete comparison component order is invalid"
+            )
         for component in result.floating_components:
             statistics = component.statistics
             numbers = (
@@ -3131,6 +4588,15 @@ def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
                 or statistics.exact_count + statistics.differing_count
                 != statistics.element_count
                 or statistics.zero_reference_count > statistics.element_count
+                or (
+                    statistics.policy_violation_count is not None
+                    and (
+                        type(statistics.policy_violation_count) is not int
+                        or not 0
+                        <= statistics.policy_violation_count
+                        <= statistics.element_count
+                    )
+                )
                 or any(not math.isfinite(value) or value < 0 for value in numbers)
                 or (
                     statistics.maximum_relative_error is not None
@@ -3142,6 +4608,12 @@ def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
             ):
                 raise ComparisonValidationError(
                     "floating comparison statistics are invalid"
+                )
+            if (statistics.policy_violation_count is None) != (
+                comparison.policy is None
+            ):
+                raise ComparisonValidationError(
+                    "floating policy counts differ from comparison mode"
                 )
         for component in result.discrete_components:
             if (
@@ -3173,6 +4645,26 @@ def _validate_scientific_comparison(comparison: ScientificComparison) -> None:
             for metric in result.metrics
         ):
             raise ComparisonValidationError("metric comparison values are invalid")
+        floating_violation = any(
+            component.statistics.policy_violation_count != 0
+            for component in result.floating_components
+        )
+        discrete_violation = any(
+            not component.exact for component in result.discrete_components
+        )
+        metric_difference = any(metric.absolute_delta != 0 for metric in result.metrics)
+        if result.status == "within_policy" and (
+            floating_violation or discrete_violation
+        ):
+            raise ComparisonValidationError(
+                "within_policy result contains a policy violation"
+            )
+        if result.status == "drift_detected" and not (
+            floating_violation or discrete_violation or metric_difference
+        ):
+            raise ComparisonValidationError(
+                "drift_detected result contains no possible policy violation"
+            )
     if type(comparison.limitations) is not tuple or any(
         type(value) is not str or not value for value in comparison.limitations
     ):

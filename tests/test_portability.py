@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 from typing import Any
 
@@ -22,6 +23,7 @@ from inspectrt.portability import (
     BundleValidationError,
     CandidateComparability,
     CandidateScientificResult,
+    CanonicalInputIdentity,
     ComparableBundle,
     ComparisonValidationError,
     DiscreteComponentComparison,
@@ -30,6 +32,15 @@ from inspectrt.portability import (
     IndexMismatch,
     MemoryBankMetadata,
     MetricDelta,
+    PolicyDerivation,
+    PolicyTolerance,
+    PortabilityEnvironmentDescriptor,
+    PortabilityEnvironmentMap,
+    PortabilityPerformance,
+    PortabilityPerformanceExclusion,
+    PortabilityPerformanceRun,
+    PortabilityPolicy,
+    PortabilityPolicyIdentity,
     PredictionRecord,
     ScientificBundleDescriptor,
     ScientificComparison,
@@ -37,9 +48,15 @@ from inspectrt.portability import (
     ScientificGenerator,
     ScientificRunIdentity,
     SourceFileSnapshot,
+    build_portability_performance,
     compare_scientific_bundles,
+    encode_portability_performance,
     encode_scientific_comparison,
     load_comparable_bundle,
+    load_portability_environment_map,
+    load_portability_policy,
+    publish_portability_comparison,
+    publish_portability_records,
 )
 
 _EVALUATION_FILES = (
@@ -152,13 +169,15 @@ def _evaluation() -> CategoryEvaluation:
     )
 
 
-def _metadata(run_id: str, device: str = "cpu") -> BaselineRunMetadata:
+def _metadata(
+    run_id: str, device: str = "cpu", *, bank_chunk_size: int = 16_384
+) -> BaselineRunMetadata:
     return BaselineRunMetadata(
         run_id=run_id,
         created_at_utc="2026-07-15T12:00:00Z",
         dataset_root="/private/mvtec-ad",
         requested_device=device,
-        bank_chunk_size=16_384,
+        bank_chunk_size=bank_chunk_size,
         git_commit=_SCIENTIFIC_SOURCE_COMMIT,
         git_dirty=False,
         uv_lock_sha256=_ACCEPTED_LOCK_SHA256,
@@ -191,9 +210,14 @@ def _metadata(run_id: str, device: str = "cpu") -> BaselineRunMetadata:
 
 
 def _benchmark(
-    evaluation: CategoryEvaluation, metadata: BaselineRunMetadata
+    evaluation: CategoryEvaluation,
+    metadata: BaselineRunMetadata,
+    *,
+    repeats: int = 2,
 ) -> BaselineBenchmark:
-    statistics = benchmark_module._statistics((1.0, 2.0))
+    statistics = benchmark_module._statistics(
+        tuple(float(value) for value in range(1, repeats + 1))
+    )
     bank_bytes = evaluation.memory_bank.numel() * evaluation.memory_bank.element_size()
     device = torch.device(metadata.requested_device)
     cuda = device.type == "cuda"
@@ -224,7 +248,7 @@ def _benchmark(
             "test_sample_count": 2,
             "training_sample_count": 1,
         },
-        methodology=benchmark_module._methodology(device, 1, 2),
+        methodology=benchmark_module._methodology(device, 1, repeats),
         environment=(
             {
                 "cuda_compute_capability": [7, 5],
@@ -266,7 +290,14 @@ def _benchmark(
     )
 
 
-def _bundle(tmp_path: Path, *, benchmark: bool = False, device: str = "cpu") -> Path:
+def _bundle(
+    tmp_path: Path,
+    *,
+    benchmark: bool = False,
+    device: str = "cpu",
+    bank_chunk_size: int = 16_384,
+    repeats: int = 2,
+) -> Path:
     evaluation = _evaluation()
     run_id = (
         "tiny-evaluation"
@@ -277,12 +308,14 @@ def _bundle(tmp_path: Path, *, benchmark: bool = False, device: str = "cpu") -> 
             else f"tiny-benchmark-{device.replace(':', '-')}"
         )
     )
-    metadata = _metadata(run_id, device)
+    metadata = _metadata(run_id, device, bank_chunk_size=bank_chunk_size)
     return persist_baseline_run(
         evaluation,
         tmp_path,
         metadata,
-        benchmark=_benchmark(evaluation, metadata) if benchmark else None,
+        benchmark=(
+            _benchmark(evaluation, metadata, repeats=repeats) if benchmark else None
+        ),
     )
 
 
@@ -528,6 +561,7 @@ def test_public_records_have_only_the_loader_contract_fields() -> None:
         "BundleValidationError",
         "CandidateComparability",
         "CandidateScientificResult",
+        "CanonicalInputIdentity",
         "ComparableBundle",
         "ComparisonValidationError",
         "DiscreteComponentComparison",
@@ -536,6 +570,15 @@ def test_public_records_have_only_the_loader_contract_fields() -> None:
         "IndexMismatch",
         "MemoryBankMetadata",
         "MetricDelta",
+        "PolicyDerivation",
+        "PolicyTolerance",
+        "PortabilityEnvironmentDescriptor",
+        "PortabilityEnvironmentMap",
+        "PortabilityPerformance",
+        "PortabilityPerformanceExclusion",
+        "PortabilityPerformanceRun",
+        "PortabilityPolicy",
+        "PortabilityPolicyIdentity",
         "PredictionRecord",
         "ScientificBundleDescriptor",
         "ScientificComparison",
@@ -543,9 +586,15 @@ def test_public_records_have_only_the_loader_contract_fields() -> None:
         "ScientificGenerator",
         "ScientificRunIdentity",
         "SourceFileSnapshot",
+        "build_portability_performance",
         "compare_scientific_bundles",
+        "encode_portability_performance",
         "encode_scientific_comparison",
         "load_comparable_bundle",
+        "load_portability_environment_map",
+        "load_portability_policy",
+        "publish_portability_comparison",
+        "publish_portability_records",
     )
     assert tuple(field.name for field in fields(SourceFileSnapshot)) == (
         "name",
@@ -642,6 +691,7 @@ def test_public_records_have_only_the_loader_contract_fields() -> None:
         "root_mean_square_error",
         "maximum_relative_error",
         "zero_reference_count",
+        "policy_violation_count",
     )
     assert tuple(field.name for field in fields(FloatingComponentComparison)) == (
         "name",
@@ -686,6 +736,50 @@ def test_public_records_have_only_the_loader_contract_fields() -> None:
         "comparability",
         "scientific_results",
         "limitations",
+        "policy",
+    )
+    assert tuple(field.name for field in fields(PortabilityEnvironmentDescriptor)) == (
+        "environment_id",
+        "policy_role",
+        "os_label",
+        "execution_layer",
+        "hardware_label",
+        "requested_device",
+    )
+    assert tuple(field.name for field in fields(PortabilityEnvironmentMap)) == (
+        "schema_version",
+        "schema_id",
+        "reference",
+        "candidates",
+        "attempts",
+    )
+    assert tuple(field.name for field in fields(PolicyTolerance)) == ("atol", "rtol")
+    assert tuple(field.name for field in fields(PolicyDerivation)) == (
+        "method_id",
+        "comparison_ids",
+    )
+    assert tuple(field.name for field in fields(CanonicalInputIdentity)) == (
+        "byte_count",
+        "sha256",
+    )
+    assert tuple(field.name for field in fields(PortabilityPolicyIdentity)) == (
+        "policy_id",
+        "sha256",
+    )
+    assert tuple(field.name for field in fields(PortabilityPerformanceRun)) == (
+        "environment_id",
+        "os_label",
+        "execution_layer",
+        "hardware_label",
+        "requested_device",
+        "run_id",
+        "benchmark_sample_id",
+        "timing_methodology",
+        "measurements",
+    )
+    assert tuple(field.name for field in fields(PortabilityPerformanceExclusion)) == (
+        "environment_id",
+        "reason_code",
     )
 
 
@@ -2625,3 +2719,1134 @@ def test_comparison_and_encoding_leave_source_files_tensors_and_records_unchange
         comparison.schema_version = 2  # type: ignore[misc]
     with pytest.raises(TypeError):
         comparison.reference.run["category"] = "changed"  # type: ignore[index]
+
+
+def _environment_value(
+    environment_id: str,
+    policy_role: str,
+    requested_device: str = "cpu",
+    *,
+    execution_layer: str = "native",
+) -> dict[str, object]:
+    return {
+        "environment_id": environment_id,
+        "execution_layer": execution_layer,
+        "hardware_label": f"Hardware {environment_id}",
+        "os_label": "Test OS",
+        "policy_role": policy_role,
+        "requested_device": requested_device,
+    }
+
+
+def _environment_map_value(
+    *candidates: dict[str, object],
+    reference_device: str = "cpu",
+    attempts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "attempts": attempts or [],
+        "candidates": list(candidates)
+        or [_environment_value("candidate-1", "holdout")],
+        "reference": _environment_value("reference-env", "reference", reference_device),
+        "schema_id": "inspectrt_portability_environment_map_v1",
+        "schema_version": 1,
+    }
+
+
+def _policy_value(**changes: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "calibration_environment_ids": ["calibration-env"],
+        "category": "bottle",
+        "derivation": {
+            "comparison_ids": ["a" * 64],
+            "method_id": "observed_envelope",
+        },
+        "discrete_output_requirements": [
+            "test_sample_ids",
+            "test_labels",
+            "evaluation_masks",
+            "nearest_bank_indices",
+        ],
+        "floating_component_limits": {
+            name: {"atol": 0.0, "rtol": 0.0}
+            for name in (
+                "memory_bank",
+                "patch_distances",
+                "image_scores",
+                "anomaly_maps",
+            )
+        },
+        "holdout_environment_ids": ["candidate-1"],
+        "limitation": (
+            "This reviewed observed envelope is bounded evidence and not a universal "
+            "guarantee."
+        ),
+        "metric_absolute_delta_limits": {
+            "image_auroc": 0.0,
+            "image_average_precision": 0.0,
+            "pixel_auroc": 0.0,
+        },
+        "policy_id": "synthetic-policy-v1",
+        "profile_id": "inspectrt_feature_memory_v1",
+        "provenance_requirements": [
+            "clean_source",
+            "scientific_source_commit",
+            "lock_identity",
+            "weight_identity",
+            "inventory_identity",
+        ],
+        "reference_environment_id": "reference-env",
+        "reviewed_evidence_hashes": ["b" * 64],
+        "schema_id": "inspectrt_portability_policy_v1",
+        "schema_version": 1,
+    }
+    value.update(changes)
+    return value
+
+
+def _loaded_policy(tmp_path: Path, **changes: object) -> PortabilityPolicy:
+    path = tmp_path / f"policy-{len(list(tmp_path.iterdir()))}.json"
+    _write_json(path, _policy_value(**changes))
+    return load_portability_policy(path)
+
+
+def _policy_comparison(
+    reference: ComparableBundle,
+    candidate: ComparableBundle,
+    policy: PortabilityPolicy,
+    *,
+    role: str = "holdout",
+    environment_id: str = "candidate-1",
+    attempts: tuple[ScientificExecutionAttempt, ...] = (),
+) -> ScientificComparison:
+    return compare_scientific_bundles(
+        _descriptor(reference, "reference-env", "reference"),
+        (_descriptor(candidate, environment_id, role),),
+        generator=_A2_GENERATOR,
+        attempts=attempts,
+        policy=policy,
+    )
+
+
+def test_loads_valid_canonical_environment_map_with_ordered_attempts(
+    tmp_path: Path,
+) -> None:
+    value = _environment_map_value(
+        _environment_value("candidate-a", "calibration"),
+        _environment_value("candidate-b", "holdout"),
+        attempts=[
+            {
+                "environment_id": "mps-attempt",
+                "gating": False,
+                "policy_role": "post_policy_attempt",
+                "reason_code": "operator_unsupported",
+                "stage_code": "evaluation",
+                "status": "execution_failed",
+            }
+        ],
+    )
+    path = tmp_path / "environment-map.json"
+    _write_json(path, value)
+
+    loaded = load_portability_environment_map(path)
+
+    assert tuple(item.environment_id for item in loaded.candidates) == (
+        "candidate-a",
+        "candidate-b",
+    )
+    assert loaded.attempts[0].environment_id == "mps-attempt"
+    with pytest.raises(FrozenInstanceError):
+        loaded.schema_version = 2  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("gating", True), ("policy_role", "holdout"), ("gating", _DELETE)),
+)
+def test_environment_map_requires_canonical_a2_attempt_records(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    attempt: dict[str, object] = {
+        "environment_id": "mps-attempt",
+        "gating": False,
+        "policy_role": "post_policy_attempt",
+        "reason_code": "operator_unsupported",
+        "stage_code": "evaluation",
+        "status": "execution_failed",
+    }
+    if value is _DELETE:
+        del attempt[field]
+    else:
+        attempt[field] = value
+    path = tmp_path / "environment-map.json"
+    _write_json(path, _environment_map_value(attempts=[attempt]))
+    with pytest.raises(ComparisonValidationError):
+        load_portability_environment_map(path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"attempts":[],"candidates":[],"reference":{},"schema_id":"x","schema_version":1}\n',
+        b'{"schema_version":1,"schema_version":1}\n',
+        b'{ "schema_version":1 }\n',
+        b'{"schema_version":1}',
+    ),
+)
+def test_environment_map_rejects_malformed_or_noncanonical_bytes(
+    tmp_path: Path, payload: bytes
+) -> None:
+    path = tmp_path / "environment-map.json"
+    path.write_bytes(payload)
+    with pytest.raises(BundleValidationError):
+        load_portability_environment_map(path)
+
+
+@pytest.mark.parametrize("unknown", ("hostname", "run_path", "timing_eligible"))
+def test_environment_map_rejects_private_or_derived_unknown_fields(
+    tmp_path: Path, unknown: str
+) -> None:
+    value = _environment_map_value()
+    value["reference"][unknown] = "private-host"  # type: ignore[index]
+    path = tmp_path / "environment-map.json"
+    _write_json(path, value)
+    with pytest.raises(ComparisonValidationError):
+        load_portability_environment_map(path)
+
+
+def test_environment_map_rejects_environment_id_collision(tmp_path: Path) -> None:
+    path = tmp_path / "environment-map.json"
+    _write_json(
+        path,
+        _environment_map_value(_environment_value("reference-env", "holdout")),
+    )
+    with pytest.raises(ComparisonValidationError, match="unique"):
+        load_portability_environment_map(path)
+
+
+@pytest.mark.parametrize("schema_version", (True, 1.0))
+def test_environment_map_schema_version_is_not_coerced(
+    tmp_path: Path, schema_version: object
+) -> None:
+    value = _environment_map_value()
+    value["schema_version"] = schema_version
+    path = tmp_path / "environment-map.json"
+    _write_json(path, value)
+    with pytest.raises(ComparisonValidationError, match="identity"):
+        load_portability_environment_map(path)
+
+
+@pytest.mark.parametrize(
+    "label",
+    (
+        "192.168.1.20",
+        "ThinkPad 192.168.1.20",
+        "192.168.1.20:22",
+        "p53.internal",
+        "host p53.internal",
+        "GPU [fe80::1]",
+    ),
+)
+def test_environment_map_rejects_embedded_host_identity(
+    tmp_path: Path, label: str
+) -> None:
+    value = _environment_map_value()
+    value["reference"]["hardware_label"] = label  # type: ignore[index]
+    path = tmp_path / "environment-map.json"
+    _write_json(path, value)
+    with pytest.raises(ComparisonValidationError):
+        load_portability_environment_map(path)
+
+
+def test_loads_valid_policy_with_exact_source_identity(tmp_path: Path) -> None:
+    path = tmp_path / "policy.json"
+    payload = _canonical(_policy_value())
+    path.write_bytes(payload)
+
+    policy = load_portability_policy(path)
+
+    assert policy.source == CanonicalInputIdentity(
+        len(payload), hashlib.sha256(payload).hexdigest()
+    )
+    assert tuple(policy.floating_component_limits) == (
+        "memory_bank",
+        "patch_distances",
+        "image_scores",
+        "anomaly_maps",
+    )
+    assert tuple(policy.metric_absolute_delta_limits) == (
+        "image_auroc",
+        "image_average_precision",
+        "pixel_auroc",
+    )
+
+
+@pytest.mark.parametrize("case", ("spacing", "duplicate", "nan", "missing-lf"))
+def test_policy_rejects_malformed_or_noncanonical_bytes(
+    tmp_path: Path, case: str
+) -> None:
+    canonical = _canonical(_policy_value())
+    if case == "spacing":
+        payload = canonical.replace(b'"schema_version":1', b'"schema_version": 1')
+    elif case == "duplicate":
+        payload = canonical.replace(
+            b'{"calibration_environment_ids"',
+            b'{"schema_version":1,"calibration_environment_ids"',
+        )
+    elif case == "nan":
+        payload = canonical.replace(b'"atol":0.0', b'"atol":NaN', 1)
+    else:
+        payload = canonical.removesuffix(b"\n")
+    path = tmp_path / "policy.json"
+    path.write_bytes(payload)
+    with pytest.raises(BundleValidationError):
+        load_portability_policy(path)
+
+
+@pytest.mark.parametrize(
+    ("case", "mutation"),
+    (
+        ("negative", ("memory_bank", "atol", -1.0)),
+        ("missing-component", ("anomaly_maps", None, None)),
+        ("unknown-component", ("unknown", "atol", 0.0)),
+        ("missing-metric", ("pixel_auroc", None, None)),
+        ("unknown-metric", ("unknown_metric", None, 0.0)),
+    ),
+)
+def test_policy_rejects_incomplete_unknown_or_negative_limits(
+    tmp_path: Path, case: str, mutation: tuple[str, str | None, float | None]
+) -> None:
+    value = _policy_value()
+    name, field, replacement = mutation
+    table_name = (
+        "floating_component_limits"
+        if "component" in case or case == "negative"
+        else "metric_absolute_delta_limits"
+    )
+    table = value[table_name]
+    assert isinstance(table, dict)
+    if field is None and replacement is None:
+        del table[name]
+    elif field is None:
+        table[name] = replacement
+    elif name == "unknown":
+        table[name] = {"atol": replacement, "rtol": 0.0}
+    else:
+        table[name][field] = replacement
+    path = tmp_path / "policy.json"
+    _write_json(path, value)
+    with pytest.raises(ComparisonValidationError):
+        load_portability_policy(path)
+
+
+def test_policy_numbers_are_not_coerced(tmp_path: Path) -> None:
+    value = _policy_value()
+    value["floating_component_limits"]["memory_bank"]["atol"] = "0"  # type: ignore[index]
+    path = tmp_path / "policy.json"
+    _write_json(path, value)
+    with pytest.raises(ComparisonValidationError, match="finite and nonnegative"):
+        load_portability_policy(path)
+
+
+def test_policy_rejects_numbers_outside_binary64_application_range(
+    tmp_path: Path,
+) -> None:
+    value = _policy_value()
+    value["floating_component_limits"]["memory_bank"]["rtol"] = 10**309  # type: ignore[index]
+    path = tmp_path / "policy.json"
+    _write_json(path, value)
+    with pytest.raises(ComparisonValidationError, match="finite and nonnegative"):
+        load_portability_policy(path)
+
+
+def test_large_finite_integer_policy_limit_applies_without_overflow(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle]
+) -> None:
+    value = _policy_value()
+    value["floating_component_limits"]["memory_bank"]["rtol"] = 10**100  # type: ignore[index]
+    path = tmp_path / "policy.json"
+    _write_json(path, value)
+    policy = load_portability_policy(path)
+    bundle = _a2_bundles["evaluation"]
+    assert (
+        _policy_comparison(bundle, bundle, policy).scientific_results[0].status
+        == "within_policy"
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"calibration_environment_ids": ["reference-env"]},
+        {"calibration_environment_ids": ["candidate-1"]},
+        {"holdout_environment_ids": ["candidate-1", "candidate-1"]},
+        {"holdout_environment_ids": []},
+        {"reviewed_evidence_hashes": ["not-a-hash"]},
+        {"policy_id": "arbitrary prose"},
+        {"limitation": "Universal."},
+    ),
+)
+def test_policy_rejects_invalid_scope_identity_or_review_record(
+    tmp_path: Path, changes: dict[str, object]
+) -> None:
+    path = tmp_path / "policy.json"
+    _write_json(path, _policy_value(**changes))
+    with pytest.raises(ComparisonValidationError):
+        load_portability_policy(path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("provenance_requirements", "discrete_output_requirements"),
+)
+def test_policy_requires_complete_exact_requirement_arrays(
+    tmp_path: Path, field: str
+) -> None:
+    value = _policy_value()
+    requirements = value[field]
+    assert isinstance(requirements, list)
+    requirements.pop()
+    path = tmp_path / "policy.json"
+    _write_json(path, value)
+    with pytest.raises(ComparisonValidationError):
+        load_portability_policy(path)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"reference_environment_id": "other-reference"}, "reference"),
+        ({"profile_id": "other_profile"}, "profile"),
+        ({"category": "capsule"}, "category"),
+        ({"holdout_environment_ids": ["other-candidate"]}, "outside"),
+    ),
+)
+def test_policy_scope_must_match_reference_and_candidate(
+    tmp_path: Path,
+    _a2_bundles: dict[str, ComparableBundle],
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    policy = _loaded_policy(tmp_path, **changes)
+    with pytest.raises(ComparisonValidationError, match=message):
+        _policy_comparison(_a2_bundles["evaluation"], _a2_bundles["evaluation"], policy)
+
+
+def test_observation_mode_remains_byte_identical_with_explicit_none(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    implicit = _comparison(bundle, bundle)
+    explicit = compare_scientific_bundles(
+        _descriptor(bundle, "reference-env", "reference"),
+        (_descriptor(bundle, "candidate-1", "holdout"),),
+        generator=_A2_GENERATOR,
+        policy=None,
+    )
+    assert implicit.comparison_id == explicit.comparison_id
+    encoded = encode_scientific_comparison(implicit)
+    assert encoded == encode_scientific_comparison(explicit)
+    assert len(encoded) == 9349
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "15e4b477cce38c4f84163c28c688ab8f33a1235616a353d28925d138b1eb13f4"
+    )
+
+
+def test_exact_pair_is_within_zero_policy(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle]
+) -> None:
+    policy = _loaded_policy(tmp_path)
+    bundle = _a2_bundles["evaluation"]
+    comparison = _policy_comparison(bundle, bundle, policy)
+
+    assert comparison.scientific_results[0].status == "within_policy"
+    assert all(
+        component.statistics.policy_violation_count == 0
+        for component in comparison.scientific_results[0].floating_components or ()
+    )
+    document = json.loads(encode_scientific_comparison(comparison))
+    assert document["policy"] == {
+        "policy_id": policy.policy_id,
+        "sha256": policy.source.sha256,
+    }
+
+
+@pytest.mark.parametrize(
+    ("atol", "expected"), ((1.0, "within_policy"), (0.5, "drift_detected"))
+)
+def test_elementwise_float_policy_is_inclusive_and_counts_exactly(
+    tmp_path: Path,
+    _a2_bundles: dict[str, ComparableBundle],
+    atol: float,
+    expected: str,
+) -> None:
+    limits = _policy_value()["floating_component_limits"]
+    assert isinstance(limits, dict)
+    limits["memory_bank"] = {"atol": atol, "rtol": 0.0}
+    policy = _loaded_policy(tmp_path, floating_component_limits=limits)
+    reference = _a2_bundles["evaluation"]
+    bank = reference.memory_bank.clone()
+    bank[0, 0] = 1.0
+    bank[0, 1] = 0.75
+    comparison = _policy_comparison(
+        reference, replace(reference, memory_bank=bank), policy
+    )
+    statistics = _floating(comparison, "memory_bank")
+
+    assert comparison.scientific_results[0].status == expected
+    assert statistics.policy_violation_count == (0 if atol == 1.0 else 2)
+
+
+def test_policy_violation_at_chunk_boundary_uses_bounded_traversal(
+    tmp_path: Path,
+    _a2_bundles: dict[str, ComparableBundle],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _loaded_policy(tmp_path)
+    reference = _a2_bundles["evaluation"]
+    chunk_size = 100_000
+    bank = reference.memory_bank.clone()
+    bank.reshape(-1)[chunk_size] = 1.0
+    monkeypatch.setattr(portability, "_FLOAT_CHUNK_SIZE", chunk_size)
+
+    statistics = _floating(
+        _policy_comparison(reference, replace(reference, memory_bank=bank), policy),
+        "memory_bank",
+    )
+
+    assert statistics.policy_violation_count == 1
+
+
+def test_relative_policy_limit_uses_absolute_reference_value(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle]
+) -> None:
+    limits = _policy_value()["floating_component_limits"]
+    assert isinstance(limits, dict)
+    limits["patch_distances"] = {"atol": 0, "rtol": 0.6}
+    policy = _loaded_policy(tmp_path, floating_component_limits=limits)
+    reference = _a2_bundles["evaluation"]
+    distances = reference.patch_distances.clone()
+    distances[0, 0] = 0.3
+    comparison = _policy_comparison(
+        reference, replace(reference, patch_distances=distances), policy
+    )
+    assert comparison.scientific_results[0].status == "within_policy"
+    assert _floating(comparison, "patch_distances").policy_violation_count == 0
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected"), ((0.25, "within_policy"), (0.24, "drift_detected"))
+)
+def test_metric_absolute_delta_policy_is_inclusive(
+    tmp_path: Path,
+    _a2_bundles: dict[str, ComparableBundle],
+    limit: float,
+    expected: str,
+) -> None:
+    limits = dict(_policy_value()["metric_absolute_delta_limits"])
+    limits["image_auroc"] = limit
+    policy = _loaded_policy(tmp_path, metric_absolute_delta_limits=limits)
+    reference = _a2_bundles["evaluation"]
+    candidate = replace(reference, metrics=replace(reference.metrics, image_auroc=0.75))
+    assert (
+        _policy_comparison(reference, candidate, policy).scientific_results[0].status
+        == expected
+    )
+
+
+@pytest.mark.parametrize("component", ("nearest_bank_indices", "evaluation_masks"))
+def test_required_discrete_mismatch_detects_drift(
+    tmp_path: Path,
+    _a2_bundles: dict[str, ComparableBundle],
+    component: str,
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    index = (0, 0) if component == "nearest_bank_indices" else (0, 0, 1)
+    candidate = _tensor_variant(reference, component, index, 1)
+    comparison = _policy_comparison(reference, candidate, _loaded_policy(tmp_path))
+    assert comparison.scientific_results[0].status == "drift_detected"
+
+
+def test_completed_post_policy_candidate_is_classified_but_attempt_is_not(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle]
+) -> None:
+    attempt = ScientificExecutionAttempt(
+        "failed-attempt", "unsupported", "backend_unavailable", "evaluation"
+    )
+    bundle = _a2_bundles["evaluation"]
+    comparison = _policy_comparison(
+        bundle,
+        bundle,
+        _loaded_policy(tmp_path),
+        role="post_policy_attempt",
+        environment_id="new-post-policy-env",
+        attempts=(attempt,),
+    )
+    assert comparison.scientific_results[0].status == "within_policy"
+    assert comparison.attempts == (attempt,)
+    assert "failed-attempt" not in {
+        result.environment_id for result in comparison.scientific_results
+    }
+
+
+def test_structurally_incomparable_remains_unclassified_in_policy_mode(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle]
+) -> None:
+    reference = _a2_bundles["evaluation"]
+    candidate = _run_variant(reference, ("profile_id",), "other-profile")
+    result = _policy_comparison(
+        reference, candidate, _loaded_policy(tmp_path)
+    ).scientific_results[0]
+    assert result.status == "structurally_incomparable"
+    assert result.floating_components is None
+
+
+def test_policy_hash_changes_comparison_id_and_equivalent_bytes_are_deterministic(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle]
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    first = _loaded_policy(tmp_path)
+    second = _loaded_policy(tmp_path)
+    changed = _loaded_policy(tmp_path, reviewed_evidence_hashes=["c" * 64])
+    first_comparison = _policy_comparison(bundle, bundle, first)
+    second_comparison = _policy_comparison(bundle, bundle, second)
+    changed_comparison = _policy_comparison(bundle, bundle, changed)
+    assert first.source.sha256 == second.source.sha256
+    assert first_comparison == second_comparison
+    assert first_comparison.comparison_id != changed_comparison.comparison_id
+
+
+def test_loaded_policy_values_cannot_change_without_a_new_source_hash(
+    tmp_path: Path,
+) -> None:
+    policy = _loaded_policy(tmp_path)
+    changed_limits = dict(policy.floating_component_limits)
+    changed_limits["memory_bank"] = PolicyTolerance(1.0, 0.0)
+    with pytest.raises(ComparisonValidationError, match="source identity"):
+        replace(policy, floating_component_limits=changed_limits)
+
+
+def test_encoder_rejects_within_policy_result_with_a_violation(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle]
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    comparison = _policy_comparison(bundle, bundle, _loaded_policy(tmp_path))
+    result = comparison.scientific_results[0]
+    assert result.floating_components is not None
+    first = result.floating_components[0]
+    forged = replace(
+        comparison,
+        scientific_results=(
+            replace(
+                result,
+                floating_components=(
+                    replace(
+                        first,
+                        statistics=replace(first.statistics, policy_violation_count=1),
+                    ),
+                    *result.floating_components[1:],
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(ComparisonValidationError, match="contains a policy violation"):
+        encode_scientific_comparison(forged)
+
+
+@pytest.mark.parametrize("missing", ("gates", "floating", "discrete"))
+def test_policy_encoder_requires_complete_acceptance_evidence(
+    tmp_path: Path,
+    _a2_bundles: dict[str, ComparableBundle],
+    missing: str,
+) -> None:
+    bundle = _a2_bundles["evaluation"]
+    comparison = _policy_comparison(bundle, bundle, _loaded_policy(tmp_path))
+    if missing == "gates":
+        forged = replace(
+            comparison,
+            comparability=(replace(comparison.comparability[0], gates=()),),
+        )
+    else:
+        result = comparison.scientific_results[0]
+        forged = replace(
+            comparison,
+            scientific_results=(replace(result, **{f"{missing}_components": ()}),),
+        )
+    with pytest.raises(ComparisonValidationError, match="order|candidate result"):
+        encode_scientific_comparison(forged)
+
+
+def _performance(
+    reference: ComparableBundle,
+    *candidates: ComparableBundle,
+    candidate_layers: tuple[str, ...] = (),
+) -> tuple[ScientificComparison, PortabilityPerformance, bytes]:
+    reference_descriptor = _descriptor(reference, "reference-env", "reference")
+    descriptors = tuple(
+        _descriptor(
+            candidate,
+            f"candidate-{index}",
+            "holdout",
+            execution_layer=(
+                candidate_layers[index - 1] if candidate_layers else "native"
+            ),
+        )
+        for index, candidate in enumerate(candidates, start=1)
+    )
+    comparison = compare_scientific_bundles(
+        reference_descriptor, descriptors, generator=_A2_GENERATOR
+    )
+    scientific = encode_scientific_comparison(comparison)
+    return (
+        comparison,
+        build_portability_performance(
+            comparison, scientific, reference_descriptor, descriptors
+        ),
+        scientific,
+    )
+
+
+def test_cpu_performance_copies_benchmark_observations_exactly(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    benchmark = _a2_bundles["benchmark"]
+    _, performance, scientific = _performance(benchmark, benchmark)
+    encoded = encode_portability_performance(performance)
+    document = json.loads(encoded)
+    assert performance.status == "descriptive_only"
+    assert len(performance.included_runs) == 2
+    assert document["included_runs"][0][
+        "measurements"
+    ] == portability._thaw_comparison_json(
+        benchmark.benchmark_metadata["results"]  # type: ignore[index]
+    )
+    assert document["scientific_sha256"] == hashlib.sha256(scientific).hexdigest()
+    assert encoded == encode_portability_performance(performance)
+
+
+def test_explicit_cuda_benchmark_is_timing_eligible(tmp_path: Path) -> None:
+    benchmark = load_comparable_bundle(
+        _bundle(tmp_path, benchmark=True, device="cuda:0")
+    )
+    _, performance, _ = _performance(benchmark, benchmark)
+    assert [item.requested_device for item in performance.included_runs] == [
+        "cuda:0",
+        "cuda:0",
+    ]
+
+
+def test_cpu_and_cuda_benchmarks_share_the_performance_matrix(tmp_path: Path) -> None:
+    cpu = load_comparable_bundle(_bundle(tmp_path / "cpu", benchmark=True))
+    cuda = load_comparable_bundle(
+        _bundle(tmp_path / "cuda", benchmark=True, device="cuda:0")
+    )
+    _, performance, _ = _performance(cpu, cuda)
+    assert [item.requested_device for item in performance.included_runs] == [
+        "cpu",
+        "cuda:0",
+    ]
+    assert performance.excluded_candidates == ()
+
+
+def test_scientific_provenance_failure_does_not_hide_valid_timing(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["benchmark"]
+    candidate = _run_variant(reference, ("source", "dirty"), True)
+    comparison, performance, _ = _performance(reference, candidate)
+    assert comparison.scientific_results[0].status == "structurally_incomparable"
+    assert [item.environment_id for item in performance.included_runs] == [
+        "reference-env",
+        "candidate-1",
+    ]
+
+
+def test_wsl2_execution_layer_is_preserved_in_performance(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    benchmark = _a2_bundles["benchmark"]
+    _, performance, _ = _performance(benchmark, benchmark, candidate_layers=("wsl2",))
+    assert performance.included_runs[1].execution_layer == "wsl2"
+    assert (
+        json.loads(encode_portability_performance(performance))["included_runs"][1][
+            "execution_layer"
+        ]
+        == "wsl2"
+    )
+
+
+def test_performance_descriptors_must_match_the_hashed_scientific_identity(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    benchmark = _a2_bundles["benchmark"]
+    reference = _descriptor(benchmark, "reference-env", "reference")
+    candidate = _descriptor(benchmark, "candidate-1", "holdout")
+    comparison = compare_scientific_bundles(
+        reference, (candidate,), generator=_A2_GENERATOR
+    )
+    scientific = encode_scientific_comparison(comparison)
+    relabeled = _descriptor(benchmark, "candidate-1", "holdout", execution_layer="wsl2")
+    with pytest.raises(ComparisonValidationError, match="differ"):
+        build_portability_performance(comparison, scientific, reference, (relabeled,))
+
+
+def test_evaluation_candidate_is_scientific_and_performance_excluded(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    comparison, performance, _ = _performance(
+        _a2_bundles["benchmark"], _a2_bundles["evaluation"]
+    )
+    assert comparison.scientific_results[0].status == "observed_unclassified"
+    assert performance.excluded_candidates == (
+        PortabilityPerformanceExclusion("candidate-1", "evaluation_bundle"),
+    )
+
+
+def test_mps_benchmark_is_never_timing_eligible(tmp_path: Path) -> None:
+    cpu = load_comparable_bundle(_bundle(tmp_path / "cpu", benchmark=True))
+    mps = load_comparable_bundle(
+        _bundle(tmp_path / "mps", benchmark=True, device="mps")
+    )
+    reference = _descriptor(cpu, "reference-env", "reference")
+    candidate = _descriptor(mps, "candidate-1", "post_policy_attempt")
+    comparison = compare_scientific_bundles(
+        reference, (candidate,), generator=_A2_GENERATOR
+    )
+    scientific = encode_scientific_comparison(comparison)
+    performance = build_portability_performance(
+        comparison, scientific, reference, (candidate,)
+    )
+    assert performance.excluded_candidates[0].reason_code == (
+        "unsupported_timing_device"
+    )
+
+
+@pytest.mark.parametrize("case", ("workload", "methodology", "profile", "inventory"))
+def test_incompatible_benchmark_candidate_has_bounded_exclusion_reason(
+    tmp_path: Path, _a2_bundles: dict[str, ComparableBundle], case: str
+) -> None:
+    reference = _a2_bundles["benchmark"]
+    if case == "profile":
+        candidate = _run_variant(reference, ("profile_id",), "other-profile")
+    elif case == "inventory":
+        candidate = _run_variant(
+            reference, ("inventory", "sample_inventory_sha256"), "f" * 64
+        )
+    elif case == "workload":
+        candidate = load_comparable_bundle(
+            _bundle(tmp_path, benchmark=True, bank_chunk_size=8_192)
+        )
+    else:
+        candidate = load_comparable_bundle(_bundle(tmp_path, benchmark=True, repeats=3))
+    _, performance, _ = _performance(reference, candidate)
+    assert performance.excluded_candidates[0].reason_code == (
+        "methodology_mismatch" if case == "methodology" else "workload_mismatch"
+    )
+
+
+def test_performance_builder_binds_measurements_to_benchmark_source_snapshot(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["benchmark"]
+    metadata = portability._thaw_comparison_json(reference.benchmark_metadata)
+    assert isinstance(metadata, dict)
+    metadata["results"]["one_off_ms"]["model_and_weight_load"] = 126.0
+    frozen = portability._freeze_json(metadata)
+    assert isinstance(frozen, dict | portability.MappingProxyType)
+    candidate = replace(reference, benchmark_metadata=frozen)
+    with pytest.raises(ComparisonValidationError, match="source snapshot"):
+        _performance(reference, candidate)
+
+
+def test_performance_record_revalidates_benchmark_measurements(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["benchmark"]
+    _, performance, _ = _performance(reference, reference)
+    run = performance.included_runs[1]
+    measurements = portability._thaw_comparison_json(run.measurements)
+    assert isinstance(measurements, dict)
+    measurements["one_off_ms"]["model_and_weight_load"] = -1.0
+    invalid = replace(run, measurements=measurements)
+    with pytest.raises(BundleValidationError, match="nonnegative"):
+        replace(
+            performance,
+            included_runs=(performance.included_runs[0], invalid),
+        )
+
+
+def test_performance_record_rejects_unknown_or_private_identity_values(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["benchmark"]
+    _, performance, _ = _performance(reference, reference)
+    with pytest.raises(ComparisonValidationError, match="workload fields"):
+        replace(performance, workload={**dict(performance.workload), "unknown": 1})
+    with pytest.raises(ComparisonValidationError, match="private path"):
+        replace(performance, limitations=("source /home/alice/private-run",))
+    with pytest.raises(ComparisonValidationError, match="run_id"):
+        replace(performance.included_runs[0], run_id="/home/alice/private-run")
+
+
+def test_performance_record_revalidates_each_full_methodology(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    reference = _a2_bundles["benchmark"]
+    _, performance, _ = _performance(reference, reference)
+    run = performance.included_runs[1]
+    methodology = portability._thaw_comparison_json(run.timing_methodology)
+    assert isinstance(methodology, dict)
+    methodology["repeat_count"] = 3
+    invalid = replace(run, timing_methodology=methodology)
+    with pytest.raises(ComparisonValidationError, match="methodology"):
+        replace(
+            performance,
+            included_runs=(performance.included_runs[0], invalid),
+        )
+
+
+def test_performance_output_has_no_comparative_or_policy_fields(
+    _a2_bundles: dict[str, ComparableBundle],
+) -> None:
+    _, performance, _ = _performance(_a2_bundles["benchmark"], _a2_bundles["benchmark"])
+    document = json.loads(encode_portability_performance(performance))
+    forbidden = {
+        "ratio",
+        "speedup",
+        "percentage",
+        "ranking",
+        "winner",
+        "regression",
+        "confidence_interval",
+        "policy",
+        "scientific_status",
+        "performance_gate",
+    }
+
+    rendered = json.dumps(document).casefold()
+    assert not any(f'"{key}"' in rendered for key in forbidden)
+    for pattern in (
+        r"\bratios?\b",
+        r"\bspeedups?\b",
+        r"\bpercentages?\b",
+        r"\brankings?\b",
+        r"\bwinners?\b",
+        r"\bregressions?\b",
+        r"\bconfidence intervals?\b",
+    ):
+        assert re.search(pattern, rendered) is None
+
+
+def _publication_bytes(scientific: bytes = b'{"science":1}\n') -> tuple[bytes, bytes]:
+    performance = _canonical(
+        {"scientific_sha256": hashlib.sha256(scientific).hexdigest()}
+    )
+    return scientific, performance
+
+
+def test_atomic_publication_has_exact_inventory_and_rejects_existing(
+    tmp_path: Path,
+) -> None:
+    scientific, performance = _publication_bytes()
+    output = tmp_path / "comparison"
+    assert publish_portability_records(scientific, performance, output) == output
+    assert tuple(sorted(path.name for path in output.iterdir())) == (
+        "performance.json",
+        "scientific.json",
+    )
+    assert (output / "scientific.json").read_bytes() == scientific
+    with pytest.raises(FileExistsError):
+        publish_portability_records(scientific, performance, output)
+
+
+def test_late_publication_failure_leaves_no_destination_or_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scientific, performance = _publication_bytes()
+    output = tmp_path / "comparison"
+    original = portability._write_portability_file
+    calls = 0
+
+    def fail_second(path: Path, payload: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected late failure")
+        original(path, payload)
+
+    monkeypatch.setattr(portability, "_write_portability_file", fail_second)
+    with pytest.raises(OSError, match="injected"):
+        publish_portability_records(scientific, performance, output)
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_publication_rejects_incorrect_scientific_hash(tmp_path: Path) -> None:
+    with pytest.raises(ComparisonValidationError, match="exact scientific"):
+        publish_portability_records(
+            b'{"science":1}\n',
+            _canonical({"scientific_sha256": "0" * 64}),
+            tmp_path / "comparison",
+        )
+
+
+def test_publication_rejects_absolute_paths_in_canonical_payloads(
+    tmp_path: Path,
+) -> None:
+    scientific = _canonical({"source_path": "/home/alice/private-run"})
+    _, performance = _publication_bytes(scientific)
+    with pytest.raises(ComparisonValidationError, match="private path"):
+        publish_portability_records(scientific, performance, tmp_path / "comparison")
+
+
+def test_high_level_publication_preserves_inputs_order_and_private_paths(
+    tmp_path: Path,
+) -> None:
+    reference = _bundle(tmp_path / "reference", benchmark=True)
+    candidate_a = _bundle(tmp_path / "candidate-a", benchmark=True)
+    candidate_b = _bundle(tmp_path / "candidate-b", benchmark=True)
+    environment_path = tmp_path / "environment-map.json"
+    _write_json(
+        environment_path,
+        _environment_map_value(
+            _environment_value("candidate-b", "holdout"),
+            _environment_value("candidate-a", "holdout"),
+        ),
+    )
+    before = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for directory in (reference, candidate_a, candidate_b)
+        for path in directory.iterdir()
+    }
+    inventories = {
+        directory: tuple(sorted(path.name for path in directory.iterdir()))
+        for directory in (reference, candidate_a, candidate_b)
+    }
+    environment_before = environment_path.read_bytes()
+    output = tmp_path / "published"
+
+    comparison, performance = publish_portability_comparison(
+        reference,
+        (candidate_b, candidate_a),
+        environment_path,
+        output,
+        generator=_A2_GENERATOR,
+    )
+
+    assert tuple(item.environment_id for item in comparison.candidates) == (
+        "candidate-b",
+        "candidate-a",
+    )
+    assert tuple(item.environment_id for item in performance.included_runs[1:]) == (
+        "candidate-b",
+        "candidate-a",
+    )
+    assert environment_path.read_bytes() == environment_before
+    assert all(
+        hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        for path, digest in before.items()
+    )
+    assert all(
+        tuple(sorted(path.name for path in directory.iterdir())) == inventory
+        for directory, inventory in inventories.items()
+    )
+    combined = b"".join(path.read_bytes() for path in output.iterdir())
+    assert str(tmp_path).encode() not in combined
+    assert (
+        hashlib.sha256((output / "scientific.json").read_bytes()).hexdigest()
+        == json.loads((output / "performance.json").read_bytes())["scientific_sha256"]
+    )
+
+
+def test_high_level_candidate_count_mismatch_fails_before_publication(
+    tmp_path: Path,
+) -> None:
+    environment_path = tmp_path / "environment-map.json"
+    _write_json(
+        environment_path,
+        _environment_map_value(
+            _environment_value("candidate-a", "holdout"),
+            _environment_value("candidate-b", "holdout"),
+        ),
+    )
+    with pytest.raises(ComparisonValidationError, match="count"):
+        publish_portability_comparison(
+            tmp_path / "never-loaded",
+            (tmp_path / "one",),
+            environment_path,
+            tmp_path / "output",
+            generator=_A2_GENERATOR,
+        )
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("source", ("reference", "candidate"))
+def test_high_level_rejects_output_inside_a_source_bundle(
+    tmp_path: Path, source: str
+) -> None:
+    reference = _bundle(tmp_path / "reference", benchmark=True)
+    candidate = _bundle(tmp_path / "candidate", benchmark=True)
+    environment_path = tmp_path / "environment-map.json"
+    _write_json(environment_path, _environment_map_value())
+    inventories = {
+        path: tuple(sorted(item.name for item in path.iterdir()))
+        for path in (reference, candidate)
+    }
+    output = (reference if source == "reference" else candidate) / "comparison"
+
+    with pytest.raises(ComparisonValidationError, match="outside source"):
+        publish_portability_comparison(
+            reference,
+            (candidate,),
+            environment_path,
+            output,
+            generator=_A2_GENERATOR,
+        )
+
+    assert not output.exists()
+    assert all(
+        tuple(sorted(item.name for item in path.iterdir())) == inventory
+        for path, inventory in inventories.items()
+    )
+
+
+def test_high_level_policy_mode_preserves_map_and_policy_sources(
+    tmp_path: Path,
+) -> None:
+    reference = _bundle(tmp_path / "reference", benchmark=True)
+    candidate = _bundle(tmp_path / "candidate", benchmark=True)
+    environment_path = tmp_path / "environment-map.json"
+    policy_path = tmp_path / "policy.json"
+    _write_json(environment_path, _environment_map_value())
+    _write_json(policy_path, _policy_value())
+    before = (environment_path.read_bytes(), policy_path.read_bytes())
+
+    comparison, performance = publish_portability_comparison(
+        reference,
+        (candidate,),
+        environment_path,
+        tmp_path / "output",
+        generator=_A2_GENERATOR,
+        policy_path=policy_path,
+    )
+
+    assert comparison.scientific_results[0].status == "within_policy"
+    assert comparison.policy is not None
+    assert (environment_path.read_bytes(), policy_path.read_bytes()) == before
+    assert "policy" not in json.loads(encode_portability_performance(performance))
+
+
+def test_evaluation_reference_is_rejected_before_publication(tmp_path: Path) -> None:
+    reference = _bundle(tmp_path / "reference")
+    candidate = _bundle(tmp_path / "candidate")
+    environment_path = tmp_path / "environment-map.json"
+    _write_json(environment_path, _environment_map_value())
+    with pytest.raises(ComparisonValidationError, match="eight-file benchmark"):
+        publish_portability_comparison(
+            reference,
+            (candidate,),
+            environment_path,
+            tmp_path / "output",
+            generator=_A2_GENERATOR,
+        )
+    assert not (tmp_path / "output").exists()
