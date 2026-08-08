@@ -1199,7 +1199,12 @@ def _git(cwd: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
-def test_repository_commit_dirty_state_and_exact_lock_digest(tmp_path: Path) -> None:
+def test_repository_commit_dirty_state_and_exact_lock_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "commit.gpgSign")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
     _git(tmp_path, "init", "--quiet")
     _git(tmp_path, "config", "user.email", "test@example.com")
     _git(tmp_path, "config", "user.name", "Test User")
@@ -1209,7 +1214,20 @@ def test_repository_commit_dirty_state_and_exact_lock_digest(tmp_path: Path) -> 
     tracked = tmp_path / "tracked.txt"
     tracked.write_text("clean\n", encoding="utf-8")
     _git(tmp_path, "add", ".")
-    _git(tmp_path, "commit", "--quiet", "-m", "fixture")
+    _git(
+        tmp_path,
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    )
+    assert _git(tmp_path, "config", "--get", "commit.gpgSign") == "true"
+    assert (
+        "gpgsign"
+        not in (tmp_path / ".git/config").read_text(encoding="utf-8").casefold()
+    )
     nested = tmp_path / "nested" / "directory"
     nested.mkdir(parents=True)
     (tmp_path / "outputs").mkdir()
@@ -1237,7 +1255,15 @@ def test_repository_metadata_fails_outside_git_and_without_lock(tmp_path: Path) 
     _git(repository, "config", "user.name", "Test User")
     (repository / "tracked").write_text("data", encoding="utf-8")
     _git(repository, "add", ".")
-    _git(repository, "commit", "--quiet", "-m", "fixture")
+    _git(
+        repository,
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    )
     with pytest.raises(FileNotFoundError, match="uv.lock not found"):
         cli._repository_metadata(repository)
 
