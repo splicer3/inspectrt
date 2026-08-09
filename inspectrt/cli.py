@@ -13,7 +13,6 @@ import random
 import re
 import subprocess
 import sys
-from time import perf_counter_ns
 import tomllib
 from typing import Any
 from urllib.parse import urlsplit
@@ -196,6 +195,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = load_baseline_config(arguments.config)
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
             return _export_fixture(arguments, config)
+        if arguments.command == "benchmark":
+            _validate_benchmark_arguments(arguments)
         config = load_baseline_config(arguments.config)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
         handler = _benchmark if arguments.command == "benchmark" else _evaluate
@@ -489,22 +490,30 @@ def _benchmark(arguments: argparse.Namespace, config: BaselineConfig) -> int:
     from torchvision.models import ResNet50_Weights
 
     from inspectrt.artifacts import persist_baseline_run
-    from inspectrt.benchmark import benchmark_mvtec_category
+    from inspectrt.benchmark import _time_backend_operation, benchmark_mvtec_category
     from inspectrt.features import build_resnet50_layer2_extractor
 
     identity = _baseline_run_identity(arguments)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    model_start = perf_counter_ns()
-    weights = ResNet50_Weights.IMAGENET1K_V2
-    extractor = build_resnet50_layer2_extractor(weights=weights)
-    extractor.to(device).eval()
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    model_load_ms = float(perf_counter_ns() - model_start) / 1_000_000.0
+
+    def load_model() -> tuple[Any, Any, str]:
+        weights = ResNet50_Weights.IMAGENET1K_V2
+        weight_digest = _cached_weight_sha256(weights.url, torch)
+        extractor = build_resnet50_layer2_extractor(weights=weights)
+        return weights, extractor.to(device).eval(), weight_digest
+
+    (weights, extractor, weight_digest), model_load_ns = _time_backend_operation(
+        device, load_model
+    )
 
     metadata = _baseline_run_metadata(
-        arguments, config, device, determinism, weights, torch, identity
+        arguments,
+        config,
+        device,
+        determinism,
+        weights,
+        torch,
+        identity,
+        weight_digest=weight_digest,
     )
     evaluation, benchmark = benchmark_mvtec_category(
         arguments.dataset_root,
@@ -514,21 +523,21 @@ def _benchmark(arguments: argparse.Namespace, config: BaselineConfig) -> int:
         bank_chunk_size=config.bank_chunk_size,
         warmup_count=arguments.warmup_count,
         repeat_count=arguments.repeat_count,
-        model_and_weight_load_ms=model_load_ms,
+        model_and_weight_load_ns=model_load_ns,
         run_id=metadata.run_id,
         created_at_utc=metadata.created_at_utc,
     )
     run_directory = persist_baseline_run(
         evaluation, arguments.output_root, metadata, benchmark=benchmark
     )
-    end_to_end = benchmark.results["synchronized_end_to_end"]
+    end_to_end = benchmark.results["synchronized_end_to_end"]["summary_ns"]
     print(f"Run written to {run_directory}")
     print(f"category={evaluation.category}")
     print(f"image_auroc={evaluation.metrics.image_auroc}")
     print(f"image_average_precision={evaluation.metrics.image_average_precision}")
     print(f"pixel_auroc={evaluation.metrics.pixel_auroc}")
-    print(f"synchronized_end_to_end_p50_ms={end_to_end['p50']}")
-    print(f"synchronized_end_to_end_p95_ms={end_to_end['p95']}")
+    print(f"synchronized_end_to_end_p50_ms={end_to_end['p50'] / 1_000_000}")
+    print(f"synchronized_end_to_end_p95_ms={end_to_end['p95'] / 1_000_000}")
     print(f"timing_device={benchmark.device}")
     return 0
 
@@ -626,7 +635,29 @@ def _resolve_device(requested: str, torch: Any) -> Any:
         or (device.index is not None and device.index >= torch.cuda.device_count())
     ):
         raise RuntimeError(f"CUDA device {device} requested but unavailable")
+    if device.type == "mps" and (
+        not torch.backends.mps.is_built() or not torch.backends.mps.is_available()
+    ):
+        raise RuntimeError("MPS device requested but unavailable")
     return device
+
+
+def _validate_benchmark_arguments(arguments: argparse.Namespace) -> None:
+    if (
+        arguments.device not in {"cpu", "mps"}
+        and re.fullmatch(r"cuda:\d+", arguments.device) is None
+    ):
+        if arguments.device == "cuda":
+            raise ValueError("CUDA benchmark device must include an explicit index")
+        raise ValueError("Benchmark device must be cpu, cuda:<index>, or mps")
+    if arguments.warmup_count != 5:
+        raise ValueError("benchmark --warmup-count must be 5")
+    if arguments.repeat_count != 30:
+        raise ValueError("benchmark --repeat-count must be 30")
+    if arguments.device == "mps" and "PYTORCH_ENABLE_MPS_FALLBACK" in os.environ:
+        raise RuntimeError(
+            "MPS benchmark requires PYTORCH_ENABLE_MPS_FALLBACK to be absent"
+        )
 
 
 def _repository_metadata(cwd: Path) -> tuple[Path, str, bool, str]:

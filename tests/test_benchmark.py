@@ -1,6 +1,5 @@
 from dataclasses import FrozenInstanceError, fields
 import inspect
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -261,14 +260,6 @@ def test_record_is_recursively_immutable_and_caller_isolated() -> None:
     with pytest.raises(TypeError):
         record.results["repeated_stages"]["image_decode"]["raw_ns"][0] = 1  # type: ignore[index]
     assert record.workload["bank_shape"] == (214_016, 512)
-
-
-def test_canonical_json_contains_only_builtin_schema_two_values() -> None:
-    record = _record("mps")
-    encoded = record.canonical_json()
-    assert encoded.endswith(b"\n")
-    assert json.loads(encoded) == record.to_json_value()
-    assert json.loads(encoded)["schema_version"] == 2
 
 
 def test_cpu_synchronization_path_calls_no_accelerator(

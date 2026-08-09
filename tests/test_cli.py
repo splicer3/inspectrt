@@ -1189,6 +1189,209 @@ def test_cuda_request_never_falls_back_to_cpu(
     assert "evaluate" not in wired_command.calls
 
 
+def _benchmark_arguments(device: str, *extra: str) -> list[str]:
+    return [
+        "benchmark",
+        "--config",
+        str(_PROFILE),
+        "--dataset-root",
+        "dataset",
+        "--category",
+        "bottle",
+        "--device",
+        device,
+        "--output-root",
+        "outputs",
+        "--run-id",
+        "timing-v2",
+        *extra,
+    ]
+
+
+def test_benchmark_routes_cpu_indexed_cuda_and_mps_with_exact_load_nanoseconds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import torch
+
+    import inspectrt.artifacts as artifacts
+    import inspectrt.benchmark as benchmark_module
+    import inspectrt.features as features
+
+    calls: list[tuple[str, object]] = []
+
+    class Extractor:
+        def to(self, device: object) -> object:
+            calls.append(("placement", str(device)))
+            return self
+
+        def eval(self) -> object:
+            calls.append(("evaluation_mode", True))
+            return self
+
+    evaluation = SimpleNamespace(
+        category="bottle",
+        metrics=SimpleNamespace(
+            image_auroc=0.75,
+            image_average_precision=0.5,
+            pixel_auroc=0.625,
+        ),
+    )
+    record = SimpleNamespace(
+        device="cpu",
+        results={
+            "synchronized_end_to_end": {
+                "summary_ns": {"p50": 2_500_000.0, "p95": 4_000_000.0}
+            }
+        },
+    )
+
+    monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
+    monkeypatch.setattr(cli, "_configure_determinism", lambda *args: {})
+    monkeypatch.setattr(
+        cli, "_resolve_device", lambda requested, runtime: torch.device(requested)
+    )
+    monkeypatch.setattr(
+        cli,
+        "_baseline_run_identity",
+        lambda arguments: {"run_id": arguments.run_id, "created_at_utc": "now"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_baseline_run_metadata",
+        lambda arguments, config, device, determinism, weights, runtime, identity, *, weight_digest: (
+            SimpleNamespace(run_id=identity["run_id"], created_at_utc="now")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_cached_weight_sha256",
+        lambda url, runtime: calls.append(("cached_weight", url)) or "f" * 64,
+    )
+
+    def build(**kwargs: object) -> Extractor:
+        calls.append(("model_construction", kwargs["weights"]))
+        return Extractor()
+
+    monkeypatch.setattr(features, "build_resnet50_layer2_extractor", build)
+
+    def time_operation(device: object, operation: object) -> tuple[object, int]:
+        calls.append(("timing_device", str(device)))
+        calls.append(("timer", "start"))
+        result = operation()  # type: ignore[operator]
+        calls.append(("timer", "end"))
+        return result, 987_654_321
+
+    monkeypatch.setattr(benchmark_module, "_time_backend_operation", time_operation)
+
+    def benchmark(*args: object, **kwargs: object) -> tuple[object, object]:
+        calls.append(("benchmark", kwargs.copy()))
+        record.device = str(kwargs["device"])
+        return evaluation, record
+
+    monkeypatch.setattr(benchmark_module, "benchmark_mvtec_category", benchmark)
+    monkeypatch.setattr(
+        artifacts,
+        "persist_baseline_run",
+        lambda evaluation, output, metadata, *, benchmark: (
+            output / "runs" / metadata.run_id
+        ),
+    )
+
+    for device in ("cpu", "cuda:2", "mps"):
+        calls.clear()
+        assert cli.main(_benchmark_arguments(device)) == 0
+        benchmark_call = next(value for name, value in calls if name == "benchmark")
+        assert benchmark_call["device"] == torch.device(device)
+        assert benchmark_call["model_and_weight_load_ns"] == 987_654_321
+        assert ("timing_device", device) in calls
+        assert ("placement", device) in calls
+        assert [name for name, _ in calls[1:6]] == [
+            "timer",
+            "cached_weight",
+            "model_construction",
+            "placement",
+            "evaluation_mode",
+        ]
+        assert calls[6] == ("timer", "end")
+        output = capsys.readouterr().out
+        assert "synchronized_end_to_end_p50_ms=2.5" in output
+        assert f"timing_device={device}" in output
+
+
+def test_benchmark_rejects_invalid_surface_before_workload(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_benchmark",
+        lambda *args: (_ for _ in ()).throw(AssertionError("workload executed")),
+    )
+    scenarios = (
+        (("cuda",), "explicit index"),
+        (("xpu:0",), "cpu, cuda:<index>, or mps"),
+        (("cpu", "--warmup-count", "4"), "warmup-count must be 5"),
+        (("cpu", "--repeat-count", "29"), "repeat-count must be 30"),
+    )
+    for arguments, message in scenarios:
+        assert cli.main(_benchmark_arguments(*arguments)) == 1
+        captured = capsys.readouterr()
+        assert message in captured.err
+        assert "Traceback" not in captured.err
+
+
+def test_benchmark_rejects_unavailable_accelerators_without_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import torch
+
+    monkeypatch.setattr(cli, "_configure_determinism", lambda *args: {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    for device, message in (("cuda:2", "CUDA device"), ("mps", "MPS device")):
+        assert cli.main(_benchmark_arguments(device)) == 1
+        captured = capsys.readouterr()
+        assert message in captured.err and "unavailable" in captured.err
+        assert "Traceback" not in captured.err
+
+
+def test_mps_fallback_presence_is_rejected_before_torch_import() -> None:
+    code = f"""
+import contextlib
+import io
+import os
+import sys
+import inspectrt.cli as cli
+arguments = {_benchmark_arguments("mps")!r}
+for value in ('1', '0', 'false', ''):
+    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = value
+    with contextlib.redirect_stderr(io.StringIO()) as errors:
+        assert cli.main(arguments) == 1
+    assert 'requires PYTORCH_ENABLE_MPS_FALLBACK to be absent' in errors.getvalue()
+    assert 'Traceback' not in errors.getvalue()
+    assert os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] == value
+    assert 'torch' not in sys.modules
+"""
+    result = subprocess.run(
+        (sys.executable, "-c", code),
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_benchmark_is_the_only_timing_cli_namespace() -> None:
+    result = _console("--help")
+    assert result.returncode == 0
+    assert "benchmark" in result.stdout
+    for name in ("portable-timing", "benchmark-v2", "benchmark-mps"):
+        assert name not in result.stdout
+
+
 def _git(cwd: Path, *arguments: str) -> str:
     return subprocess.run(
         ("git", *arguments),

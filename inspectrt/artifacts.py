@@ -179,7 +179,11 @@ def persist_baseline_run(
             },
         ),
         ("metrics.json", _canonical_json(metrics)),
-        *((("benchmark.json", benchmark.canonical_json()),) if benchmark else ()),
+        *(
+            (("benchmark.json", _canonical_json(benchmark.to_json_value())),)
+            if benchmark
+            else ()
+        ),
         (
             "run.json",
             _canonical_json(
@@ -385,6 +389,7 @@ def _run_record(
             if benchmark is None
             else {
                 "artifact": "benchmark.json",
+                "present": True,
                 "schema_version": benchmark.schema_version,
                 "timing_device": benchmark.device,
             }

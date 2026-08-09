@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, asdict, replace
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import torch
 
 import inspectrt.artifacts as artifacts
 from inspectrt.artifacts import BaselineRunMetadata, persist_baseline_run
+from inspectrt.benchmark import BaselineBenchmark
+import inspectrt.benchmark as benchmark_module
 from inspectrt.data import MvtecSample
 from inspectrt.evaluation import CategoryEvaluation, MvtecSampleObservation
 from inspectrt.metrics import ThresholdFreeMetrics, compute_threshold_free_metrics
@@ -21,6 +24,15 @@ _FILES = {
     "run.json",
     "samples.jsonl",
 }
+_BENCHMARK_FILES = {*_FILES, "benchmark.json"}
+_TIMED_STAGES = (
+    "image_decode",
+    "canonical_image_preprocessing",
+    "host_to_device_transfer",
+    "frozen_feature_extraction",
+    "exact_chunked_retrieval",
+    "anomaly_map_reconstruction",
+)
 
 
 def _observation(
@@ -102,6 +114,41 @@ def _metadata(run_id: str = "baseline-run", **changes: object) -> BaselineRunMet
     }
     values.update(changes)
     return BaselineRunMetadata(**values)  # type: ignore[arg-type]
+
+
+def _benchmark(metadata: BaselineRunMetadata) -> BaselineBenchmark:
+    repeated = list(range(30, 0, -1))
+
+    def measurement(raw: list[int]) -> dict[str, object]:
+        return {"raw_ns": raw, "summary_ns": benchmark_module._summary_ns(raw)}
+
+    return BaselineBenchmark(
+        schema_version=2,
+        profile_id="inspectrt_feature_memory_v1",
+        category="bottle",
+        device="cpu",
+        benchmark_sample_id="mvtec_ad/bottle/test/broken_large/000.png",
+        run_id=metadata.run_id,
+        created_at_utc=metadata.created_at_utc,
+        workload=benchmark_module._workload(),
+        methodology=benchmark_module._methodology(),
+        environment={"kind": "cpu", "properties": {}},
+        results={
+            "one_off": {
+                "model_and_weight_load": measurement([11]),
+                "full_nominal_bank_build": measurement([12]),
+                "bank_transfer_and_device_setup": measurement([13]),
+            },
+            "repeated_stages": {
+                name: measurement(repeated.copy()) for name in _TIMED_STAGES
+            },
+            "synchronized_end_to_end": measurement(repeated.copy()),
+            "memory_observations": {
+                "kind": "cpu",
+                "host_peak_memory": "not_measured",
+            },
+        },
+    )
 
 
 def _json_bytes(value: object) -> bytes:
@@ -279,6 +326,35 @@ def test_persists_complete_recomputable_bundle_without_mutation(tmp_path: Path) 
     )
 
 
+def test_persists_canonical_schema_two_benchmark_and_run_link(tmp_path: Path) -> None:
+    metadata = _metadata(requested_device="cpu")
+    benchmark = _benchmark(metadata)
+
+    run_dir = persist_baseline_run(
+        _evaluation(), tmp_path, metadata, benchmark=benchmark
+    )
+
+    assert {path.name for path in run_dir.iterdir()} == _BENCHMARK_FILES
+    benchmark_bytes = (run_dir / "benchmark.json").read_bytes()
+    assert benchmark_bytes == _json_bytes(benchmark.to_json_value())
+    _assert_canonical(run_dir / "benchmark.json")
+    persisted = json.loads(benchmark_bytes)
+    assert persisted["schema_version"] == 2
+    assert persisted["results"]["repeated_stages"]["image_decode"]["raw_ns"] == (
+        list(range(30, 0, -1))
+    )
+    run = json.loads((run_dir / "run.json").read_bytes())
+    assert run["benchmark"] == {
+        "artifact": "benchmark.json",
+        "present": True,
+        "schema_version": 2,
+        "timing_device": "cpu",
+    }
+    source = inspect.getsource(artifacts.persist_baseline_run)
+    assert "benchmark.to_json_value()" in source
+    assert "benchmark.canonical_json" not in source
+
+
 def test_inventory_digest_excludes_run_metadata_but_identifies_order(
     tmp_path: Path,
 ) -> None:
@@ -328,8 +404,11 @@ def test_never_overwrites_an_existing_run(tmp_path: Path) -> None:
     destination.mkdir(parents=True)
     marker = destination / "keep.txt"
     marker.write_text("unchanged", encoding="utf-8")
+    metadata = _metadata("existing", requested_device="cpu")
     with pytest.raises(FileExistsError, match="already exists"):
-        persist_baseline_run(_evaluation(), tmp_path, _metadata("existing"))
+        persist_baseline_run(
+            _evaluation(), tmp_path, metadata, benchmark=_benchmark(metadata)
+        )
     assert marker.read_text(encoding="utf-8") == "unchanged"
     assert not list(destination.parent.glob(".existing.tmp-*"))
 
@@ -337,16 +416,19 @@ def test_never_overwrites_an_existing_run(tmp_path: Path) -> None:
 def test_failed_write_removes_final_and_temporary_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_save = torch.save
+    real_write_bytes = Path.write_bytes
 
-    def fail_late(value: object, path: Path) -> None:
-        if path.name == "anomaly_maps.pt":
+    def fail_late(path: Path, value: bytes) -> int:
+        if path.name == "run.json":
             raise OSError("late write failed")
-        real_save(value, path)
+        return real_write_bytes(path, value)
 
-    monkeypatch.setattr(artifacts.torch, "save", fail_late)
+    monkeypatch.setattr(Path, "write_bytes", fail_late)
+    metadata = _metadata("failed", requested_device="cpu")
     with pytest.raises(OSError, match="late write failed"):
-        persist_baseline_run(_evaluation(), tmp_path, _metadata("failed"))
+        persist_baseline_run(
+            _evaluation(), tmp_path, metadata, benchmark=_benchmark(metadata)
+        )
     assert list((tmp_path / "runs").iterdir()) == []
 
 

@@ -2,7 +2,6 @@
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-import json
 import math
 import os
 from pathlib import Path
@@ -99,19 +98,6 @@ class BaselineBenchmark:
             "schema_version": self.schema_version,
             "workload": _thaw_json(self.workload),
         }
-
-    def canonical_json(self) -> bytes:
-        """Serialize for the existing persistence caller during Unit 1."""
-        return (
-            json.dumps(
-                self.to_json_value(),
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
-        ).encode("utf-8")
 
 
 def benchmark_mvtec_category(
