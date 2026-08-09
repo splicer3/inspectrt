@@ -15,9 +15,13 @@ validate binary exact-retrieval fixtures. See
 commands, and validation limits.
 
 The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 running the
-current locked Linux stack with a Quadro T1000. It does not cover other systems
-yet; they will be benchmarked separately. See the measured results and method
-contract in [docs/baseline.md](docs/baseline.md).
+current locked Linux stack with a Quadro T1000. The frozen `bottle` workload now
+has reviewed cross-platform evidence from P53 T1000 CUDA, P53 CPU, RTX 4080
+Super CUDA under WSL 2, M1 Pro CPU, and one scientific-only MPS evaluation.
+Floating outputs and metrics stayed inside the reviewed observed envelope, but
+exact nearest-neighbour identity varied across devices. The timing record is
+descriptive. See [docs/portability.md](docs/portability.md) and the baseline
+method contract in [docs/baseline.md](docs/baseline.md).
 
 ## Installation
 
