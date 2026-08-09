@@ -118,8 +118,8 @@ distances=exact
 status=accepted
 ```
 
-CPU is the canonical acceptance device for this synthetic fixture, so it can
-run on pretty much any device.
+CPU is the canonical acceptance device for this synthetic fixture, so the
+check does not require an accelerator.
 
 ## Real application fixture
 
@@ -157,8 +157,8 @@ The real fixture is generated below the gitignored `outputs/` tree.
 
 ## Export
 
-When the deterministic destination is absent, export the local bottle fixture
-from the accepted run with:
+Export the local bottle fixture only when its deterministic destination does
+not exist:
 
 ```bash
 uv run inspectrt fixture export \
@@ -170,16 +170,15 @@ uv run inspectrt fixture export \
   --output-root outputs
 ```
 
-Export starts from a verified benchmark run, then checks its source identities
-and five recorded source-artifact hashes. Since the query tensor is not in the
-run bundle, export extracts it again and recomputes retrieval with the frozen
-profile. The accepted export ran on the recorded environment. Every export must
-match the accepted run's stored distances and indices exactly before it writes
-the fixture.
+Before writing, the command verifies the benchmark run, its source identities,
+and five recorded source-artifact hashes. The run bundle does not contain the
+query tensor, so the command extracts it again and recomputes retrieval with
+the frozen profile. It requires an exact match with the accepted run's stored
+distances and indices. The accepted export ran on the recorded environment.
 
-The repository working tree must be clean, and the write is atomic. The
-deterministic fixture directory must not already exist because export refuses
-to overwrite it. The dataset and pretrained weight must be obtained manually.
+Export requires a clean working tree and writes the fixture atomically. It
+refuses to overwrite the deterministic fixture directory. The dataset and
+pretrained weight must be obtained manually.
 
 ## Real-fixture validation
 

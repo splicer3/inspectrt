@@ -1,8 +1,8 @@
 # InspectRT
 
-InspectRT is currently a reproducible, reduced feature-memory baseline for one
-MVTec AD category at a time. `RT` means **Runtime**: it measures runtime
-behavior, but it does not make hard real-time guarantees.
+InspectRT is a reproducible, reduced feature-memory baseline for one MVTec AD
+category at a time. `RT` means **Runtime**. InspectRT measures runtime behavior,
+but it does not make hard real-time guarantees.
 
 ## Status
 
@@ -14,12 +14,12 @@ validate binary exact-retrieval fixtures. See
 [docs/retrieval-fixtures.md](docs/retrieval-fixtures.md) for the format,
 commands, and validation limits.
 
-The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 running the
-current locked Linux stack with a Quadro T1000. The frozen `bottle` workload now
-has reviewed cross-platform evidence from P53 T1000 CUDA, P53 CPU, RTX 4080
-Super CUDA under WSL 2, M1 Pro CPU, and one scientific-only MPS evaluation.
-Floating outputs and metrics stayed inside the reviewed observed envelope, but
-exact nearest-neighbour identity varied across devices. The timing record is
+The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 with a
+Quadro T1000 and the current locked Linux stack. The frozen `bottle` workload
+also has reviewed results from P53 CPU, RTX 4080 Super CUDA under WSL 2, M1 Pro
+CPU, and M1 Pro MPS. The MPS run contains scientific results only. Floating
+outputs and metrics stayed within the reviewed envelope, while exact
+nearest-neighbour identity varied across devices. Timing results are
 descriptive. See [docs/portability.md](docs/portability.md) and the baseline
 method contract in [docs/baseline.md](docs/baseline.md).
 
@@ -41,8 +41,9 @@ uv run ruff check .
 
 ## MVTec AD
 
-Obtain MVTec AD from the [official dataset page](https://www.mvtec.com/research-teaching/datasets/mvtec-ad) (you will need to enter your email, name and occupation, also commercial use is not allowed)
-and place categories manually below one dataset root:
+Obtain MVTec AD from the [official dataset page](https://www.mvtec.com/research-teaching/datasets/mvtec-ad).
+The download form asks for your email, name, and occupation, and commercial use
+is not allowed. Place the categories below one dataset root:
 
 ```text
 datasets/mvtec_ad/
@@ -50,8 +51,8 @@ datasets/mvtec_ad/
 └── leather/
 ```
 
-The dataset remains untracked through gitignore. Pass `datasets/mvtec_ad` (not an individual
-category directory) as `--dataset-root`.
+The dataset remains untracked through `.gitignore`. Pass `datasets/mvtec_ad`,
+not an individual category directory, as `--dataset-root`.
 
 ## Evaluation
 
@@ -77,7 +78,7 @@ uv run inspectrt benchmark \
   --repeat-count 30
 ```
 
-Both commands write to `outputs/runs/<generated-run-id>/`. An evaluation run has
-seven files containing the resolved run metadata, ordered inventory, memory
-bank, predictions, retrieval results, anomaly maps and masks, and metrics. A
-benchmark run adds `benchmark.json`. Generated runs are gitignored.
+Both commands write to `outputs/runs/<generated-run-id>/`. An evaluation run
+has seven files. They contain the resolved run metadata, ordered inventory,
+memory bank, predictions, retrieval results, anomaly maps and masks, and
+metrics. A benchmark run adds `benchmark.json`. Generated runs are gitignored.

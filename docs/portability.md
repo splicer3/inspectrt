@@ -1,18 +1,19 @@
 # Cross-platform evidence
 
-This page records one frozen `inspectrt_feature_memory_v1` workload on a small,
-named set of systems. The scope is the original MVTec AD `bottle` category and
-source commit `bc330b9070c5ca8db9cb7cfbb27617256388536b`. These measurements do
-not imply that InspectRT behaves identically on every device.
+This record covers one frozen `inspectrt_feature_memory_v1` workload on a small
+set of named systems. It uses the original MVTec AD `bottle` category and source
+commit `bc330b9070c5ca8db9cb7cfbb27617256388536b`. Results from these systems do
+not establish identical behavior on other devices.
 
 ## What was tested
 
-Every run used the accepted configuration, lock, ResNet-50
-`IMAGENET1K_V2` weights, and ordered `bottle` inventory. Images were resized to
-`256 x 256`; frozen `layer2` features became row-major `[1, 1024, 512]` FP32
+Every run used the accepted configuration and lock, ResNet-50
+`IMAGENET1K_V2` weights, and the ordered `bottle` inventory. Images were resized
+to `256 x 256`. Frozen `layer2` features became row-major `[1, 1024, 512]` FP32
 patches. Retrieval remained exact chunked top-1 squared L2 against the complete
-`[214016, 512]` nominal bank. The profile, sample order, image-score semantics,
-map reconstruction, and threshold-free metrics were unchanged.
+`[214016, 512]` nominal bank. The profile and sample order did not change.
+Image-score semantics, map reconstruction, and threshold-free metrics also
+stayed the same.
 
 The scientific source was the clean commit above. The comparison was generated
 from clean commit `25654276682de466efa4df3d86c3d3d3d165113e`.
@@ -27,10 +28,10 @@ from clean commit `25654276682de466efa4df3d86c3d3d3d165113e`.
 | Post-policy evaluation | Apple M1 Pro MPS, macOS 26.5.2 | Native macOS | Evaluation | Excluded: `evaluation_bundle` |
 
 The reference, same-stack control, P53 CPU, and RTX WSL 2 runs established the
-calibration record. The policy was reviewed before the M1 Pro CPU holdout and
-the later MPS evaluation. Neither Mac result changed its limits.
+calibration record. Review of the policy finished before the M1 Pro CPU holdout
+and the later MPS evaluation. The Mac results did not change the policy limits.
 
-## Frozen workload and evidence matrix
+## Comparison rules
 
 The policy requires exact provenance and exact sample IDs, labels, masks, and
 nearest-neighbour indices. Floating components use the elementwise rule:
@@ -60,16 +61,17 @@ elements. Every floating component had zero policy violations.
 
 Image AUROC and image Average Precision were unchanged. Every pixel AUROC
 delta remained inside the reviewed limit. The cross-device records are
-`drift_detected` because nearest-neighbour identity is an exact gate, not
-because floating limits or metric limits were exceeded. The result is neither
-a scientific failure nor a statement of universal equivalence.
+`drift_detected` because nearest-neighbour identity is an exact gate. Floating
+and metric checks still passed, and all required scientific artifacts were
+valid. The evidence only covers the named systems and cannot establish
+universal equivalence.
 
-## Descriptive latency observations
+## Descriptive latency
 
 ![Panel A shows feature extraction, exact retrieval, and end-to-end p50 to p95 latency for five timing-valid environments. Panel B shows the share of 84,992 patch queries whose nearest-neighbour index differs from the T1000 reference for all five completed candidates, including MPS.](evidence/inspectrt_cross_platform_evidence_v1/latency.svg)
 
-The table contains the persisted millisecond values in evidence order. These
-are absolute observations, not ratios or rankings.
+The table lists the persisted millisecond observations in evidence order. The
+values are not normalized into ratios or used to rank the systems.
 
 | Environment | Frozen feature extraction p50 / p95 | Exact retrieval p50 / p95 | Synchronized end to end p50 / p95 |
 | --- | ---: | ---: | ---: |
@@ -80,26 +82,27 @@ are absolute observations, not ratios or rankings.
 | M1 Pro CPU | `18.197083499999998 / 19.20166235` | `202.98639550000001 / 205.35461859999998` | `236.024375 / 238.37803385` |
 
 Each benchmark used five warm-ups and 30 measured repeats on one batch-1 test
-sample. Feature timing includes frozen `layer2` inference, local averaging,
-row-major layout, and output allocation. Retrieval includes the complete
-chunked search, stable merge, reshape, image maximum, and allocations. The
-synchronized end-to-end boundary starts before image decode and ends after the
+sample. Feature timing covers frozen `layer2` inference, local averaging,
+row-major layout, and output allocation. Retrieval timing covers the complete
+chunked search, stable merge, reshape, image maximum, and allocations.
+Synchronized end-to-end timing starts before image decode and stops when the
 raw anomaly map is ready. It excludes model and bank setup, masks, metrics,
 serialization, persistence, and console output.
 
 The summaries do not retain raw repetitions. Host load, power state, and
-thermal state were not controlled across machines, so `performance.json` is
-`descriptive_only`. Host peak memory was not measured; no approximation was
-added.
+thermal state were not controlled across machines. For that reason,
+`performance.json` is `descriptive_only`. Host peak memory was not measured or
+approximated.
 
-## MPS scientific-only result
+## MPS result
 
-The MPS run produced a valid seven-file evaluation bundle. It was
-post-policy, non-calibrating, non-gating, and scientific-only. Its floating
-outputs had zero policy violations, its metrics remained inside their limits,
-and 3,019 nearest indices differed. No MPS latency was measured or inferred.
+The MPS run produced a valid seven-file evaluation bundle after policy review.
+It did not participate in calibration or gating and contributes only to the
+scientific comparison. Its floating outputs had zero policy violations, its
+metrics remained inside their limits, and 3,019 nearest indices differed. No
+MPS latency was measured or inferred.
 
-## How the policy was established
+## Policy derivation
 
 The same-stack control, P53 CPU, and RTX 4080 Super CUDA under WSL 2 defined the
 observed calibration envelope. Each absolute tolerance is the next simple
@@ -114,7 +117,7 @@ The subsequent MPS evaluation followed the same policy and did not widen it.
 
 ## Reproducing and inspecting the evidence
 
-The two JSON files are the canonical machine-readable evidence:
+The published records, graph, and policy are:
 
 - [scientific.json](evidence/inspectrt_cross_platform_evidence_v1/scientific.json)
 - [performance.json](evidence/inspectrt_cross_platform_evidence_v1/performance.json)
@@ -139,18 +142,18 @@ uv run python scripts/render_portability_latency.py \
 | `performance.json` SHA-256 | `b8e57ac6098c89d11d002e797a6d7a79774c871e548f6fbf02d14ded786cb893` |
 | `latency.svg` SHA-256 | `05e14dd3d671a70439e5100b1ee40feb32eceefffc9da2cf014731b87ca66e18` |
 
-## Limits of the result
+## Limits
 
-The scope stops at the named profile, original `bottle` category, versions, and
-machines. The comparison directly covers the nominal feature bank and persisted
-downstream artifacts; raw test feature tensors are not stored. One complete run
-per candidate cannot establish behavior across future library versions,
-drivers, operating-system updates, or hardware.
+This evidence covers only the named profile, original `bottle` category,
+versions, and machines. The comparison includes the nominal feature bank and
+persisted downstream artifacts, but raw test feature tensors are not stored.
+One complete run per candidate cannot establish behavior across future library
+versions, drivers, operating-system updates, or hardware.
 
 The file hashes above are current snapshots. They cannot prove the historical
 identity of files that lacked earlier per-file anchors. Without raw repetitions,
 the latency summaries cannot support confidence intervals. Uncontrolled host
 conditions also prevent broader cross-machine performance conclusions.
 
-`RT` means Runtime. InspectRT measures latency, but this evidence makes no
-hard-real-time claim.
+`RT` means Runtime. InspectRT measures latency, but this evidence does not make
+a hard-real-time claim.

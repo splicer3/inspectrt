@@ -57,10 +57,10 @@ uv run inspectrt evaluate \
   --output-root outputs
 ```
 
-`--config` points to the committed profile, while `--dataset-root` points to the
-category parent. `--category` chooses one category, `--device` chooses the
-PyTorch device, and `--output-root` chooses where run directories are written.
-`--run-id` is optional. InspectRT generates a safe ID when it is omitted.
+`--config` selects the committed profile. `--dataset-root` is the parent of the
+category directories. Use `--category` to choose a category and `--device` to
+choose the PyTorch device. `--output-root` sets the run directory location.
+`--run-id` is optional; InspectRT generates a safe ID when it is omitted.
 
 ## Running a benchmark
 
@@ -111,9 +111,9 @@ ThinkPad P53 with a Quadro T1000 and the current locked Linux stack.
 | `leather` | 245 | 32 | 92 | `[250880, 512]` | 513,802,240 B (490 MiB) | 1.0000000000 | 1.0000000000 | 0.9948517303 |
 
 The accepted `bottle` benchmark used five warm-ups and 30 measured repetitions.
-CUDA events measured repeated device stages: synchronized end-to-end wall time
-runs from image decode through the raw map. It excludes model load, bank build,
-bank transfer, masks, metrics, persistence, and console output.
+CUDA events measured the repeated device stages. Synchronized end-to-end wall
+time runs from image decode through the raw map. It excludes model load, bank
+build, bank transfer, masks, metrics, persistence, and console output.
 
 | Bottle benchmark measurement | Value |
 |---|---:|
@@ -133,13 +133,13 @@ latency.
 
 ## Reproducibility
 
-The profile fixes sample ordering, seed `0`, deterministic PyTorch algorithms,
-disabled cuDNN benchmarking, IEEE FP32 with TF32 disabled, and
-`CUBLAS_WORKSPACE_CONFIG=:4096:8`. It pins
+The profile fixes the sample order and seed `0`. PyTorch uses deterministic
+algorithms with cuDNN benchmarking disabled. FP32 precision is set to `ieee`,
+with TF32 disabled and `CUBLAS_WORKSPACE_CONFIG=:4096:8`. The profile pins
 `ResNet50_Weights.IMAGENET1K_V2`; the accepted cached weight SHA-256 is
 `11ad3fa62ca79e40addfd354a8ec4b7c75143b3038b8d2a807fbc68deab379ca`.
-Each run records its Git commit and dirty state, dependency versions, platform,
-lockfile digest, and ordered sample-inventory digest.
+Each run records its Git commit and dirty state. It also records dependency
+versions, platform, lockfile digest, and the ordered sample-inventory digest.
 
 The accepted `uv.lock` SHA-256 is
 `ddaddc99b318a1c3a04d5d7cc433cf736d321b56f98a8ae8b532e71e19e6d76b`.
@@ -149,10 +149,10 @@ for `bottle` and
 `ea6db1eaf7a544cfb6d618c4ace19a3caf304eb15f42224b07dab4610e211569`
 for `leather`.
 
-A second `bottle` evaluation on the same commit, locked stack, and T1000 had
-identical inventory bytes, ordered test IDs, FP32 bank, and nearest-bank
-indices. Maximum absolute differences were `0.0` for image scores, patch
-distances, and anomaly maps; differences for all three metrics were also `0.0`.
+A second `bottle` evaluation used the same commit, locked stack, and T1000. Its
+inventory bytes, ordered test IDs, FP32 bank, and nearest-bank indices were
+identical. Maximum absolute differences were `0.0` for image scores, patch
+distances, and anomaly maps. All three metric differences were also `0.0`.
 Both runs used the same host, so this only establishes same-stack behavior.
 
 ## Limitations
