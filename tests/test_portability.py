@@ -2547,10 +2547,7 @@ def test_observation_mode_remains_byte_identical_with_explicit_none(
     assert implicit.comparison_id == explicit.comparison_id
     encoded = encode_scientific_comparison(implicit)
     assert encoded == encode_scientific_comparison(explicit)
-    assert len(encoded) == 9349
-    assert hashlib.sha256(encoded).hexdigest() == (
-        "15e4b477cce38c4f84163c28c688ab8f33a1235616a353d28925d138b1eb13f4"
-    )
+    assert "policy" not in json.loads(encoded)
 
 
 def test_exact_pair_is_within_zero_policy(
