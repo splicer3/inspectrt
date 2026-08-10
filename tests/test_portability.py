@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, replace
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
@@ -12,6 +13,12 @@ import torch
 
 import inspectrt.portability as portability
 from inspectrt.artifacts import BaselineRunMetadata, persist_baseline_run
+from inspectrt.benchmark import (
+    BaselineBenchmark,
+    _methodology as _timing_methodology,
+    _timing_component,
+    _workload as _timing_workload,
+)
 from inspectrt.data import MvtecSample
 from inspectrt.evaluation import CategoryEvaluation, MvtecSampleObservation
 from inspectrt.metrics import compute_threshold_free_metrics
@@ -35,11 +42,17 @@ from inspectrt.portability import (
     ScientificExecutionAttempt,
     ScientificGenerator,
     SourceFileSnapshot,
+    TimingBundle,
+    build_portability_performance_v2,
     compare_scientific_bundles,
+    encode_portability_performance_v2,
     encode_scientific_comparison,
     load_comparable_bundle,
     load_portability_environment_map,
     load_portability_policy,
+    load_portability_scientific_identity,
+    load_timing_bundle,
+    publish_portability_performance_v2,
     publish_portability_records,
 )
 
@@ -61,6 +74,7 @@ _ACCEPTED_LOCK_SHA256 = (
 _ACCEPTED_WEIGHT_SHA256 = (
     "11ad3fa62ca79e40addfd354a8ec4b7c75143b3038b8d2a807fbc68deab379ca"
 )
+_INVENTORY_SHA256 = "022df1a49e0f1ab33d57696db2ed667a9603b493d838f4e2f2a850fd95a581c3"
 
 
 def _observation(
@@ -2834,3 +2848,486 @@ def test_publication_rejects_absolute_paths_in_canonical_payloads(
     _, performance = _publication_bytes(scientific)
     with pytest.raises(ComparisonValidationError, match="private path"):
         publish_portability_records(scientific, performance, tmp_path / "comparison")
+
+
+_TIMING_MATRIX = (
+    (
+        "p53-linux-t1000-cuda-reference",
+        "reference",
+        "Ubuntu 24.04.4",
+        "native",
+        "NVIDIA Quadro T1000",
+        "cuda:0",
+    ),
+    (
+        "p53-linux-t1000-cuda-control",
+        "same_stack_control",
+        "Ubuntu 24.04.4",
+        "native",
+        "NVIDIA Quadro T1000",
+        "cuda:0",
+    ),
+    (
+        "p53-linux-cpu",
+        "calibration",
+        "Ubuntu 24.04.4",
+        "native",
+        "Intel Core i7-9850H CPU",
+        "cpu",
+    ),
+    (
+        "rtx4080-wsl2-cuda",
+        "calibration",
+        "Ubuntu 24.04.4 under WSL 2",
+        "wsl2",
+        "NVIDIA GeForce RTX 4080 SUPER",
+        "cuda:0",
+    ),
+    (
+        "m1pro-macos-cpu",
+        "holdout",
+        "macOS 26.5.2 build 25F84 arm64",
+        "native",
+        "Apple M1 Pro CPU",
+        "cpu",
+    ),
+    (
+        "m1pro-macos-mps",
+        "post_policy_attempt",
+        "macOS 26.5.2 build 25F84 arm64",
+        "native",
+        "Apple M1 Pro integrated GPU",
+        "mps",
+    ),
+)
+_TIMING_RUN_IDS = (
+    "ptv2-bottle-p53-linux-t1000-cuda-reference-r01-4f23067",
+    "ptv2-bottle-p53-linux-t1000-cuda-control-r01-4f23067",
+    "ptv2-bottle-p53-linux-cpu-r01-4f23067",
+    "ptv2-bottle-rtx4080-wsl2-cuda-r01-4f23067",
+    "ptv2-bottle-m1pro-macos-cpu-r01-4f23067",
+    "ptv2-bottle-m1pro-macos-mps-r01-4f23067",
+)
+
+
+def _timing_environment(device: str, hardware: str) -> dict[str, object]:
+    if device == "cpu":
+        return {"kind": "cpu", "properties": {}}
+    if device == "mps":
+        return {
+            "kind": "mps",
+            "properties": {
+                "available": True,
+                "built": True,
+                "pytorch_enable_mps_fallback": "unset",
+            },
+        }
+    return {
+        "kind": "cuda",
+        "properties": {
+            "available": True,
+            "compute_capability": [
+                8 if "RTX 4080" in hardware else 7,
+                9 if "RTX 4080" in hardware else 5,
+            ],
+            "device_index": 0,
+            "device_name": (
+                hardware if "RTX 4080" in hardware else hardware.removeprefix("NVIDIA ")
+            ),
+            "pytorch_cuda_runtime_version": "13.0",
+        },
+    }
+
+
+def _timing_memory(device: str) -> dict[str, object]:
+    if device == "cpu":
+        return {"host_peak_memory": "not_measured", "kind": "cpu"}
+    if device.startswith("cuda:"):
+        return {
+            "kind": "cuda",
+            "peak_allocated_bytes": 438_304_768,
+            "peak_reserved_bytes": 438_304_768,
+            "peak_window": "after_warmups_through_all_measured_passes",
+        }
+    return {
+        "kind": "mps",
+        "observations": [
+            {
+                "boundary": boundary,
+                "current_allocated_bytes": 1,
+                "driver_allocated_bytes": 2,
+            }
+            for boundary in (
+                "after_setup",
+                "after_warmups",
+                "after_measured_passes",
+            )
+        ],
+        "peak_memory": "not_available_in_selected_pytorch_api",
+        "recommended_max_memory_bytes": 3,
+    }
+
+
+def _timing_bundle_value(index: int) -> tuple[dict[str, object], dict[str, object]]:
+    _, _, _, _, hardware, device = _TIMING_MATRIX[index]
+    run_id = _TIMING_RUN_IDS[index]
+    created = f"2026-08-09T21:{index:02d}:00.000000Z"
+    repeated = list(range(30))
+    result = {
+        "memory_observations": _timing_memory(device),
+        "one_off": {
+            name: _timing_component([value])
+            for name, value in (
+                ("model_and_weight_load", 1),
+                ("full_nominal_bank_build", 2),
+                ("bank_transfer_and_device_setup", 3),
+            )
+        },
+        "repeated_stages": {
+            name: _timing_component(repeated)
+            for name in (
+                "image_decode",
+                "canonical_image_preprocessing",
+                "host_to_device_transfer",
+                "frozen_feature_extraction",
+                "exact_chunked_retrieval",
+                "anomaly_map_reconstruction",
+            )
+        },
+        "synchronized_end_to_end": _timing_component(repeated),
+    }
+    benchmark = BaselineBenchmark(
+        schema_version=2,
+        profile_id="inspectrt_feature_memory_v1",
+        category="bottle",
+        device=device,
+        benchmark_sample_id="mvtec_ad/bottle/test/broken_large/000.png",
+        run_id=run_id,
+        created_at_utc=created,
+        workload=_timing_workload(),
+        methodology=_timing_methodology(),
+        environment=_timing_environment(device, hardware),
+        results=result,
+    ).to_json_value()
+    run = {
+        "bank_chunk_size": 16384,
+        "batch_size": 1,
+        "benchmark": {
+            "artifact": "benchmark.json",
+            "present": True,
+            "schema_version": 2,
+            "timing_device": device,
+        },
+        "category": "bottle",
+        "dataset_root": "/private/test-data",
+        "determinism": {
+            "allow_tf32": False,
+            "cublas_workspace_config": ":4096:8",
+            "cudnn_benchmark": False,
+            "deterministic_algorithms_warn_only": False,
+            "fp32_precision": "ieee",
+            "numpy_seed": 0,
+            "python_random_seed": 0,
+            "torch_cpu_seed": 0,
+            "torch_cuda_seed_all": 0 if device.startswith("cuda:") else None,
+            "use_deterministic_algorithms": True,
+        },
+        "device": device,
+        "environment": {
+            "created_at_utc": created,
+            "dependency_versions": {
+                "inspectrt": "0.1.0",
+                "numpy": "2.4.6",
+                "pillow": "12.3.0",
+                "scikit-learn": "1.9.0",
+                "torch": "2.13.0",
+                "torchvision": "0.28.0",
+            },
+            "platform_description": "Synthetic platform",
+            "python_version": "3.11.15",
+        },
+        "feature_extractor": "ResNet-50",
+        "feature_layer": "layer2",
+        "inventory": {
+            "anomalous_test_sample_count": 63,
+            "sample_inventory_sha256": _INVENTORY_SHA256,
+            "test_good_sample_count": 20,
+            "test_sample_count": 83,
+            "total_sample_count": 292,
+            "training_sample_count": 209,
+        },
+        "map_interpolation": portability._MAP_INTERPOLATION,
+        "preprocessing_profile": "inspectrt_resize256_v1",
+        "profile_id": "inspectrt_feature_memory_v1",
+        "retrieval_semantics": "exact top-1 squared L2",
+        "run_id": run_id,
+        "schema_version": 1,
+        "source": {
+            "dirty": False,
+            "git_commit": "4f230679d52b5ed08e43230ebb1308cb85a33e57",
+            "uv_lock_sha256": (
+                "4464c375e3bf0f9c575504b427a0e82aedc954ef3491807306b72c382ce07d5c"
+            ),
+        },
+        "tensors": {
+            "anomaly_maps": {"dtype": "float32", "shape": [83, 256, 256]},
+            "evaluation_masks": {"dtype": "uint8", "shape": [83, 256, 256]},
+            "image_scores": {"dtype": "float32", "shape": [83]},
+            "memory_bank": {
+                "byte_count": 438304768,
+                "dtype": "float32",
+                "shape": [214016, 512],
+            },
+            "nearest_bank_indices": {"dtype": "int64", "shape": [83, 1024]},
+            "patch_distances": {"dtype": "float32", "shape": [83, 1024]},
+            "test_labels": {"dtype": "uint8", "shape": [83]},
+        },
+        "weights": {
+            "cached_file_sha256": _ACCEPTED_WEIGHT_SHA256,
+            "enum": "ResNet50_Weights.IMAGENET1K_V2",
+            "source_url": ("https://download.pytorch.org/models/resnet50-11ad3fa6.pth"),
+        },
+    }
+    return run, benchmark
+
+
+def _write_timing_bundle(root: Path, index: int) -> Path:
+    run, benchmark = _timing_bundle_value(index)
+    path = root / _TIMING_RUN_IDS[index]
+    path.mkdir(parents=True)
+    for name in _EVALUATION_FILES:
+        (path / name).write_bytes(f"synthetic-{name}\n".encode())
+    _write_json(path / "run.json", run)
+    _write_json(path / "benchmark.json", benchmark)
+    return path
+
+
+def _timing_inputs(
+    tmp_path: Path,
+) -> tuple[
+    Mapping[str, object],
+    PortabilityPolicy,
+    portability.PortabilityEnvironmentMap,
+    tuple[TimingBundle, ...],
+]:
+    root = Path(__file__).resolve().parents[1]
+    environment_map_path = tmp_path / "environment-map.json"
+    _write_json(
+        environment_map_path,
+        {
+            "attempts": [],
+            "candidates": [
+                {
+                    "environment_id": item[0],
+                    "policy_role": item[1],
+                    "os_label": item[2],
+                    "execution_layer": item[3],
+                    "hardware_label": item[4],
+                    "requested_device": item[5],
+                }
+                for item in _TIMING_MATRIX[1:]
+            ],
+            "reference": {
+                "environment_id": _TIMING_MATRIX[0][0],
+                "policy_role": _TIMING_MATRIX[0][1],
+                "os_label": _TIMING_MATRIX[0][2],
+                "execution_layer": _TIMING_MATRIX[0][3],
+                "hardware_label": _TIMING_MATRIX[0][4],
+                "requested_device": _TIMING_MATRIX[0][5],
+            },
+            "schema_id": "inspectrt_portability_environment_map_v1",
+            "schema_version": 1,
+        },
+    )
+    bundle_root = tmp_path / "bundles"
+    paths = tuple(_write_timing_bundle(bundle_root, index) for index in range(6))
+    return (
+        load_portability_scientific_identity(
+            root / "docs/evidence/inspectrt_cross_platform_evidence_v1/scientific.json"
+        ),
+        load_portability_policy(root / "configs/portability_policy.json"),
+        load_portability_environment_map(environment_map_path),
+        tuple(load_timing_bundle(path) for path in paths),
+    )
+
+
+def _build_timing_performance(
+    inputs: tuple[
+        Mapping[str, object],
+        PortabilityPolicy,
+        portability.PortabilityEnvironmentMap,
+        tuple[TimingBundle, ...],
+    ],
+    bundles: Sequence[TimingBundle] | None = None,
+) -> Mapping[str, object]:
+    scientific, policy, environment_map, loaded = inputs
+    return build_portability_performance_v2(
+        scientific,
+        policy,
+        environment_map,
+        loaded if bundles is None else bundles,
+        generator=ScientificGenerator("a" * 40, True),
+    )
+
+
+def test_timing_v2_loads_and_aggregates_without_tensor_deserialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        portability.torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("timing loader deserialized a tensor"),
+    )
+    inputs = _timing_inputs(tmp_path)
+    performance = _build_timing_performance(inputs)
+    encoded = encode_portability_performance_v2(performance)
+    loaded = json.loads(encoded)
+
+    assert set(loaded) == {
+        "environment_order",
+        "generator",
+        "limitations",
+        "milestone_id",
+        "performance_id",
+        "policy",
+        "runs",
+        "schema_id",
+        "schema_version",
+        "scientific",
+        "status",
+        "timing_harness",
+        "timing_methodology",
+        "workload",
+    }
+    assert loaded["environment_order"] == [item[0] for item in _TIMING_MATRIX]
+    assert loaded["runs"][3]["environment"]["execution_layer"] == "wsl2"
+    assert (
+        loaded["runs"][5]["environment"]["backend"]["properties"][
+            "pytorch_enable_mps_fallback"
+        ]
+        == "unset"
+    )
+    assert (
+        len(
+            loaded["runs"][0]["measurements"]["repeated_stages"]["image_decode"][
+                "raw_ns"
+            ]
+        )
+        == 30
+    )
+    assert "/private/test-data" not in encoded.decode()
+    assert all(str(bundle.path) not in encoded.decode() for bundle in inputs[3])
+
+
+def test_performance_v2_rejects_incomplete_duplicate_extra_and_reordered_matrix(
+    tmp_path: Path,
+) -> None:
+    inputs = _timing_inputs(tmp_path)
+    bundles = inputs[3]
+    scenarios = (
+        bundles[:-1],
+        (bundles[0], bundles[0], *bundles[2:]),
+        (*bundles, bundles[0]),
+        (bundles[1], bundles[0], *bundles[2:]),
+    )
+    for scenario in scenarios:
+        with pytest.raises(ComparisonValidationError, match="six-run matrix"):
+            _build_timing_performance(inputs, scenario)
+
+
+def test_performance_v2_rejects_common_provenance_runtime_and_contract_mismatch(
+    tmp_path: Path,
+) -> None:
+    inputs = _timing_inputs(tmp_path)
+    bundles = inputs[3]
+    methodology = dict(bundles[1].methodology)
+    methodology["repeat_count"] = 29
+    workload = dict(bundles[1].workload)
+    workload["Q"] = 1
+    dependencies = dict(bundles[1].dependency_versions)
+    dependencies["numpy"] = "0.0.0"
+    replacements = (
+        {"source_commit": "b" * 40},
+        {"uv_lock_sha256": "c" * 64},
+        {"dependency_versions": dependencies},
+        {"methodology": methodology},
+        {"workload": workload},
+    )
+    for changes in replacements:
+        scenario = (bundles[0], replace(bundles[1], **changes), *bundles[2:])
+        with pytest.raises(ComparisonValidationError, match="mismatch"):
+            _build_timing_performance(inputs, scenario)
+
+
+def test_timing_v2_rejects_schema_one(tmp_path: Path) -> None:
+    path = _write_timing_bundle(tmp_path, 0)
+    run = _json(path / "run.json")
+    run["benchmark"]["schema_version"] = 1
+    benchmark = _json(path / "benchmark.json")
+    benchmark["schema_version"] = 1
+    _write_json(path / "run.json", run)
+    _write_json(path / "benchmark.json", benchmark)
+    with pytest.raises(BundleValidationError):
+        load_timing_bundle(path)
+
+
+def test_timing_v2_rejects_raw_summary_mismatch_and_changed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_timing_bundle(tmp_path / "summary", 0)
+    benchmark = _json(path / "benchmark.json")
+    benchmark["results"]["repeated_stages"]["image_decode"]["summary_ns"]["p50"] = -1.0
+    _write_json(path / "benchmark.json", benchmark)
+    with pytest.raises(BundleValidationError, match="raw_ns"):
+        load_timing_bundle(path)
+
+    changed_path = _write_timing_bundle(tmp_path / "changed", 0)
+    snapshot = portability._snapshot_sources
+    calls = 0
+
+    def change_after_snapshot(
+        bundle_path: Path, names: tuple[str, ...]
+    ) -> tuple[SourceFileSnapshot, ...]:
+        nonlocal calls
+        result = snapshot(bundle_path, names)
+        calls += 1
+        if calls == 1:
+            (bundle_path / "metrics.json").write_bytes(b"changed\n")
+        return result
+
+    monkeypatch.setattr(portability, "_snapshot_sources", change_after_snapshot)
+    with pytest.raises(BundleValidationError, match="changed"):
+        load_timing_bundle(changed_path)
+
+
+def test_performance_v2_encoding_and_publication_are_deterministic_and_atomic(
+    tmp_path: Path,
+) -> None:
+    inputs = _timing_inputs(tmp_path)
+    first = encode_portability_performance_v2(_build_timing_performance(inputs))
+    second = encode_portability_performance_v2(_build_timing_performance(inputs))
+    output = tmp_path / "performance_v2.json"
+
+    assert first == second == _canonical(json.loads(first))
+    assert publish_portability_performance_v2(first, output) == output
+    assert output.read_bytes() == first
+    with pytest.raises(FileExistsError):
+        publish_portability_performance_v2(first, output)
+
+
+def test_performance_v2_rejects_private_or_nonreviewed_environment(
+    tmp_path: Path,
+) -> None:
+    inputs = _timing_inputs(tmp_path)
+    with pytest.raises(ComparisonValidationError):
+        replace(inputs[2].reference, hardware_label="host p53.internal")
+    public_but_wrong = replace(inputs[2].reference, hardware_label="Different GPU")
+    environment_map = replace(inputs[2], reference=public_but_wrong)
+    with pytest.raises(ComparisonValidationError, match="reviewed six-row"):
+        build_portability_performance_v2(
+            inputs[0],
+            inputs[1],
+            environment_map,
+            inputs[3],
+            generator=ScientificGenerator("a" * 40, True),
+        )

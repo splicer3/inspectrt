@@ -161,6 +161,14 @@ def _argument_parser() -> argparse.ArgumentParser:
     compare.add_argument("--environment-map", required=True, type=Path)
     compare.add_argument("--policy", type=Path)
     compare.add_argument("--output", required=True, type=Path)
+    performance = portability_commands.add_parser(
+        "performance", help="aggregate reviewed synchronized timing bundles"
+    )
+    performance.add_argument("--scientific", required=True, type=Path)
+    performance.add_argument("--policy", required=True, type=Path)
+    performance.add_argument("--environment-map", required=True, type=Path)
+    performance.add_argument("--timing-run", required=True, action="append", type=Path)
+    performance.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -188,7 +196,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
     try:
         if arguments.command == "portability":
-            return _compare_portability(arguments)
+            return (
+                _compare_portability(arguments)
+                if arguments.portability_command == "compare"
+                else _performance_portability(arguments)
+            )
         if arguments.command == "fixture":
             if arguments.fixture_command == "validate":
                 return _validate_fixture(arguments)
@@ -231,6 +243,48 @@ def _compare_portability(arguments: argparse.Namespace) -> int:
     print(f"performance_included={len(performance.included_runs)}")
     print(f"performance_excluded={len(performance.excluded_candidates)}")
     print(f"mode={'policy' if comparison.policy is not None else 'observation'}")
+    print("status=published")
+    return 0
+
+
+def _performance_portability(arguments: argparse.Namespace) -> int:
+    from inspectrt.portability import (
+        ScientificGenerator,
+        build_portability_performance_v2,
+        encode_portability_performance_v2,
+        load_portability_environment_map,
+        load_portability_policy,
+        load_portability_scientific_identity,
+        load_timing_bundle,
+        publish_portability_performance_v2,
+    )
+
+    if len(arguments.timing_run) != 6:
+        raise ValueError("--timing-run must occur exactly six times")
+    resolved_output = arguments.output.resolve(strict=False)
+    if any(
+        resolved_output.is_relative_to(path.resolve(strict=False))
+        for path in arguments.timing_run
+    ):
+        raise ValueError("--output must be outside source timing bundles")
+    _, commit, dirty, _ = _repository_metadata(Path.cwd())
+    scientific = load_portability_scientific_identity(arguments.scientific)
+    policy = load_portability_policy(arguments.policy)
+    environment_map = load_portability_environment_map(arguments.environment_map)
+    bundles = tuple(load_timing_bundle(path) for path in arguments.timing_run)
+    performance = build_portability_performance_v2(
+        scientific,
+        policy,
+        environment_map,
+        bundles,
+        generator=ScientificGenerator(commit, dirty),
+    )
+    payload = encode_portability_performance_v2(performance)
+    publish_portability_performance_v2(payload, arguments.output)
+    print(f"performance_id={performance['performance_id']}")
+    print("runs=6")
+    print(f"byte_count={len(payload)}")
+    print(f"sha256={hashlib.sha256(payload).hexdigest()}")
     print("status=published")
     return 0
 

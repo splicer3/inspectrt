@@ -199,7 +199,7 @@ def test_command_help_succeeds(arguments: tuple[str, ...], expected: str) -> Non
     (
         ("--help",),
         ("portability", "--help"),
-        ("portability", "compare", "--help"),
+        ("portability", "performance", "--help"),
     ),
 )
 def test_portability_help_does_not_load_runtime_modules(
@@ -231,9 +231,11 @@ def test_portability_command_help_and_action_surface() -> None:
     root = _console("--help")
     group = _console("portability", "--help")
     compare = _console("portability", "compare", "--help")
+    performance = _console("portability", "performance", "--help")
     assert root.returncode == group.returncode == compare.returncode == 0
+    assert performance.returncode == 0
     assert "portability" in root.stdout
-    assert "{compare}" in group.stdout
+    assert "{compare,performance}" in group.stdout
     for argument in (
         "--reference-run",
         "--candidate-run",
@@ -242,6 +244,14 @@ def test_portability_command_help_and_action_surface() -> None:
         "--output",
     ):
         assert argument in compare.stdout
+    for argument in (
+        "--scientific",
+        "--policy",
+        "--environment-map",
+        "--timing-run",
+        "--output",
+    ):
+        assert argument in performance.stdout
     graph = _console("portability", "graph")
     assert graph.returncode == 2
     assert "invalid choice" in graph.stderr
@@ -487,6 +497,95 @@ def test_portability_success_prints_only_the_bounded_summary(
         "status=published",
     ]
     assert str(command.private_root) not in output
+
+
+def test_portability_performance_routes_six_runs_and_has_one_error_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import inspectrt.portability as portability
+
+    paths = tuple(tmp_path / f"run-{index}" for index in range(6))
+    scientific_path = tmp_path / "scientific.json"
+    policy_path = tmp_path / "policy.json"
+    environment_path = tmp_path / "environment.json"
+    output = tmp_path / "performance_v2.json"
+    scientific = {"scientific": "identity"}
+    policy = object()
+    environment = object()
+    bundles = tuple(object() for _ in paths)
+    performance = {"performance_id": "d" * 64}
+    payload = b'{"performance_id":"' + b"d" * 64 + b'"}\n'
+    load_scientific = Mock(return_value=scientific)
+    load_policy = Mock(return_value=policy)
+    load_environment = Mock(return_value=environment)
+    load_bundle = Mock(side_effect=bundles)
+    build = Mock(return_value=performance)
+    encode = Mock(return_value=payload)
+    publish = Mock()
+    monkeypatch.setattr(
+        portability, "load_portability_scientific_identity", load_scientific
+    )
+    monkeypatch.setattr(portability, "load_portability_policy", load_policy)
+    monkeypatch.setattr(
+        portability, "load_portability_environment_map", load_environment
+    )
+    monkeypatch.setattr(portability, "load_timing_bundle", load_bundle)
+    monkeypatch.setattr(portability, "build_portability_performance_v2", build)
+    monkeypatch.setattr(portability, "encode_portability_performance_v2", encode)
+    monkeypatch.setattr(portability, "publish_portability_performance_v2", publish)
+    monkeypatch.setattr(
+        cli,
+        "_repository_metadata",
+        lambda cwd: (_ROOT, "a" * 40, True, "b" * 64),
+    )
+    arguments = [
+        "portability",
+        "performance",
+        "--scientific",
+        str(scientific_path),
+        "--policy",
+        str(policy_path),
+        "--environment-map",
+        str(environment_path),
+    ]
+    for path in paths:
+        arguments.extend(("--timing-run", str(path)))
+    arguments.extend(("--output", str(output)))
+
+    assert cli.main(arguments) == 0
+    assert [call.args[0] for call in load_bundle.call_args_list] == list(paths)
+    build.assert_called_once_with(
+        scientific,
+        policy,
+        environment,
+        bundles,
+        generator=portability.ScientificGenerator("a" * 40, True),
+    )
+    publish.assert_called_once_with(payload, output)
+    assert capsys.readouterr().out.splitlines() == [
+        f"performance_id={'d' * 64}",
+        "runs=6",
+        f"byte_count={len(payload)}",
+        f"sha256={hashlib.sha256(payload).hexdigest()}",
+        "status=published",
+    ]
+
+    inside_bundle = [*arguments[:-1], str(paths[0] / "performance_v2.json")]
+    assert cli.main(inside_bundle) == 1
+    assert capsys.readouterr().err == (
+        "inspectrt portability performance failed: "
+        "--output must be outside source timing bundles\n"
+    )
+
+    load_scientific.side_effect = ValueError("scientific identity mismatch")
+    assert cli.main(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "inspectrt portability performance failed: scientific identity mismatch\n"
+    )
 
 
 def test_fixture_command_help_and_action_surface() -> None:

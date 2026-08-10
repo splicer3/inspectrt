@@ -20,7 +20,7 @@ import torch
 from torch import Tensor
 
 from inspectrt.artifacts import _canonical_json, _rename_without_overwrite
-from inspectrt.benchmark import _methodology
+from inspectrt.benchmark import BaselineBenchmark, _methodology
 from inspectrt.data import MvtecSample
 from inspectrt.metrics import (
     ThresholdFreeMetrics,
@@ -57,14 +57,20 @@ __all__ = (
     "ScientificGenerator",
     "ScientificRunIdentity",
     "SourceFileSnapshot",
+    "TimingBundle",
     "build_portability_performance",
+    "build_portability_performance_v2",
     "compare_scientific_bundles",
     "encode_portability_performance",
+    "encode_portability_performance_v2",
     "encode_scientific_comparison",
     "load_comparable_bundle",
     "load_portability_environment_map",
     "load_portability_policy",
+    "load_portability_scientific_identity",
+    "load_timing_bundle",
     "publish_portability_comparison",
+    "publish_portability_performance_v2",
     "publish_portability_records",
 )
 
@@ -197,6 +203,91 @@ _MILESTONE_ID = "inspectrt_cross_platform_evidence_v1"
 _ENVIRONMENT_MAP_SCHEMA_ID = "inspectrt_portability_environment_map_v1"
 _POLICY_SCHEMA_ID = "inspectrt_portability_policy_v1"
 _PERFORMANCE_SCHEMA_ID = "inspectrt_portability_performance_v1"
+_PERFORMANCE_V2_SCHEMA_ID = "inspectrt_portability_performance_v2"
+_PERFORMANCE_V2_MILESTONE_ID = "inspectrt_portable_timing_v2"
+_TIMING_HARNESS_COMMIT = "4f230679d52b5ed08e43230ebb1308cb85a33e57"
+_TIMING_HARNESS_LOCK = (
+    "4464c375e3bf0f9c575504b427a0e82aedc954ef3491807306b72c382ce07d5c"
+)
+_SCIENTIFIC_JSON_SHA256 = (
+    "81318cd81c0e5f23be953719c2bb03604c22c75bb8c1dd17c389786623d32b8a"
+)
+_SCIENTIFIC_COMPARISON_ID = (
+    "1dec773f2d237598305a315145bec7bc40b9f94fbd326ed44f6330d3c9a11fe5"
+)
+_POLICY_ID = "inspectrt-bottle-bc330b9-v1"
+_POLICY_SHA256 = "576717b70e53714eed8370619cc08c81517405728f767942298b0c8c415836a2"
+_CONFIGURATION_SHA256 = (
+    "8df093df5eb8e35f77e0e8c088746b34fe69023f115f89fb822a5682d66cdfb6"
+)
+_INVENTORY_SHA256 = "022df1a49e0f1ab33d57696db2ed667a9603b493d838f4e2f2a850fd95a581c3"
+_BENCHMARK_SAMPLE_ID = "mvtec_ad/bottle/test/broken_large/000.png"
+_BENCHMARK_SOURCE_SHA256 = (
+    "11a691a06a33dd78c5fcab6a822caa48c0d72f27f660e19f5abd9b5aa392b0eb"
+)
+_TIMING_RUN_IDS = (
+    "ptv2-bottle-p53-linux-t1000-cuda-reference-r01-4f23067",
+    "ptv2-bottle-p53-linux-t1000-cuda-control-r01-4f23067",
+    "ptv2-bottle-p53-linux-cpu-r01-4f23067",
+    "ptv2-bottle-rtx4080-wsl2-cuda-r01-4f23067",
+    "ptv2-bottle-m1pro-macos-cpu-r01-4f23067",
+    "ptv2-bottle-m1pro-macos-mps-r01-4f23067",
+)
+_TIMING_ENVIRONMENTS = (
+    (
+        "p53-linux-t1000-cuda-reference",
+        "reference",
+        "Ubuntu 24.04.4",
+        "native",
+        "NVIDIA Quadro T1000",
+        "cuda:0",
+    ),
+    (
+        "p53-linux-t1000-cuda-control",
+        "same_stack_control",
+        "Ubuntu 24.04.4",
+        "native",
+        "NVIDIA Quadro T1000",
+        "cuda:0",
+    ),
+    (
+        "p53-linux-cpu",
+        "calibration",
+        "Ubuntu 24.04.4",
+        "native",
+        "Intel Core i7-9850H CPU",
+        "cpu",
+    ),
+    (
+        "rtx4080-wsl2-cuda",
+        "calibration",
+        "Ubuntu 24.04.4 under WSL 2",
+        "wsl2",
+        "NVIDIA GeForce RTX 4080 SUPER",
+        "cuda:0",
+    ),
+    (
+        "m1pro-macos-cpu",
+        "holdout",
+        "macOS 26.5.2 build 25F84 arm64",
+        "native",
+        "Apple M1 Pro CPU",
+        "cpu",
+    ),
+    (
+        "m1pro-macos-mps",
+        "post_policy_attempt",
+        "macOS 26.5.2 build 25F84 arm64",
+        "native",
+        "Apple M1 Pro integrated GPU",
+        "mps",
+    ),
+)
+_TIMING_CUDA_IDENTITIES = {
+    0: ("Quadro T1000", (7, 5)),
+    1: ("Quadro T1000", (7, 5)),
+    3: ("NVIDIA GeForce RTX 4080 SUPER", (8, 9)),
+}
 _FLOAT_CHUNK_SIZE = 65_536
 _INDEX_MISMATCH_LIMIT = 16
 _FLOATING_COMPONENTS = (
@@ -299,6 +390,26 @@ class SourceFileSnapshot:
     name: str
     byte_count: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class TimingBundle:
+    """One validated schema-2 timing bundle without deserialized tensors."""
+
+    path: Path
+    run_metadata: Mapping[str, object]
+    benchmark_metadata: Mapping[str, object]
+    source_files: tuple[SourceFileSnapshot, ...]
+    run_id: str
+    source_commit: str
+    source_dirty: bool
+    uv_lock_sha256: str
+    dependency_versions: Mapping[str, object]
+    requested_device: str
+    methodology: Mapping[str, object]
+    workload: Mapping[str, object]
+    measurements: Mapping[str, object]
+    memory_observations: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -937,6 +1048,133 @@ def load_comparable_bundle(bundle_path: Path) -> ComparableBundle:
     )
 
 
+def load_timing_bundle(bundle_path: Path) -> TimingBundle:
+    """Load one strict benchmark-schema-2 bundle without loading tensor payloads."""
+    if not isinstance(bundle_path, Path):
+        raise TypeError("bundle_path must be a pathlib.Path")
+    path = _validate_bundle_directory(bundle_path)
+    kind, names = _classify_bundle(path)
+    if kind != "benchmark" or names != _BENCHMARK_FILES:
+        raise BundleValidationError("timing bundle must contain exactly eight files")
+    source_files = _snapshot_sources(path, names)
+    snapshots = {snapshot.name: snapshot for snapshot in source_files}
+    run = _parse_json(
+        _read_regular(path / "run.json", "run.json", snapshots["run.json"]),
+        "run.json",
+    )
+    benchmark = _parse_json(
+        _read_regular(
+            path / "benchmark.json",
+            "benchmark.json",
+            snapshots["benchmark.json"],
+        ),
+        "benchmark.json",
+    )
+    _validate_run(run, path.name, "benchmark", benchmark_schema=2)
+    try:
+        record = BaselineBenchmark(**benchmark)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as error:
+        raise BundleValidationError(f"benchmark.json: {error}") from error
+    _validate_timing_run_linkage(run, benchmark, record)
+
+    final_kind, final_names = _classify_bundle(path)
+    final_sources = _snapshot_sources(path, names)
+    if final_kind != kind or final_names != names or final_sources != source_files:
+        raise BundleValidationError("timing bundle changed during loading")
+
+    run_frozen = _freeze_json(run)
+    benchmark_frozen = _freeze_json(benchmark)
+    assert isinstance(run_frozen, Mapping) and isinstance(benchmark_frozen, Mapping)
+    source = _object(run["source"], "run.json.source")
+    environment = _object(run["environment"], "run.json.environment")
+    dependencies = _freeze_json(environment["dependency_versions"])
+    assert isinstance(dependencies, Mapping)
+    results = record.results
+    measurements = _freeze_json(
+        {
+            "one_off": results["one_off"],
+            "repeated_stages": results["repeated_stages"],
+            "synchronized_end_to_end": results["synchronized_end_to_end"],
+        }
+    )
+    assert isinstance(measurements, Mapping)
+    return TimingBundle(
+        path=path,
+        run_metadata=run_frozen,
+        benchmark_metadata=benchmark_frozen,
+        source_files=source_files,
+        run_id=record.run_id,
+        source_commit=source["git_commit"],  # type: ignore[arg-type]
+        source_dirty=source["dirty"],  # type: ignore[arg-type]
+        uv_lock_sha256=source["uv_lock_sha256"],  # type: ignore[arg-type]
+        dependency_versions=dependencies,
+        requested_device=record.device,
+        methodology=record.methodology,
+        workload=record.workload,
+        measurements=measurements,
+        memory_observations=results["memory_observations"],  # type: ignore[arg-type]
+    )
+
+
+def _validate_timing_run_linkage(
+    run: dict[str, object], benchmark: dict[str, object], record: BaselineBenchmark
+) -> None:
+    environment = _object(run["environment"], "run.json.environment")
+    links = {
+        "category": run["category"],
+        "created_at_utc": environment["created_at_utc"],
+        "device": run["device"],
+        "profile_id": run["profile_id"],
+        "run_id": run["run_id"],
+    }
+    for name, expected in links.items():
+        if benchmark[name] != expected:
+            raise BundleValidationError(f"benchmark.json.{name} must match run.json")
+    source = _object(run["source"], "run.json.source")
+    if source["dirty"] is not False:
+        raise BundleValidationError("timing bundle source must be clean")
+    expected_dependencies = {
+        "inspectrt": "0.1.0",
+        "numpy": "2.4.6",
+        "pillow": "12.3.0",
+        "scikit-learn": "1.9.0",
+        "torchvision": "0.28.0",
+    }
+    dependencies = _object(
+        environment["dependency_versions"],
+        "run.json.environment.dependency_versions",
+    )
+    if environment["python_version"] != "3.11.15" or any(
+        dependencies[name] != version for name, version in expected_dependencies.items()
+    ):
+        raise BundleValidationError("timing bundle runtime versions are not reviewed")
+    torch_version = dependencies["torch"]
+    if torch_version not in {"2.13.0", "2.13.0+cu130"}:
+        raise BundleValidationError("timing bundle PyTorch build is not reviewed")
+    backend = _object(benchmark["environment"], "benchmark.json.environment")
+    properties = _object(backend["properties"], "benchmark.json.environment.properties")
+    if record.device.startswith("cuda:"):
+        if properties.get("pytorch_cuda_runtime_version") != "13.0":
+            raise BundleValidationError("Linux CUDA must use the reviewed cu130 build")
+    elif torch_version != "2.13.0":
+        raise BundleValidationError("non-CUDA timing must use PyTorch 2.13.0")
+    inventory = _object(run["inventory"], "run.json.inventory")
+    expected_inventory = {
+        "anomalous_test_sample_count": 63,
+        "sample_inventory_sha256": _INVENTORY_SHA256,
+        "test_good_sample_count": 20,
+        "test_sample_count": 83,
+        "total_sample_count": 292,
+        "training_sample_count": 209,
+    }
+    weights = _object(run["weights"], "run.json.weights")
+    if (
+        inventory != expected_inventory
+        or weights["cached_file_sha256"] != _ACCEPTED_WEIGHT_SHA256
+    ):
+        raise BundleValidationError("timing bundle scientific workload is not frozen")
+
+
 def load_portability_environment_map(path: Path) -> PortabilityEnvironmentMap:
     """Load one exact canonical sanitized environment map."""
     _, value = _load_canonical_input(path, "environment map")
@@ -1087,6 +1325,64 @@ def load_portability_policy(path: Path) -> PortabilityPolicy:
             len(payload), hashlib.sha256(payload).hexdigest()
         ),
     )
+
+
+def load_portability_scientific_identity(path: Path) -> Mapping[str, object]:
+    """Load the exact frozen scientific JSON and project only its identity."""
+    payload, value = _load_canonical_input(path, "scientific JSON")
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != _SCIENTIFIC_JSON_SHA256:
+        raise ComparisonValidationError("scientific JSON SHA-256 is not reviewed")
+    reference = _comparison_dict(value.get("reference"), "scientific reference")
+    run = _comparison_dict(reference.get("run"), "scientific reference run")
+    source = _comparison_dict(run.get("source"), "scientific reference source")
+    weights = _comparison_dict(run.get("weights"), "scientific reference weights")
+    inventory = _comparison_dict(run.get("inventory"), "scientific reference inventory")
+    benchmark = _comparison_dict(
+        run.get("benchmark_identity"), "scientific reference benchmark"
+    )
+    expected = (
+        value.get("schema_id") == _SCHEMA_ID,
+        value.get("schema_version") == 1,
+        value.get("comparison_id") == _SCIENTIFIC_COMPARISON_ID,
+        run.get("profile_id") == "inspectrt_feature_memory_v1",
+        run.get("category") == "bottle",
+        source.get("git_commit") == _SCIENTIFIC_SOURCE_COMMIT,
+        source.get("dirty") is False,
+        source.get("uv_lock_sha256") == _ACCEPTED_LOCK_SHA256,
+        weights.get("enum") == _WEIGHT_ENUM,
+        weights.get("cached_file_sha256") == _ACCEPTED_WEIGHT_SHA256,
+        inventory.get("sample_inventory_sha256") == _INVENTORY_SHA256,
+        benchmark.get("benchmark_sample_id") == _BENCHMARK_SAMPLE_ID,
+    )
+    if not all(expected):
+        raise ComparisonValidationError("scientific JSON identity is not frozen")
+    identity = {
+        "accepted_lock_sha256": _ACCEPTED_LOCK_SHA256,
+        "benchmark_sample": {
+            "sample_id": _BENCHMARK_SAMPLE_ID,
+            "source_image_sha256": _BENCHMARK_SOURCE_SHA256,
+        },
+        "category": "bottle",
+        "comparison_id": _SCIENTIFIC_COMPARISON_ID,
+        "configuration_sha256": _CONFIGURATION_SHA256,
+        "inventory_sha256": _INVENTORY_SHA256,
+        "profile_id": "inspectrt_feature_memory_v1",
+        "scientific_json": {
+            "byte_count": len(payload),
+            "schema_id": _SCHEMA_ID,
+            "schema_version": 1,
+            "sha256": digest,
+        },
+        "source_commit": _SCIENTIFIC_SOURCE_COMMIT,
+        "weight_identity": {
+            "enum": _WEIGHT_ENUM,
+            "sha256": _ACCEPTED_WEIGHT_SHA256,
+        },
+    }
+    frozen = _freeze_json(identity)
+    assert isinstance(frozen, Mapping)
+    return frozen
 
 
 def compare_scientific_bundles(
@@ -1425,6 +1721,438 @@ def encode_portability_performance(performance: PortabilityPerformance) -> bytes
         ) from error
 
 
+def build_portability_performance_v2(
+    scientific: Mapping[str, object],
+    policy: PortabilityPolicy,
+    environment_map: PortabilityEnvironmentMap,
+    timing_bundles: Sequence[TimingBundle],
+    *,
+    generator: ScientificGenerator,
+) -> Mapping[str, object]:
+    """Aggregate the reviewed six-run timing matrix without scientific policy use."""
+    if (
+        type(policy) is not PortabilityPolicy
+        or type(generator) is not ScientificGenerator
+    ):
+        raise ComparisonValidationError("performance v2 policy or generator is invalid")
+    if type(environment_map) is not PortabilityEnvironmentMap:
+        raise ComparisonValidationError("performance v2 environment map is invalid")
+    descriptors = (environment_map.reference, *environment_map.candidates)
+    actual_environments = tuple(
+        (
+            item.environment_id,
+            item.policy_role,
+            item.os_label,
+            item.execution_layer,
+            item.hardware_label,
+            item.requested_device,
+        )
+        for item in descriptors
+    )
+    if actual_environments != _TIMING_ENVIRONMENTS or environment_map.attempts:
+        raise ComparisonValidationError(
+            "environment map must be the reviewed six-row timing matrix"
+        )
+    bundles = _comparison_sequence(timing_bundles, TimingBundle, "timing bundles")
+    if (
+        len(bundles) != len(_TIMING_RUN_IDS)
+        or tuple(bundle.run_id for bundle in bundles) != _TIMING_RUN_IDS
+    ):
+        raise ComparisonValidationError(
+            "timing bundles must be the exact ordered reviewed six-run matrix"
+        )
+    common_methodology = _thaw_comparison_json(bundles[0].methodology)
+    common_workload = _thaw_comparison_json(bundles[0].workload)
+    common_dependencies = {
+        "python": _comparison_mapping(
+            bundles[0].run_metadata["environment"], "timing environment"
+        )["python_version"],
+        **_thaw_comparison_json(bundles[0].dependency_versions),
+    }
+    for index, (bundle, descriptor) in enumerate(
+        zip(bundles, descriptors, strict=True)
+    ):
+        run_environment = _comparison_mapping(
+            bundle.run_metadata["environment"], "timing environment"
+        )
+        dependencies = {
+            "python": run_environment["python_version"],
+            **_thaw_comparison_json(bundle.dependency_versions),
+        }
+        if (
+            bundle.source_dirty
+            or bundle.source_commit != _TIMING_HARNESS_COMMIT
+            or bundle.uv_lock_sha256 != _TIMING_HARNESS_LOCK
+            or bundle.requested_device != descriptor.requested_device
+            or _thaw_comparison_json(bundle.methodology) != common_methodology
+            or _thaw_comparison_json(bundle.workload) != common_workload
+            or dependencies != common_dependencies
+        ):
+            raise ComparisonValidationError(
+                f"{descriptor.environment_id}: timing provenance or workload mismatch"
+            )
+
+    scientific_value = _thaw_comparison_json(scientific)
+    runs = []
+    for bundle, descriptor in zip(bundles, descriptors, strict=True):
+        benchmark = _comparison_mapping(
+            bundle.benchmark_metadata, "timing benchmark metadata"
+        )
+        benchmark_snapshot = next(
+            snapshot
+            for snapshot in bundle.source_files
+            if snapshot.name == "benchmark.json"
+        )
+        runs.append(
+            {
+                "benchmark_artifact": {
+                    "byte_count": benchmark_snapshot.byte_count,
+                    "sha256": benchmark_snapshot.sha256,
+                },
+                "environment": {
+                    "backend": _thaw_comparison_json(benchmark["environment"]),
+                    "environment_id": descriptor.environment_id,
+                    "execution_layer": descriptor.execution_layer,
+                    "hardware_label": descriptor.hardware_label,
+                    "os_label": descriptor.os_label,
+                    "requested_device": descriptor.requested_device,
+                },
+                "measurements": _thaw_comparison_json(bundle.measurements),
+                "memory_observations": _thaw_comparison_json(
+                    bundle.memory_observations
+                ),
+                "run_id": bundle.run_id,
+                "source_files": [
+                    {
+                        "byte_count": snapshot.byte_count,
+                        "name": snapshot.name,
+                        "sha256": snapshot.sha256,
+                    }
+                    for snapshot in bundle.source_files
+                ],
+            }
+        )
+    value = {
+        "environment_order": [item[0] for item in _TIMING_ENVIRONMENTS],
+        "generator": _generator_value(generator),
+        "limitations": [
+            "host_power_and_thermal_conditions_uncontrolled",
+            "absolute_observations_only_no_cross_machine_inference",
+        ],
+        "milestone_id": _PERFORMANCE_V2_MILESTONE_ID,
+        "policy": {"policy_id": policy.policy_id, "sha256": policy.source.sha256},
+        "runs": runs,
+        "schema_id": _PERFORMANCE_V2_SCHEMA_ID,
+        "schema_version": 2,
+        "scientific": scientific_value,
+        "status": "descriptive_only",
+        "timing_harness": {
+            "dependency_versions": common_dependencies,
+            "dirty": False,
+            "source_commit": _TIMING_HARNESS_COMMIT,
+            "uv_lock_sha256": _TIMING_HARNESS_LOCK,
+        },
+        "timing_methodology": common_methodology,
+        "workload": common_workload,
+    }
+    value["performance_id"] = hashlib.sha256(
+        _canonical_json(_performance_v2_identity_payload(value))
+    ).hexdigest()
+    _validate_portability_performance_v2(value)
+    frozen = _freeze_json(value)
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def encode_portability_performance_v2(performance: Mapping[str, object]) -> bytes:
+    """Return canonical UTF-8 bytes for one performance-v2 record."""
+    value = _thaw_comparison_json(performance)
+    if type(value) is not dict:
+        raise ComparisonValidationError("performance v2 must be a mapping")
+    _validate_portability_performance_v2(value)
+    try:
+        return _canonical_json(value)
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise ComparisonValidationError(
+            "performance v2 cannot be canonically encoded"
+        ) from error
+
+
+def publish_portability_performance_v2(payload: bytes, output: Path) -> Path:
+    """Atomically publish one canonical performance-v2 file without overwrite."""
+    if type(payload) is not bytes or not isinstance(output, Path):
+        raise TypeError("performance publication requires bytes and a pathlib.Path")
+    value = _parse_json(payload, "performance_v2.json")
+    _validate_portability_performance_v2(value)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"output file already exists: {output}")
+    parent = output.parent
+    if not parent.is_dir() or parent.is_symlink():
+        raise ComparisonValidationError(
+            "output parent must be an existing real directory"
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.tmp-", dir=parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _rename_without_overwrite(temporary, output)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return output
+
+
+def _performance_v2_identity_payload(value: Mapping[str, object]) -> dict[str, object]:
+    runs = _comparison_list(value["runs"], "performance v2 runs")
+    return {
+        "benchmark_artifacts": [
+            {
+                "environment_id": _comparison_dict(run, "performance run")[
+                    "environment"
+                ]["environment_id"],  # type: ignore[index]
+                **_comparison_dict(
+                    _comparison_dict(run, "performance run")["benchmark_artifact"],
+                    "benchmark artifact",
+                ),
+            }
+            for run in runs
+        ],
+        "environment_order": value["environment_order"],
+        "milestone_id": value["milestone_id"],
+        "policy": value["policy"],
+        "schema_id": value["schema_id"],
+        "schema_version": value["schema_version"],
+        "scientific": value["scientific"],
+        "source_snapshots": [
+            {
+                "environment_id": _comparison_dict(run, "performance run")[
+                    "environment"
+                ]["environment_id"],  # type: ignore[index]
+                "source_files": _comparison_dict(run, "performance run")[
+                    "source_files"
+                ],
+            }
+            for run in runs
+        ],
+        "timing_harness": value["timing_harness"],
+        "timing_methodology": value["timing_methodology"],
+        "workload": value["workload"],
+    }
+
+
+def _validate_portability_performance_v2(value: Mapping[str, object]) -> None:
+    fields = {
+        "environment_order",
+        "generator",
+        "limitations",
+        "milestone_id",
+        "performance_id",
+        "policy",
+        "runs",
+        "schema_id",
+        "schema_version",
+        "scientific",
+        "status",
+        "timing_harness",
+        "timing_methodology",
+        "workload",
+    }
+    _comparison_keys(value, fields, "performance v2")
+    if (
+        value["schema_version"] != 2
+        or value["schema_id"] != _PERFORMANCE_V2_SCHEMA_ID
+        or value["milestone_id"] != _PERFORMANCE_V2_MILESTONE_ID
+        or value["status"] != "descriptive_only"
+        or value["environment_order"] != [item[0] for item in _TIMING_ENVIRONMENTS]
+    ):
+        raise ComparisonValidationError("performance v2 identity is invalid")
+    generator = _comparison_dict(value["generator"], "performance v2 generator")
+    _comparison_keys(generator, {"dirty", "source_commit"}, "performance v2 generator")
+    ScientificGenerator(generator["source_commit"], generator["dirty"])  # type: ignore[arg-type]
+    policy = _comparison_dict(value["policy"], "performance v2 policy")
+    if policy != {"policy_id": _POLICY_ID, "sha256": _POLICY_SHA256}:
+        raise ComparisonValidationError("performance v2 policy identity is invalid")
+    scientific = _comparison_dict(value["scientific"], "performance v2 scientific")
+    _comparison_keys(
+        scientific,
+        {
+            "accepted_lock_sha256",
+            "benchmark_sample",
+            "category",
+            "comparison_id",
+            "configuration_sha256",
+            "inventory_sha256",
+            "profile_id",
+            "scientific_json",
+            "source_commit",
+            "weight_identity",
+        },
+        "performance v2 scientific",
+    )
+    scientific_json = _comparison_dict(
+        scientific.get("scientific_json"), "performance v2 scientific JSON"
+    )
+    benchmark_sample = _comparison_dict(
+        scientific.get("benchmark_sample"), "performance v2 benchmark sample"
+    )
+    weight_identity = _comparison_dict(
+        scientific.get("weight_identity"), "performance v2 weight identity"
+    )
+    if (
+        scientific_json
+        != {
+            "byte_count": 57167,
+            "schema_id": _SCHEMA_ID,
+            "schema_version": 1,
+            "sha256": _SCIENTIFIC_JSON_SHA256,
+        }
+        or scientific.get("comparison_id") != _SCIENTIFIC_COMPARISON_ID
+        or scientific.get("profile_id") != "inspectrt_feature_memory_v1"
+        or scientific.get("category") != "bottle"
+        or scientific.get("source_commit") != _SCIENTIFIC_SOURCE_COMMIT
+        or scientific.get("accepted_lock_sha256") != _ACCEPTED_LOCK_SHA256
+        or scientific.get("configuration_sha256") != _CONFIGURATION_SHA256
+        or scientific.get("inventory_sha256") != _INVENTORY_SHA256
+        or benchmark_sample
+        != {
+            "sample_id": _BENCHMARK_SAMPLE_ID,
+            "source_image_sha256": _BENCHMARK_SOURCE_SHA256,
+        }
+        or weight_identity != {"enum": _WEIGHT_ENUM, "sha256": _ACCEPTED_WEIGHT_SHA256}
+    ):
+        raise ComparisonValidationError("performance v2 scientific identity is invalid")
+    harness = _comparison_dict(value["timing_harness"], "timing harness")
+    _comparison_keys(
+        harness,
+        {"dependency_versions", "dirty", "source_commit", "uv_lock_sha256"},
+        "timing harness",
+    )
+    if (
+        harness["dirty"] is not False
+        or harness["source_commit"] != _TIMING_HARNESS_COMMIT
+        or harness["uv_lock_sha256"] != _TIMING_HARNESS_LOCK
+        or harness["dependency_versions"]
+        != {
+            "inspectrt": "0.1.0",
+            "numpy": "2.4.6",
+            "pillow": "12.3.0",
+            "python": "3.11.15",
+            "scikit-learn": "1.9.0",
+            "torch": "2.13.0",
+            "torchvision": "0.28.0",
+        }
+    ):
+        raise ComparisonValidationError("timing harness identity is invalid")
+    runs = _comparison_list(value["runs"], "performance v2 runs")
+    if len(runs) != 6:
+        raise ComparisonValidationError("performance v2 must contain six runs")
+    for index, (run_value, expected_environment, run_id) in enumerate(
+        zip(runs, _TIMING_ENVIRONMENTS, _TIMING_RUN_IDS, strict=True)
+    ):
+        run = _comparison_dict(run_value, f"performance v2 runs[{index}]")
+        _comparison_keys(
+            run,
+            {
+                "benchmark_artifact",
+                "environment",
+                "measurements",
+                "memory_observations",
+                "run_id",
+                "source_files",
+            },
+            f"performance v2 runs[{index}]",
+        )
+        environment = _comparison_dict(run["environment"], "performance environment")
+        descriptor = {
+            "environment_id": expected_environment[0],
+            "os_label": expected_environment[2],
+            "execution_layer": expected_environment[3],
+            "hardware_label": expected_environment[4],
+            "requested_device": expected_environment[5],
+        }
+        if {key: environment.get(key) for key in descriptor} != descriptor or run[
+            "run_id"
+        ] != run_id:
+            raise ComparisonValidationError("performance v2 run order is invalid")
+        files = _comparison_list(run["source_files"], "performance source files")
+        if len(files) != len(_BENCHMARK_FILES):
+            raise ComparisonValidationError("performance source inventory is invalid")
+        snapshots = {}
+        for expected_name, item in zip(_BENCHMARK_FILES, files, strict=True):
+            snapshot = _comparison_dict(item, "performance source snapshot")
+            if (
+                set(snapshot) != {"byte_count", "name", "sha256"}
+                or snapshot["name"] != expected_name
+                or type(snapshot["byte_count"]) is not int
+                or snapshot["byte_count"] < 0
+                or type(snapshot["sha256"]) is not str
+                or not _SHA256.fullmatch(snapshot["sha256"])
+            ):
+                raise ComparisonValidationError(
+                    "performance source snapshot is invalid"
+                )
+            snapshots[expected_name] = snapshot
+        artifact = _comparison_dict(run["benchmark_artifact"], "benchmark artifact")
+        if artifact != {
+            "byte_count": snapshots["benchmark.json"]["byte_count"],
+            "sha256": snapshots["benchmark.json"]["sha256"],
+        }:
+            raise ComparisonValidationError("benchmark artifact identity is invalid")
+        measurements = _comparison_dict(run["measurements"], "measurements")
+        BaselineBenchmark(
+            schema_version=2,
+            profile_id="inspectrt_feature_memory_v1",
+            category="bottle",
+            device=descriptor["requested_device"],
+            benchmark_sample_id=_BENCHMARK_SAMPLE_ID,
+            run_id=run_id,
+            created_at_utc="validated",
+            workload=_comparison_dict(value["workload"], "performance workload"),
+            methodology=_comparison_dict(
+                value["timing_methodology"], "timing methodology"
+            ),
+            environment=_comparison_dict(environment["backend"], "timing backend"),
+            results={
+                **measurements,
+                "memory_observations": run["memory_observations"],
+            },
+        )
+        _validate_reviewed_timing_backend(environment["backend"], index)
+    limitations = _comparison_list(value["limitations"], "performance limitations")
+    if limitations != [
+        "host_power_and_thermal_conditions_uncontrolled",
+        "absolute_observations_only_no_cross_machine_inference",
+    ]:
+        raise ComparisonValidationError("performance limitations are invalid")
+    expected_id = hashlib.sha256(
+        _canonical_json(_performance_v2_identity_payload(value))
+    ).hexdigest()
+    if value["performance_id"] != expected_id:
+        raise ComparisonValidationError("performance ID differs from canonical inputs")
+    _reject_absolute_identity_values(value, "performance v2")
+
+
+def _validate_reviewed_timing_backend(value: object, index: int) -> None:
+    expected = _TIMING_CUDA_IDENTITIES.get(index)
+    if expected is None:
+        return
+    backend = _comparison_mapping(value, "timing backend")
+    properties = _comparison_mapping(
+        backend.get("properties"), "timing backend properties"
+    )
+    if (
+        backend.get("kind") != "cuda"
+        or properties.get("device_name") != expected[0]
+        or properties.get("compute_capability") not in (expected[1], list(expected[1]))
+    ):
+        raise ComparisonValidationError("timing CUDA backend identity is not reviewed")
+
+
 def publish_portability_records(
     scientific_bytes: bytes, performance_bytes: bytes, output: Path
 ) -> Path:
@@ -1748,6 +2476,8 @@ def _validate_run(
     run: dict[str, object],
     directory_name: str,
     kind: Literal["evaluation", "benchmark"],
+    *,
+    benchmark_schema: Literal[1, 2] = 1,
 ) -> torch.device:
     _keys(run, _RUN_FIELDS, "run.json")
     _equals(run["schema_version"], 1, "run.json.schema_version")
@@ -1899,13 +2629,22 @@ def _validate_run(
             )
     else:
         benchmark = _object(declaration, "run.json.benchmark")
+        benchmark_fields = {"artifact", "schema_version", "timing_device"}
+        if benchmark_schema == 2:
+            benchmark_fields.add("present")
         _keys(
             benchmark,
-            {"artifact", "schema_version", "timing_device"},
+            benchmark_fields,
             "run.json.benchmark",
         )
         _equals(benchmark["artifact"], "benchmark.json", "run.json.benchmark.artifact")
-        _equals(benchmark["schema_version"], 1, "run.json.benchmark.schema_version")
+        if benchmark_schema == 2:
+            _equals(benchmark["present"], True, "run.json.benchmark.present")
+        _equals(
+            benchmark["schema_version"],
+            benchmark_schema,
+            "run.json.benchmark.schema_version",
+        )
         _equals(
             benchmark["timing_device"],
             device_value,
