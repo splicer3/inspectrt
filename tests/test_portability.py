@@ -3143,7 +3143,7 @@ def _timing_inputs(
     paths = tuple(_write_timing_bundle(bundle_root, index) for index in range(6))
     return (
         load_portability_scientific_identity(
-            root / "docs/evidence/inspectrt_cross_platform_evidence_v1/scientific.json"
+            root / "docs/evidence/inspectrt_cross_platform_evidence_v2/scientific.json"
         ),
         load_portability_policy(root / "configs/portability_policy.json"),
         load_portability_environment_map(environment_map_path),

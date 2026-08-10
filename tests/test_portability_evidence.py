@@ -16,13 +16,13 @@ from scripts import render_portability_latency as renderer
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EVIDENCE = ROOT / "docs/evidence/inspectrt_cross_platform_evidence_v1"
+EVIDENCE = ROOT / "docs/evidence/inspectrt_cross_platform_evidence_v2"
 SCIENTIFIC_PATH = EVIDENCE / "scientific.json"
 PERFORMANCE_PATH = EVIDENCE / "performance.json"
 SVG_PATH = EVIDENCE / "latency.svg"
 POLICY_PATH = ROOT / "configs/portability_policy.json"
 SCIENTIFIC_SHA256 = "81318cd81c0e5f23be953719c2bb03604c22c75bb8c1dd17c389786623d32b8a"
-PERFORMANCE_SHA256 = "b8e57ac6098c89d11d002e797a6d7a79774c871e548f6fbf02d14ded786cb893"
+PERFORMANCE_SHA256 = "44057e5317b902341b1b359c0ff5a43f3900940115a206e1bd8ea2774adc85d9"
 COMPARISON_ID = "1dec773f2d237598305a315145bec7bc40b9f94fbd326ed44f6330d3c9a11fe5"
 POLICY_ID = "inspectrt-bottle-bc330b9-v1"
 POLICY_SHA256 = "576717b70e53714eed8370619cc08c81517405728f767942298b0c8c415836a2"
@@ -34,7 +34,10 @@ CANDIDATE_IDS = (
     "m1pro-macos-cpu",
     "m1pro-macos-mps",
 )
-TIMING_IDS = (REFERENCE_ID, *CANDIDATE_IDS[:-1])
+TIMING_IDS = (REFERENCE_ID, *CANDIDATE_IDS)
+AGGREGATION_COMMIT = "339b66848c5f47c3e03b0377df33315421fe96aa"
+TIMING_HARNESS_COMMIT = "4f230679d52b5ed08e43230ebb1308cb85a33e57"
+TIMING_HARNESS_LOCK = "4464c375e3bf0f9c575504b427a0e82aedc954ef3491807306b72c382ce07d5c"
 MISMATCHES = {
     "p53-linux-t1000-cuda-control": 0,
     "p53-linux-cpu": 3569,
@@ -72,6 +75,14 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def _percentile(raw: list[int], quantile: float) -> float:
+    ordered = sorted(raw)
+    rank = (len(ordered) - 1) * quantile
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
+
+
 def test_public_json_exists_and_loads_with_standard_library(
     evidence: tuple[bytes, bytes, dict[str, object], dict[str, object]],
 ) -> None:
@@ -86,7 +97,7 @@ def test_public_json_has_exact_reviewed_byte_identity(
     scientific_bytes, performance_bytes, _, _ = evidence
     assert len(scientific_bytes) == 57_167
     assert hashlib.sha256(scientific_bytes).hexdigest() == SCIENTIFIC_SHA256
-    assert len(performance_bytes) == 27_975
+    assert len(performance_bytes) == 36_530
     assert hashlib.sha256(performance_bytes).hexdigest() == PERFORMANCE_SHA256
 
 
@@ -94,11 +105,16 @@ def test_comparison_policy_and_hash_binding_are_exact(
     evidence: tuple[bytes, bytes, dict[str, object], dict[str, object]],
 ) -> None:
     scientific_bytes, _, scientific, performance = evidence
-    assert scientific["comparison_id"] == performance["comparison_id"] == COMPARISON_ID
+    assert scientific["comparison_id"] == COMPARISON_ID
+    assert performance["scientific"]["comparison_id"] == COMPARISON_ID
     assert scientific["policy"] == {"policy_id": POLICY_ID, "sha256": POLICY_SHA256}
-    assert (
-        performance["scientific_sha256"] == hashlib.sha256(scientific_bytes).hexdigest()
-    )
+    assert performance["policy"] == scientific["policy"]
+    assert performance["scientific"]["scientific_json"] == {
+        "byte_count": 57_167,
+        "schema_id": "inspectrt_portability_comparison_v1",
+        "schema_version": 1,
+        "sha256": hashlib.sha256(scientific_bytes).hexdigest(),
+    }
     assert hashlib.sha256(POLICY_PATH.read_bytes()).hexdigest() == POLICY_SHA256
 
 
@@ -157,40 +173,57 @@ def test_every_floating_limit_and_metric_limit_is_satisfied(
             assert metric["absolute_delta"] <= metric_limits[metric["metric_name"]]
 
 
-def test_performance_matrix_and_mps_exclusion_are_exact(
+def test_performance_matrix_and_timing_provenance_are_exact(
     evidence: tuple[bytes, bytes, dict[str, object], dict[str, object]],
 ) -> None:
     _, _, _, performance = evidence
+    assert performance["schema_version"] == 2
+    assert performance["schema_id"] == "inspectrt_portability_performance_v2"
+    assert performance["milestone_id"] == "inspectrt_portable_timing_v2"
     assert performance["status"] == "descriptive_only"
-    assert tuple(item["environment_id"] for item in performance["included_runs"]) == (
-        TIMING_IDS
+    assert tuple(performance["environment_order"]) == TIMING_IDS
+    assert (
+        tuple(item["environment"]["environment_id"] for item in performance["runs"])
+        == TIMING_IDS
     )
-    assert performance["excluded_candidates"] == [
-        {"environment_id": "m1pro-macos-mps", "reason_code": "evaluation_bundle"}
-    ]
+    assert performance["runs"][3]["environment"]["execution_layer"] == "wsl2"
+    assert performance["runs"][5]["environment"]["requested_device"] == "mps"
+    assert performance["generator"] == {
+        "dirty": False,
+        "source_commit": AGGREGATION_COMMIT,
+    }
+    assert performance["timing_harness"]["source_commit"] == TIMING_HARNESS_COMMIT
+    assert performance["timing_harness"]["uv_lock_sha256"] == TIMING_HARNESS_LOCK
+    assert performance["timing_harness"]["dirty"] is False
 
 
-def test_required_p50_and_p95_values_are_valid(
+def test_raw_arrays_and_summaries_recompute_exactly(
     evidence: tuple[bytes, bytes, dict[str, object], dict[str, object]],
 ) -> None:
     _, _, _, performance = evidence
-    for run in performance["included_runs"]:
+    for run in performance["runs"]:
         measurements = run["measurements"]
-        summaries = [
-            measurements["repeated_stages"]["frozen_feature_extraction"],
-            measurements["repeated_stages"]["exact_chunked_retrieval"],
+        records = [
+            *measurements["repeated_stages"].values(),
             measurements["synchronized_end_to_end"],
         ]
-        for summary in summaries:
-            assert math.isfinite(summary["p50"]) and summary["p50"] > 0
-            assert math.isfinite(summary["p95"]) and summary["p95"] >= summary["p50"]
+        for record in records:
+            raw = record["raw_ns"]
+            summary = record["summary_ns"]
+            assert len(raw) == summary["count"] == 30
+            assert summary["minimum"] == min(raw)
+            assert summary["maximum"] == max(raw)
+            assert summary["mean"] == sum(raw) / len(raw)
+            assert summary["p50"] == _percentile(raw, 0.50)
+            assert summary["p95"] == _percentile(raw, 0.95)
 
 
 def test_renderer_rejects_broken_scientific_hash_binding(
     evidence: tuple[bytes, bytes, dict[str, object], dict[str, object]],
 ) -> None:
     scientific_bytes, _, _, performance = evidence
-    broken = {**performance, "scientific_sha256": "0" * 64}
+    broken = copy.deepcopy(performance)
+    broken["scientific"]["scientific_json"]["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="scientific hash binding"):
         renderer.render_svg(scientific_bytes, _canonical(broken))
 
@@ -200,20 +233,20 @@ def test_renderer_rejects_unexpected_environment_ordering(
 ) -> None:
     scientific_bytes, _, _, performance = evidence
     broken = copy.deepcopy(performance)
-    broken["included_runs"][0], broken["included_runs"][1] = (
-        broken["included_runs"][1],
-        broken["included_runs"][0],
+    broken["runs"][0], broken["runs"][1] = (
+        broken["runs"][1],
+        broken["runs"][0],
     )
     with pytest.raises(ValueError, match="environment ordering"):
         renderer.render_svg(scientific_bytes, _canonical(broken))
 
 
-def test_renderer_rejects_mps_timing(
+def test_renderer_rejects_missing_mps_timing(
     evidence: tuple[bytes, bytes, dict[str, object], dict[str, object]],
 ) -> None:
     scientific_bytes, _, _, performance = evidence
     broken = copy.deepcopy(performance)
-    broken["included_runs"][0]["environment_id"] = "m1pro-macos-mps"
+    broken["runs"][5]["environment"]["environment_id"] = "m1pro-macos-cpu"
     with pytest.raises(ValueError):
         renderer.render_svg(scientific_bytes, _canonical(broken))
 
@@ -237,15 +270,15 @@ def test_graph_rates_are_derived_from_persisted_counts(
         "nearest_bank_indices"
     ]["mismatch_rate"] = 0.99
     scientific_bytes = _canonical(changed)
-    performance = {
-        **performance,
-        "scientific_sha256": hashlib.sha256(scientific_bytes).hexdigest(),
-    }
+    performance = copy.deepcopy(performance)
+    performance["scientific"]["scientific_json"]["sha256"] = hashlib.sha256(
+        scientific_bytes
+    ).hexdigest()
     svg = renderer.render_svg(scientific_bytes, _canonical(performance))
     assert b">4.20%</text>" in svg
 
 
-def test_graph_check_mode_accepts_only_the_tracked_bytes() -> None:
+def test_graph_check_mode_accepts_only_the_tracked_bytes(tmp_path: Path) -> None:
     result = subprocess.run(
         (
             sys.executable,
@@ -262,6 +295,27 @@ def test_graph_check_mode_accepts_only_the_tracked_bytes() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+    same_output = tmp_path / "same-output"
+    result = subprocess.run(
+        (
+            sys.executable,
+            str(ROOT / "scripts/render_portability_latency.py"),
+            "--scientific",
+            str(SCIENTIFIC_PATH),
+            "--performance",
+            str(PERFORMANCE_PATH),
+            "--output",
+            str(same_output),
+            "--png-preview",
+            str(same_output),
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "--output and --png-preview must differ" in result.stderr
 
 
 def test_svg_is_accessible_standalone_xml_with_exact_dimensions() -> None:
@@ -292,39 +346,39 @@ def test_svg_has_no_external_or_executable_resource() -> None:
 def test_svg_uses_the_direct_two_panel_copy_and_mps_treatment() -> None:
     rendered = SVG_PATH.read_text()
     required = (
-        "A. Pipeline stage latency",
-        "p50–p95, milliseconds, logarithmic scale",
-        "marker: p50 · right cap: p95",
+        "A. Stage latency",
+        "p50 → p95",
         "Feature extraction",
         "Exact retrieval",
         "End to end",
-        "Quadro T1000 · CUDA · reference",
-        "Quadro T1000 · CUDA · repeat",
-        "Core i7-9850H · CPU",
+        "T1000 · CUDA · reference",
+        "T1000 · CUDA · repeat",
+        "P53 · CPU",
         "RTX 4080 Super · CUDA · WSL 2",
         "M1 Pro · CPU",
-        "B. Top-1 nearest-neighbour index differences",
-        "Share of 84,992 patch queries selecting a different",
-        "memory-bank row than the T1000 reference",
-        "All floating outputs and metrics remained within the reviewed policy.",
-        "Queries with a different top-1 index (%)",
+        "M1 Pro · MPS",
+        "Milliseconds (log scale)",
+        "B. Top-1 index differences",
+        "Different top-1 index (%)",
         "T1000 repeat",
         "P53 CPU",
         "RTX 4080 Super",
         "M1 Pro CPU",
         "M1 Pro MPS",
-        "Same frozen workload. Five warm-ups and 30 measured repeats. "
-        "MPS latency was not collected.",
     )
     assert all(value in rendered for value in required)
-    assert rendered.count("MPS latency was not collected.") == 1
-    assert len(re.findall(r">[0-9]+\.[0-9]–[0-9]+\.[0-9] ms</text>", rendered)) == 5
+    assert len(re.findall(r">[0-9]+\.[0-9]–[0-9]+\.[0-9] ms</text>", rendered)) == 6
     for value in (
         "InspectRT: one frozen inspection workload across CPU, CUDA and MPS",
+        "MPS latency was not collected",
+        "All floating outputs and metrics",
+        "Share of 84,992",
         "scientific only",
         "scientific-only",
         "post-policy",
         "non-gating",
+        "confidence interval",
+        "confidence-interval",
         "evaluation only",
         "same-stack control",
         "Ubuntu 24.04.4",
@@ -370,8 +424,22 @@ def test_performance_json_has_no_comparative_or_universal_claim_field(
     evidence: tuple[bytes, bytes, dict[str, object], dict[str, object]],
 ) -> None:
     _, _, _, performance = evidence
-    rendered = json.dumps(performance).casefold()
-    for word in ("speedup", "ranking", "winner", "portable_everywhere"):
+    rendered = "\n".join(
+        (
+            json.dumps(performance),
+            SVG_PATH.read_text(),
+            (ROOT / "README.md").read_text(),
+            (ROOT / "docs/portability.md").read_text(),
+        )
+    ).casefold()
+    for word in (
+        "speedup",
+        "ranking",
+        "winner",
+        "portable_everywhere",
+        "confidence interval",
+        "confidence-interval",
+    ):
         assert word not in rendered
 
 

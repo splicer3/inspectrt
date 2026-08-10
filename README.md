@@ -16,12 +16,12 @@ commands, and validation limits.
 
 The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 with a
 Quadro T1000 and the current locked Linux stack. The frozen `bottle` workload
-also has reviewed results from P53 CPU, RTX 4080 Super CUDA under WSL 2, M1 Pro
-CPU, and M1 Pro MPS. The MPS run contains scientific results only. Floating
-outputs and metrics stayed within the reviewed envelope, while exact
-nearest-neighbour identity varied across devices. Timing results are
-descriptive. See [docs/portability.md](docs/portability.md) and the baseline
-method contract in [docs/baseline.md](docs/baseline.md).
+also has reviewed results for P53 CPU, RTX 4080 Super CUDA under WSL 2, M1 Pro
+CPU, and M1 Pro MPS. Floating outputs and metrics stayed within the reviewed
+envelope, although exact nearest-neighbour indices varied across devices. The
+synchronized wall-clock record contains six descriptive timing rows. See
+[docs/portability.md](docs/portability.md) and the baseline method contract in
+[docs/baseline.md](docs/baseline.md).
 
 ## Installation
 
