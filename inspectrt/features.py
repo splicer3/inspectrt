@@ -2,6 +2,7 @@
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torchvision.models import ResNet50_Weights, resnet50
 from torchvision.models.feature_extraction import create_feature_extractor
 
@@ -9,12 +10,6 @@ _RETURN_NODE = "layer2"
 _IMAGE_SHAPE = (3, 256, 256)
 _LAYER2_SHAPE = (512, 32, 32)
 _PATCH_COUNT = 32 * 32
-_LOCAL_AVERAGE = nn.AvgPool2d(
-    kernel_size=3,
-    stride=1,
-    padding=1,
-    count_include_pad=True,
-)
 
 
 def build_resnet50_layer2_extractor(
@@ -53,18 +48,30 @@ def extract_patch_embeddings(extractor: nn.Module, images: Tensor) -> Tensor:
                 f"Expected layer2 dtype torch.float32, got {feature_map.dtype}"
             )
 
-        pooled = _LOCAL_AVERAGE(feature_map)
+        pooled, patches = _pool_and_layout_layer2(feature_map)
         if pooled.shape != feature_map.shape:
             raise RuntimeError(
                 "Local average changed layer2 shape: "
                 f"{tuple(feature_map.shape)} to {tuple(pooled.shape)}"
             )
 
-        return (
-            pooled.permute(0, 2, 3, 1)
-            .reshape(images.shape[0], _PATCH_COUNT, _LAYER2_SHAPE[0])
-            .contiguous()
-        )
+        return patches
+
+
+def _pool_and_layout_layer2(feature_map: Tensor) -> tuple[Tensor, Tensor]:
+    pooled = F.avg_pool2d(
+        feature_map,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        count_include_pad=True,
+    )
+    patches = (
+        pooled.permute(0, 2, 3, 1)
+        .reshape(feature_map.shape[0], _PATCH_COUNT, _LAYER2_SHAPE[0])
+        .contiguous()
+    )
+    return pooled, patches
 
 
 def _validate_image_batch(images: Tensor) -> None:

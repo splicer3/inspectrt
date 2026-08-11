@@ -16,6 +16,13 @@ dependencies = [
     "torchvision>=0.28.0",
 ]
 
+[project.optional-dependencies]
+onnx = [
+    "onnx>=1.22.0",
+    "onnxruntime>=1.28.0",
+    "onnxscript>=0.7.1",
+]
+
 [project.scripts]
 inspectrt = "inspectrt.cli:main"
 
