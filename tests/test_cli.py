@@ -63,7 +63,11 @@ def test_import_does_not_load_heavy_runtime_modules() -> None:
         "assert 'numpy' not in sys.modules; "
         "assert 'inspectrt.portability' not in sys.modules; "
         "assert 'inspectrt.fixtures' not in sys.modules; "
-        "assert 'inspectrt.retrieval' not in sys.modules"
+        "assert 'inspectrt.retrieval' not in sys.modules; "
+        "assert 'inspectrt.onnx_artifacts' not in sys.modules; "
+        "assert 'onnx' not in sys.modules; "
+        "assert 'onnxscript' not in sys.modules; "
+        "assert 'onnxruntime' not in sys.modules"
     )
     result = subprocess.run(
         (sys.executable, "-c", code),
@@ -585,6 +589,178 @@ def test_portability_performance_routes_six_runs_and_has_one_error_boundary(
     assert captured.out == ""
     assert captured.err == (
         "inspectrt portability performance failed: scientific identity mismatch\n"
+    )
+
+
+def test_onnx_help_action_arguments_and_import_isolation() -> None:
+    root = _console("--help")
+    group = _console("onnx", "--help")
+    export = _console("onnx", "export", "--help")
+    validate = _console("onnx", "validate", "--help")
+    assert root.returncode == group.returncode == export.returncode == 0
+    assert validate.returncode == 0
+    assert "onnx" in root.stdout
+    assert "{export,validate}" in group.stdout
+    assert "--output-root" in export.stdout
+    assert "--artifact" in validate.stdout
+    for arguments, required in (
+        (("onnx", "export"), "--output-root"),
+        (("onnx", "validate"), "--artifact"),
+    ):
+        result = _console(*arguments)
+        assert result.returncode == 2
+        assert required in result.stderr
+    invalid = _console("onnx", "run")
+    assert invalid.returncode == 2
+    assert "invalid choice" in invalid.stderr
+
+    code = """
+import sys
+import inspectrt.cli as cli
+for arguments in (
+    ["onnx", "--help"],
+    ["onnx", "export", "--help"],
+    ["onnx", "validate", "--help"],
+):
+    try:
+        cli.main(arguments)
+    except SystemExit as error:
+        assert error.code == 0
+    else:
+        raise AssertionError("help did not exit")
+for name in (
+    "numpy",
+    "torch",
+    "torchvision",
+    "onnx",
+    "onnxscript",
+    "onnxruntime",
+    "inspectrt.onnx_artifacts",
+    "inspectrt.onnx_features",
+):
+    assert name not in sys.modules, name
+"""
+    result = subprocess.run(
+        (sys.executable, "-c", code),
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_onnx_export_dirty_gate_routing_and_exact_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import inspectrt.onnx_artifacts as onnx_artifacts
+
+    artifact = onnx_artifacts.LoadedOnnxFeatureArtifact(
+        "resnet50-layer2-opset20-143b305b37a9",
+        5_857_483,
+        "a" * 64,
+        "b" * 64,
+        20,
+    )
+    destination = tmp_path / artifact.artifact_id
+
+    def publish(*args: object, **kwargs: object) -> tuple[Path, object]:
+        print("exporter progress")
+        return destination, artifact
+
+    publisher = Mock(side_effect=publish)
+    monkeypatch.setattr(
+        onnx_artifacts,
+        "publish_onnx_feature_artifact",
+        publisher,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_repository_metadata",
+        lambda cwd: (_ROOT, "c" * 40, False, "d" * 64),
+    )
+    arguments = ["onnx", "export", "--output-root", str(tmp_path)]
+    assert cli.main(arguments) == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        f"artifact_id={artifact.artifact_id}",
+        f"artifact_path={destination}",
+        "model_bytes=5857483",
+        f"model_sha256={'a' * 64}",
+        f"artifact_digest={'b' * 64}",
+        "status=published",
+    ]
+    assert captured.err == "exporter progress\n"
+    publisher.assert_called_once_with(
+        tmp_path,
+        git_commit="c" * 40,
+        git_dirty=False,
+        uv_lock_sha256="d" * 64,
+    )
+
+    publisher.reset_mock()
+    monkeypatch.setattr(
+        cli,
+        "_repository_metadata",
+        lambda cwd: (_ROOT, "c" * 40, True, "d" * 64),
+    )
+    assert cli.main(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "inspectrt onnx export failed: "
+        "ONNX artifact source working tree must be clean\n"
+    )
+    publisher.assert_not_called()
+
+
+def test_onnx_validate_routing_error_context_and_exact_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import inspectrt.onnx_artifacts as onnx_artifacts
+
+    artifact = onnx_artifacts.LoadedOnnxFeatureArtifact(
+        "resnet50-layer2-opset20-143b305b37a9",
+        5_857_483,
+        "a" * 64,
+        "b" * 64,
+        20,
+    )
+    path = tmp_path / "artifact"
+
+    def load(value: Path) -> object:
+        print("checker progress")
+        assert value == path
+        return artifact
+
+    loader = Mock(side_effect=load)
+    monkeypatch.setattr(onnx_artifacts, "load_onnx_feature_artifact", loader)
+    arguments = ["onnx", "validate", "--artifact", str(path)]
+    assert cli.main(arguments) == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        f"artifact_id={artifact.artifact_id}",
+        "model_bytes=5857483",
+        f"model_sha256={'a' * 64}",
+        f"artifact_digest={'b' * 64}",
+        "opset=20",
+        "status=valid",
+    ]
+    assert captured.err == "checker progress\n"
+
+    loader.side_effect = RuntimeError(
+        "install inspectrt[onnx] to use ONNX artifact commands"
+    )
+    assert cli.main(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "inspectrt onnx validate failed: "
+        "install inspectrt[onnx] to use ONNX artifact commands\n"
     )
 
 

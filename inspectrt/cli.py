@@ -2,6 +2,7 @@
 
 import argparse
 from collections.abc import Mapping, Sequence
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -147,6 +148,16 @@ def _argument_parser() -> argparse.ArgumentParser:
     export.add_argument("--sample-id", required=True)
     export.add_argument("--device", required=True)
     export.add_argument("--output-root", required=True, type=Path)
+    onnx = commands.add_parser("onnx", help="export or validate ONNX feature artifacts")
+    onnx_commands = onnx.add_subparsers(dest="onnx_command", required=True)
+    onnx_export = onnx_commands.add_parser(
+        "export", help="export the fixed ONNX feature artifact"
+    )
+    onnx_export.add_argument("--output-root", required=True, type=Path)
+    onnx_validate = onnx_commands.add_parser(
+        "validate", help="validate an ONNX feature artifact"
+    )
+    onnx_validate.add_argument("--artifact", required=True, type=Path)
     portability = commands.add_parser(
         "portability", help="compare portable run bundles"
     )
@@ -195,6 +206,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface."""
     arguments = _argument_parser().parse_args(argv)
     try:
+        if arguments.command == "onnx":
+            return (
+                _export_onnx(arguments)
+                if arguments.onnx_command == "export"
+                else _validate_onnx(arguments)
+            )
         if arguments.command == "portability":
             return (
                 _compare_portability(arguments)
@@ -217,10 +234,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = arguments.command
         if command == "fixture":
             command = f"{command} {arguments.fixture_command}"
+        elif command == "onnx":
+            command = f"{command} {arguments.onnx_command}"
         elif command == "portability":
             command = f"{command} {arguments.portability_command}"
         print(f"inspectrt {command} failed: {error}", file=sys.stderr)
         return 1
+
+
+def _export_onnx(arguments: argparse.Namespace) -> int:
+    _, commit, dirty, lock_digest = _repository_metadata(Path.cwd())
+    if dirty:
+        raise ValueError("ONNX artifact source working tree must be clean")
+    from inspectrt.onnx_artifacts import publish_onnx_feature_artifact
+
+    with redirect_stdout(sys.stderr):
+        destination, artifact = publish_onnx_feature_artifact(
+            arguments.output_root,
+            git_commit=commit,
+            git_dirty=dirty,
+            uv_lock_sha256=lock_digest,
+        )
+    print(f"artifact_id={artifact.artifact_id}")
+    print(f"artifact_path={destination}")
+    print(f"model_bytes={artifact.model_byte_count}")
+    print(f"model_sha256={artifact.model_sha256}")
+    print(f"artifact_digest={artifact.artifact_digest}")
+    print("status=published")
+    return 0
+
+
+def _validate_onnx(arguments: argparse.Namespace) -> int:
+    from inspectrt.onnx_artifacts import load_onnx_feature_artifact
+
+    with redirect_stdout(sys.stderr):
+        artifact = load_onnx_feature_artifact(arguments.artifact)
+    print(f"artifact_id={artifact.artifact_id}")
+    print(f"model_bytes={artifact.model_byte_count}")
+    print(f"model_sha256={artifact.model_sha256}")
+    print(f"artifact_digest={artifact.artifact_digest}")
+    print(f"opset={artifact.opset_version}")
+    print("status=valid")
+    return 0
 
 
 def _compare_portability(arguments: argparse.Namespace) -> int:
