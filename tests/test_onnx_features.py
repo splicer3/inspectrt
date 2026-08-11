@@ -1,8 +1,6 @@
 from pathlib import Path
+from typing import Any
 
-import onnx
-from onnx import TensorProto
-from onnx.external_data_helper import uses_external_data
 import pytest
 import torch
 from torch import nn
@@ -28,7 +26,15 @@ def graph_and_reference() -> tuple[nn.Module, nn.Module]:
 def exported_model(
     tmp_path_factory: pytest.TempPathFactory,
     graph_and_reference: tuple[nn.Module, nn.Module],
-) -> tuple[onnx.ModelProto, Path]:
+) -> tuple[Any, Path]:
+    onnx = pytest.importorskip(
+        "onnx",
+        reason="install inspectrt[onnx] to run ONNX export tests",
+    )
+    pytest.importorskip(
+        "onnxscript",
+        reason="install inspectrt[onnx] to run ONNX export tests",
+    )
     graph, _ = graph_and_reference
     directory = tmp_path_factory.mktemp("onnx-feature-graph")
     model_path = directory / "model.onnx"
@@ -94,8 +100,10 @@ def test_eager_dual_outputs_exactly_match_the_existing_path(
 
 
 def test_exports_static_fp32_dual_output_contract(
-    exported_model: tuple[onnx.ModelProto, Path],
+    exported_model: tuple[Any, Path],
 ) -> None:
+    from onnx import TensorProto
+
     model, _ = exported_model
 
     assert [_value_info(value) for value in model.graph.input] == [
@@ -111,8 +119,10 @@ def test_exports_static_fp32_dual_output_contract(
 
 
 def test_exports_frozen_pool_and_row_major_layout_without_external_data(
-    exported_model: tuple[onnx.ModelProto, Path],
+    exported_model: tuple[Any, Path],
 ) -> None:
+    from onnx.external_data_helper import uses_external_data
+
     model, model_path = exported_model
     nodes_by_operation = {
         operation: [node for node in model.graph.node if node.op_type == operation]
@@ -148,7 +158,7 @@ def test_exports_frozen_pool_and_row_major_layout_without_external_data(
     assert [path.name for path in model_path.parent.iterdir()] == ["model.onnx"]
 
 
-def _value_info(value: onnx.ValueInfoProto) -> tuple[str, int, tuple[int, ...]]:
+def _value_info(value: Any) -> tuple[str, int, tuple[int, ...]]:
     tensor_type = value.type.tensor_type
     dimensions = tensor_type.shape.dim
     assert all(dimension.HasField("dim_value") for dimension in dimensions)
@@ -159,7 +169,9 @@ def _value_info(value: onnx.ValueInfoProto) -> tuple[str, int, tuple[int, ...]]:
     )
 
 
-def _attributes(node: onnx.NodeProto) -> dict[str, object]:
+def _attributes(node: Any) -> dict[str, object]:
+    import onnx
+
     return {
         attribute.name: onnx.helper.get_attribute_value(attribute)
         for attribute in node.attribute
