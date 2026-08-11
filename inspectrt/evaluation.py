@@ -1,5 +1,6 @@
 """In-process evaluation of one MVTec AD category."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from inspectrt.features import extract_patch_embeddings
 from inspectrt.metrics import ThresholdFreeMetrics, compute_threshold_free_metrics
 from inspectrt.preprocessing import PreprocessedImage, preprocess_image
 from inspectrt.retrieval import score_patch_embeddings
+
+_PatchExtractor = Callable[[Tensor], Tensor]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,11 +52,34 @@ def evaluate_mvtec_category(
         dataset_root, category
     )
     resolved_device = _resolve_evaluation_device(feature_extractor, device)
+    return _evaluate_mvtec_category_with_patch_extractor(
+        dataset_root,
+        category,
+        samples,
+        nominal_samples,
+        test_samples,
+        lambda images: extract_patch_embeddings(feature_extractor, images),
+        resolved_device=resolved_device,
+        bank_chunk_size=bank_chunk_size,
+    )
+
+
+def _evaluate_mvtec_category_with_patch_extractor(
+    dataset_root: Path,
+    category: str,
+    samples: tuple[MvtecSample, ...],
+    nominal_samples: tuple[MvtecSample, ...],
+    test_samples: tuple[MvtecSample, ...],
+    patch_extractor: _PatchExtractor,
+    *,
+    resolved_device: torch.device,
+    bank_chunk_size: int,
+) -> CategoryEvaluation:
     observations: dict[str, MvtecSampleObservation] = {}
     memory_bank = _build_nominal_memory_bank(
         dataset_root,
         nominal_samples,
-        feature_extractor,
+        patch_extractor,
         resolved_device,
         observations,
     )
@@ -63,7 +89,7 @@ def evaluate_mvtec_category(
         category,
         samples,
         test_samples,
-        feature_extractor,
+        patch_extractor,
         resolved_device,
         bank_chunk_size,
         memory_bank,
@@ -111,7 +137,7 @@ def _resolve_evaluation_device(
 def _load_and_extract_sample(
     dataset_root: Path,
     sample: MvtecSample,
-    feature_extractor: nn.Module,
+    feature_extractor: nn.Module | _PatchExtractor,
     resolved_device: torch.device,
     observations: dict[str, MvtecSampleObservation],
 ) -> tuple[PreprocessedImage, Tensor]:
@@ -123,8 +149,11 @@ def _load_and_extract_sample(
         prepared.original_width,
         prepared.original_mode,
     )
-    patches = extract_patch_embeddings(
-        feature_extractor, prepared.image.unsqueeze(0).to(resolved_device)
+    images = prepared.image.unsqueeze(0).to(resolved_device)
+    patches = (
+        extract_patch_embeddings(feature_extractor, images)
+        if isinstance(feature_extractor, nn.Module)
+        else feature_extractor(images)
     )
     return prepared, patches
 
@@ -132,7 +161,7 @@ def _load_and_extract_sample(
 def _build_nominal_memory_bank(
     dataset_root: Path,
     nominal_samples: tuple[MvtecSample, ...],
-    feature_extractor: nn.Module,
+    feature_extractor: nn.Module | _PatchExtractor,
     resolved_device: torch.device,
     observations: dict[str, MvtecSampleObservation],
 ) -> Tensor:
@@ -161,7 +190,7 @@ def _score_and_finalize_category(
     category: str,
     samples: tuple[MvtecSample, ...],
     test_samples: tuple[MvtecSample, ...],
-    feature_extractor: nn.Module,
+    feature_extractor: nn.Module | _PatchExtractor,
     resolved_device: torch.device,
     bank_chunk_size: int,
     memory_bank: Tensor,

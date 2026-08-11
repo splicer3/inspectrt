@@ -6,7 +6,12 @@ from PIL import Image
 from torch import Tensor, nn
 
 from inspectrt.data import discover_mvtec_samples
-from inspectrt.evaluation import CategoryEvaluation, evaluate_mvtec_category
+from inspectrt.evaluation import (
+    CategoryEvaluation,
+    _discover_category_samples,
+    _evaluate_mvtec_category_with_patch_extractor,
+    evaluate_mvtec_category,
+)
 from inspectrt.features import extract_patch_embeddings
 from inspectrt.metrics import compute_threshold_free_metrics
 from inspectrt.preprocessing import preprocess_image
@@ -136,6 +141,55 @@ def test_evaluates_category_without_test_leakage_and_preserves_contract(
     assert repeated.metrics == result.metrics
     for name in tensor_contract:
         assert torch.equal(getattr(repeated, name), getattr(result, name))
+
+
+def test_patch_extractor_callable_reuses_complete_category_orchestration(
+    tmp_path: Path,
+) -> None:
+    _make_dataset(tmp_path)
+    expected = _evaluate(tmp_path)
+    samples, nominal_samples, test_samples = _discover_category_samples(
+        tmp_path, "bottle"
+    )
+    calls = []
+    extractor = _ControlledExtractor()
+
+    def extract_patches(images: Tensor) -> Tensor:
+        calls.append(
+            (
+                tuple(images.shape),
+                images.dtype,
+                images.device,
+                images.is_contiguous(),
+            )
+        )
+        return extract_patch_embeddings(extractor, images)
+
+    result = _evaluate_mvtec_category_with_patch_extractor(
+        tmp_path,
+        "bottle",
+        samples,
+        nominal_samples,
+        test_samples,
+        extract_patches,
+        resolved_device=torch.device("cpu"),
+        bank_chunk_size=_CHUNK_SIZE,
+    )
+
+    assert calls == [((1, 3, 256, 256), torch.float32, torch.device("cpu"), True)] * 4
+    assert result.samples == expected.samples
+    assert result.test_samples == expected.test_samples
+    assert result.metrics == expected.metrics
+    for name in (
+        "memory_bank",
+        "test_labels",
+        "pixel_masks",
+        "patch_distances",
+        "nearest_bank_indices",
+        "image_scores",
+        "anomaly_maps",
+    ):
+        assert torch.equal(getattr(result, name), getattr(expected, name))
 
 
 @pytest.mark.parametrize(
