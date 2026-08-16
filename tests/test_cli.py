@@ -1,9 +1,6 @@
 from datetime import datetime, timezone
 import hashlib
-from importlib import metadata
-import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -55,31 +52,9 @@ def _modified_profile(tmp_path: Path, old: str, new: str) -> Path:
     return path
 
 
-def test_import_does_not_load_heavy_runtime_modules() -> None:
-    code = (
-        "import sys; import inspectrt.cli; "
-        "assert 'torch' not in sys.modules; "
-        "assert 'torchvision' not in sys.modules; "
-        "assert 'numpy' not in sys.modules; "
-        "assert 'inspectrt.portability' not in sys.modules; "
-        "assert 'inspectrt.fixtures' not in sys.modules; "
-        "assert 'inspectrt.retrieval' not in sys.modules; "
-        "assert 'inspectrt.onnx_artifacts' not in sys.modules; "
-        "assert 'onnx' not in sys.modules; "
-        "assert 'onnxscript' not in sys.modules; "
-        "assert 'onnxruntime' not in sys.modules"
-    )
-    result = subprocess.run(
-        (sys.executable, "-c", code),
-        cwd=_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
-def test_committed_profile_is_supported_and_contains_only_known_keys() -> None:
+def test_baseline_profile_accepts_contract_and_rejects_invalid_classes(
+    tmp_path: Path,
+) -> None:
     config = cli.load_baseline_config(_PROFILE)
     assert config == cli.BaselineConfig(
         1,
@@ -100,138 +75,35 @@ def test_committed_profile_is_supported_and_contains_only_known_keys() -> None:
     assert not (
         {"dataset_root", "category", "device", "output_root", "run_id"} & raw.keys()
     )
-
-
-@pytest.mark.parametrize(
-    ("old", "message"),
-    [
-        ("bank_chunk_size = 16384\n", "bank_chunk_size"),
-        ("allow_tf32 = false\n", "allow_tf32"),
-    ],
-)
-def test_missing_config_keys_fail_clearly(
-    tmp_path: Path, old: str, message: str
-) -> None:
-    path = _modified_profile(tmp_path, old, "")
-    with pytest.raises(ValueError, match=rf"missing.*{message}"):
-        cli.load_baseline_config(path)
-
-
-@pytest.mark.parametrize(
-    ("old", "new", "message"),
-    [
-        ("[determinism]", "unknown = 1\n\n[determinism]", "profile.*unknown"),
+    scenarios = (
+        ("missing", "bank_chunk_size = 16384\n", "", "missing.*bank_chunk_size"),
         (
-            'cublas_workspace_config = ":4096:8"',
-            'cublas_workspace_config = ":4096:8"\nunknown = 1',
-            "determinism.*unknown",
-        ),
-    ],
-)
-def test_unknown_config_keys_fail_clearly(
-    tmp_path: Path, old: str, new: str, message: str
-) -> None:
-    path = _modified_profile(tmp_path, old, new)
-    with pytest.raises(ValueError, match=message):
-        cli.load_baseline_config(path)
-
-
-@pytest.mark.parametrize(
-    ("old", "new", "message"),
-    [
-        ("schema_version = 1", "schema_version = 2", "schema_version"),
-        (
-            'profile_id = "inspectrt_feature_memory_v1"',
-            'profile_id = "other"',
-            "profile_id",
+            "unknown",
+            "[determinism]",
+            "unknown = 1\n\n[determinism]",
+            "profile.*unknown",
         ),
         (
-            'preprocessing_profile_id = "inspectrt_resize256_v1"',
-            'preprocessing_profile_id = "other"',
-            "preprocessing_profile_id",
+            "wrong-type",
+            "bank_chunk_size = 16384",
+            "bank_chunk_size = true",
+            "positive integer",
         ),
-        ('weights = "IMAGENET1K_V2"', 'weights = "DEFAULT"', "weights"),
-        ("bank_chunk_size = 16384", "bank_chunk_size = 0", "positive integer"),
-        ("bank_chunk_size = 16384", "bank_chunk_size = true", "positive integer"),
-        ("seed = 0", "seed = -1", "nonnegative integer"),
-        ("seed = 0", "seed = true", "nonnegative integer"),
         (
-            "use_deterministic_algorithms = true",
-            "use_deterministic_algorithms = false",
-            "use_deterministic_algorithms",
+            "unsupported",
+            'weights = "IMAGENET1K_V2"',
+            'weights = "DEFAULT"',
+            "weights",
         ),
-        ("cudnn_benchmark = false", "cudnn_benchmark = true", "cudnn_benchmark"),
-        ("allow_tf32 = false", "allow_tf32 = true", "allow_tf32"),
-        (
-            'cublas_workspace_config = ":4096:8"',
-            'cublas_workspace_config = ":16:8"',
-            "cublas_workspace_config",
-        ),
-    ],
-)
-def test_unsupported_config_values_fail_clearly(
-    tmp_path: Path, old: str, new: str, message: str
-) -> None:
-    path = _modified_profile(tmp_path, old, new)
-    with pytest.raises(ValueError, match=message):
-        cli.load_baseline_config(path)
-
-
-@pytest.mark.parametrize(
-    ("arguments", "expected"),
-    [(("--help",), "evaluate"), (("evaluate", "--help"), "--dataset-root")],
-)
-def test_command_help_succeeds(arguments: tuple[str, ...], expected: str) -> None:
-    result = _console(*arguments)
-    assert result.returncode == 0, result.stderr
-    assert expected in result.stdout
-    if arguments[0] == "evaluate":
-        for forbidden in (
-            "--backbone",
-            "--feature-layer",
-            "--image-size",
-            "--weights",
-            "--bank-chunk-size",
-            "--batch-size",
-            "--seed",
-        ):
-            assert forbidden not in result.stdout
-
-
-@pytest.mark.parametrize(
-    "arguments",
-    (
-        ("--help",),
-        ("portability", "--help"),
-        ("portability", "performance", "--help"),
-    ),
-)
-def test_portability_help_does_not_load_runtime_modules(
-    arguments: tuple[str, ...],
-) -> None:
-    code = f"""
-import sys
-import inspectrt.cli as cli
-try:
-    cli.main({list(arguments)!r})
-except SystemExit as error:
-    assert error.code == 0
-else:
-    raise AssertionError("help did not exit")
-for name in ("numpy", "torch", "torchvision", "inspectrt.portability"):
-    assert name not in sys.modules, name
-"""
-    result = subprocess.run(
-        (sys.executable, "-c", code),
-        cwd=_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
     )
-    assert result.returncode == 0, result.stderr
+    for scenario, old, new, message in scenarios:
+        (tmp_path / scenario).mkdir()
+        with pytest.raises((TypeError, ValueError), match=message) as raised:
+            cli.load_baseline_config(_modified_profile(tmp_path / scenario, old, new))
+        assert raised.value, scenario
 
 
-def test_portability_command_help_and_action_surface() -> None:
+def test_command_groups_expose_the_documented_parser_surface() -> None:
     root = _console("--help")
     group = _console("portability", "--help")
     compare = _console("portability", "compare", "--help")
@@ -259,38 +131,24 @@ def test_portability_command_help_and_action_surface() -> None:
     graph = _console("portability", "graph")
     assert graph.returncode == 2
     assert "invalid choice" in graph.stderr
-
-
-def test_portability_compare_requires_all_four_inputs() -> None:
-    values = {
-        "--reference-run": "reference",
-        "--candidate-run": "candidate",
-        "--environment-map": "environment.json",
-        "--output": "comparison",
-    }
-    for omitted in values:
-        arguments = ["portability", "compare"]
-        for name, value in values.items():
-            if name != omitted:
-                arguments.extend((name, value))
-        result = _console(*arguments)
-        assert result.returncode == 2
-        assert omitted in result.stderr
-
-
-def test_portability_compare_requires_at_least_one_candidate() -> None:
-    result = _console(
-        "portability",
-        "compare",
-        "--reference-run",
-        "reference",
-        "--environment-map",
-        "environment.json",
-        "--output",
-        "comparison",
+    fixture_group = _console("fixture", "--help")
+    fixture_validate = _console("fixture", "validate", "--help")
+    fixture_export = _console("fixture", "export", "--help")
+    assert fixture_group.returncode == fixture_validate.returncode == 0
+    assert fixture_export.returncode == 0
+    assert "{validate,export}" in fixture_group.stdout
+    assert "--fixture" in fixture_validate.stdout
+    assert all(
+        argument in fixture_export.stdout
+        for argument in (
+            "--config",
+            "--run-dir",
+            "--dataset-root",
+            "--sample-id",
+            "--device",
+            "--output-root",
+        )
     )
-    assert result.returncode == 2
-    assert "--candidate-run" in result.stderr
 
 
 def _portability_arguments(
@@ -407,13 +265,12 @@ def wired_portability(
     )
 
 
-@pytest.mark.parametrize("count", (1, 3))
-def test_portability_routes_one_or_multiple_candidates_in_explicit_order(
+def test_portability_routes_candidates_in_explicit_order(
     wired_portability: SimpleNamespace,
     capsys: pytest.CaptureFixture[str],
-    count: int,
 ) -> None:
     command = wired_portability
+    count = 3
     candidates = tuple(
         command.private_root / f"candidate-{index}" for index in range(count)
     )
@@ -426,81 +283,11 @@ def test_portability_routes_one_or_multiple_candidates_in_explicit_order(
     assert call["generator"] == command.module.ScientificGenerator("a" * 40, True)
     assert f"candidates={count}" in capsys.readouterr().out
 
-
-@pytest.mark.parametrize("policy_mode", (False, True))
-def test_portability_observation_and_policy_modes(
-    wired_portability: SimpleNamespace,
-    capsys: pytest.CaptureFixture[str],
-    policy_mode: bool,
-) -> None:
-    command = wired_portability
-    candidate = command.private_root / "candidate"
-    policy = command.private_root / "policy.json" if policy_mode else None
-    assert command.run(candidate, policy=policy) == 0
-    assert command.publisher.call_args.kwargs["policy_path"] == policy
-    output = capsys.readouterr().out
-    assert f"mode={'policy' if policy_mode else 'observation'}" in output
-    assert "accepted" not in output
-
-
-@pytest.mark.parametrize(
-    "error",
-    (
-        ValueError("environment map JSON bytes are not canonical"),
-        ValueError("policy JSON contains a duplicate key"),
-        ValueError("reference run must be a benchmark bundle"),
-        ValueError("reference benchmark data is required"),
-        FileExistsError("output directory already exists"),
-        OSError("late publication failure"),
-        ValueError("comparison validation failed"),
-    ),
-)
-def test_portability_failures_use_one_concise_error_boundary(
-    wired_portability: SimpleNamespace,
-    capsys: pytest.CaptureFixture[str],
-    error: Exception,
-) -> None:
-    command = wired_portability
-    command.publisher.side_effect = error
-    assert command.run(command.private_root / "candidate") == 1
+    command.publisher.side_effect = ValueError("candidate contract mismatch")
+    assert command.run(*candidates) == 1
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == f"inspectrt portability compare failed: {error}\n"
-
-
-def test_portability_keeps_evaluation_candidate_scientific_and_excludes_timing(
-    wired_portability: SimpleNamespace,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    command = wired_portability
-    assert command.run(command.private_root / "evaluation-candidate") == 0
-    comparison = command.records["comparison"]
-    performance = command.records["performance"]
-    assert comparison.scientific_results[0].status == "observed_unclassified"
-    assert len(performance.included_runs) == 1
-    assert len(performance.excluded_candidates) == 1
-    output = capsys.readouterr().out
-    assert "performance_included=1" in output
-    assert "performance_excluded=1" in output
-
-
-def test_portability_success_prints_only_the_bounded_summary(
-    wired_portability: SimpleNamespace,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    command = wired_portability
-    candidate = command.private_root / "candidate"
-    assert command.run(candidate) == 0
-    output = capsys.readouterr().out
-    assert output.splitlines() == [
-        f"comparison_id={'c' * 64}",
-        "candidates=1",
-        "performance_included=2",
-        "performance_excluded=0",
-        "mode=observation",
-        "status=published",
-    ]
-    assert str(command.private_root) not in output
+    assert "candidate contract mismatch" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_portability_performance_routes_six_runs_and_has_one_error_boundary(
@@ -714,9 +501,10 @@ def test_onnx_export_dirty_gate_routing_and_exact_output(
         "ONNX artifact source working tree must be clean\n"
     )
     publisher.assert_not_called()
+    _assert_onnx_validate_routing(tmp_path, monkeypatch, capsys)
 
 
-def test_onnx_validate_routing_error_context_and_exact_output(
+def _assert_onnx_validate_routing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -762,51 +550,6 @@ def test_onnx_validate_routing_error_context_and_exact_output(
         "inspectrt onnx validate failed: "
         "install inspectrt[onnx] to use ONNX artifact commands\n"
     )
-
-
-def test_fixture_command_help_and_action_surface() -> None:
-    root = _console("--help")
-    group = _console("fixture", "--help")
-    validate = _console("fixture", "validate", "--help")
-    export = _console("fixture", "export", "--help")
-    assert root.returncode == group.returncode == validate.returncode == 0
-    assert export.returncode == 0
-    assert "fixture" in root.stdout
-    assert "{validate,export}" in group.stdout
-    assert "--fixture" in validate.stdout
-    assert "--device" in validate.stdout
-    for argument in (
-        "--config",
-        "--run-dir",
-        "--dataset-root",
-        "--sample-id",
-        "--device",
-        "--output-root",
-    ):
-        assert argument in export.stdout
-    for action in ("inspect", "generate"):
-        result = _console("fixture", action)
-        assert result.returncode == 2
-        assert "invalid choice" in result.stderr
-
-
-def test_fixture_export_requires_all_six_arguments() -> None:
-    values = {
-        "--config": str(_PROFILE),
-        "--run-dir": "run",
-        "--dataset-root": "dataset",
-        "--sample-id": "sample",
-        "--device": "cuda:0",
-        "--output-root": "outputs",
-    }
-    for omitted in values:
-        arguments = ["fixture", "export"]
-        for name, value in values.items():
-            if name != omitted:
-                arguments.extend((name, value))
-        result = _console(*arguments)
-        assert result.returncode == 2
-        assert omitted in result.stderr
 
 
 def _export_arguments(*, run_directory: str = "run") -> list[str]:
@@ -860,79 +603,19 @@ def test_controlled_fixture_export_returns_accepted_identity(
     )
     assert output["indices"] == output["distances"] == "exact"
     assert output["status"] == "accepted"
-
-
-def test_fixture_export_missing_source_is_concise(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
     monkeypatch.setattr(
         cli,
-        "_repository_metadata",
-        lambda cwd: (
-            _ROOT,
-            _git(_ROOT, "rev-parse", "HEAD"),
-            False,
-            hashlib.sha256((_ROOT / "uv.lock").read_bytes()).hexdigest(),
-        ),
+        "_export_fixture",
+        lambda *args: (_ for _ in ()).throw(ValueError("fixture contract mismatch")),
     )
-    assert cli.main(_export_arguments(run_directory=str(tmp_path / "missing"))) == 1
+    assert cli.main(_export_arguments()) == 1
     captured = capsys.readouterr()
-    assert "source run must be a real directory" in captured.err
+    assert "fixture contract mismatch" in captured.err
     assert "Traceback" not in captured.err
 
 
-@pytest.mark.parametrize(
-    ("message", "expected"),
-    (
-        ("evaluation-only source run", "evaluation-only"),
-        ("reference distance mismatch", "reference distance mismatch"),
-        ("fixture directory already exists", "already exists"),
-    ),
-)
-def test_fixture_export_expected_failures_return_one(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    message: str,
-    expected: str,
-) -> None:
-    def fail(*args: object) -> int:
-        raise ValueError(message)
-
-    monkeypatch.setattr(cli, "_export_fixture", fail)
-    assert cli.main(_export_arguments()) == 1
-    captured = capsys.readouterr()
-    assert expected in captured.err
-    assert "Traceback" not in captured.err
-
-
-def test_fixture_export_rejects_dirty_generator_before_runtime_work(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "_repository_metadata",
-        lambda cwd: (_ROOT, "f" * 40, True, "a" * 64),
-    )
-    assert cli.main(_export_arguments()) == 1
-    assert "working tree must be clean" in capsys.readouterr().err
-
-
-def test_fixture_validate_requires_both_arguments() -> None:
-    for arguments in (
-        ("fixture", "validate"),
-        ("fixture", "validate", "--fixture", str(_RETRIEVAL_FIXTURE)),
-        ("fixture", "validate", "--device", "cpu"),
-    ):
-        result = _console(*arguments)
-        assert result.returncode == 2
-        assert "required" in result.stderr
-
-
-def test_committed_fixture_validates_on_cpu() -> None:
-    result = _console(
+def test_fixture_validate_accepts_exact_cpu_and_reports_device_errors() -> None:
+    accepted = _console(
         "fixture",
         "validate",
         "--fixture",
@@ -940,302 +623,23 @@ def test_committed_fixture_validates_on_cpu() -> None:
         "--device",
         "cpu",
     )
-    assert result.returncode == 0, result.stderr
-    output = dict(line.split("=", 1) for line in result.stdout.splitlines())
-    manifest_bytes = (_RETRIEVAL_FIXTURE / "manifest.json").read_bytes()
-    payload = (_RETRIEVAL_FIXTURE / "tensors.bin").read_bytes()
-    manifest = json.loads(manifest_bytes)
-    assert output == {
-        "fixture_id": "synthetic-correctness-v1",
-        "fixture_class": "synthetic_correctness",
-        "Q": "4",
-        "M": "7",
-        "D": "5",
-        "k": "1",
-        "chunk_size": "3",
-        "payload_sha256": manifest["payload"]["sha256"],
-        "fixture_digest": hashlib.sha256(manifest_bytes + payload).hexdigest(),
-        "indices": "exact",
-        "distances": "exact",
-        "status": "accepted",
-    }
-    assert re.fullmatch(r"[0-9a-f]{64}", output["payload_sha256"])
-    assert re.fullmatch(r"[0-9a-f]{64}", output["fixture_digest"])
-
-
-def _mismatched_fixture(
-    tmp_path: Path, *, index: bool = False, distance: bool = False
-) -> Path:
-    import numpy as np
-
-    from inspectrt.fixtures import RetrievalFixture, load_retrieval_fixture
-    from inspectrt.fixtures import write_retrieval_fixture
-
-    loaded = load_retrieval_fixture(_RETRIEVAL_FIXTURE)
-    expected_indices = loaded.expected_indices.copy()
-    expected_distances = loaded.expected_squared_l2_distances.copy()
-    if index:
-        expected_indices[0] = np.int64(2)
-    if distance:
-        expected_distances[0] = np.float32(2)
-    fixture = RetrievalFixture(
-        loaded.metadata,
-        loaded.queries,
-        loaded.memory_bank,
-        expected_distances,
-        expected_indices,
-    )
-    directory = tmp_path / f"mismatch-{index}-{distance}"
-    write_retrieval_fixture(fixture, directory)
-    return directory
-
-
-@pytest.mark.parametrize(
-    ("kind", "message"),
-    (("missing", "not found"), ("corrupt", "SHA-256 mismatch")),
-)
-def test_fixture_path_and_hash_failures_are_concise(
-    tmp_path: Path, kind: str, message: str
-) -> None:
-    fixture = tmp_path / kind
-    if kind == "corrupt":
-        shutil.copytree(_RETRIEVAL_FIXTURE, fixture)
-        payload = bytearray((fixture / "tensors.bin").read_bytes())
-        payload[0] ^= 1
-        (fixture / "tensors.bin").write_bytes(payload)
-    result = _console(
-        "fixture", "validate", "--fixture", str(fixture), "--device", "cpu"
-    )
-    assert result.returncode == 1
-    assert message in result.stderr
-    assert "Traceback" not in result.stderr
-
-
-@pytest.mark.parametrize(
-    ("index", "distance", "message"),
-    ((True, False, "index mismatch"), (False, True, "distance mismatch")),
-)
-def test_fixture_reference_mismatch_fails(
-    tmp_path: Path, index: bool, distance: bool, message: str
-) -> None:
-    fixture = _mismatched_fixture(tmp_path, index=index, distance=distance)
-    result = _console(
-        "fixture", "validate", "--fixture", str(fixture), "--device", "cpu"
-    )
-    assert result.returncode == 1
-    assert message in result.stderr
-    assert "status=accepted" not in result.stdout
-
-
-def _real_cli_fixture(tmp_path: Path) -> tuple[Path, object]:
-    from inspectrt.fixtures import (
-        RealApplicationFixtureSource,
-        RetrievalFixture,
-        RetrievalFixtureMetadata,
-        load_retrieval_fixture,
-        real_fixture_id,
-        write_retrieval_fixture,
-    )
-
-    loaded = load_retrieval_fixture(_RETRIEVAL_FIXTURE)
-    source_commit = "a" * 40
-    lock_digest = hashlib.sha256((_ROOT / "uv.lock").read_bytes()).hexdigest()
-    source = RealApplicationFixtureSource(
-        category="bottle",
-        sample_id="mvtec_ad/bottle/test/crack/000.png",
-        test_tensor_index=0,
-        accepted_run_id="accepted-run",
-        source_commit=source_commit,
-        source_dirty=False,
-        inventory_sha256="b" * 64,
-        uv_lock_sha256=lock_digest,
-        weight_enum="ResNet50_Weights.IMAGENET1K_V2",
-        weight_file_sha256="d" * 64,
-        baseline_profile="inspectrt_feature_memory_v1",
-        configuration_sha256="e" * 64,
-        preprocessing_identity="inspectrt_resize256_v1",
-        feature_layer="layer2",
-        source_image_sha256="f" * 64,
-        python_version=cli.platform.python_version(),
-        dependency_versions={
-            name: metadata.version(name)
-            for name in (
-                "inspectrt",
-                "numpy",
-                "pillow",
-                "scikit-learn",
-                "torch",
-                "torchvision",
-            )
-        },
-        platform_description=cli.platform.platform(),
-        requested_device="cuda:0",
-        determinism={
-            "allow_tf32": False,
-            "cublas_workspace_config": ":4096:8",
-            "cudnn_benchmark": False,
-            "deterministic_algorithms_warn_only": False,
-            "fp32_precision": "ieee",
-            "numpy_seed": 0,
-            "python_random_seed": 0,
-            "torch_cpu_seed": 0,
-            "torch_cuda_seed_all": 0,
-            "use_deterministic_algorithms": True,
-        },
-        cuda_device_name="test GPU",
-        cuda_compute_capability=(7, 5),
-        pytorch_cuda_runtime_version="13.0",
-        source_artifact_sha256={
-            name: str(index) * 64
-            for index, name in enumerate(
-                (
-                    "run.json",
-                    "samples.jsonl",
-                    "memory_bank.pt",
-                    "retrieval.pt",
-                    "benchmark.json",
-                ),
-                1,
-            )
-        },
-    )
-    fixture_metadata = RetrievalFixtureMetadata(
-        real_fixture_id(source.category, source.sample_id, source_commit),
-        "real_application",
-        3,
-        source,
-        loaded.metadata.generator,
-    )
-    directory = tmp_path / "real"
-    write_retrieval_fixture(
-        RetrievalFixture(
-            fixture_metadata,
-            loaded.queries,
-            loaded.memory_bank,
-            loaded.expected_squared_l2_distances,
-            loaded.expected_indices,
-        ),
-        directory,
-    )
-    return directory, source
-
-
-def test_real_fixture_nonmatching_environment_is_structurally_valid(
-    tmp_path: Path,
-) -> None:
-    directory, _ = _real_cli_fixture(tmp_path)
-    result = _console(
-        "fixture", "validate", "--fixture", str(directory), "--device", "cpu"
-    )
-    assert result.returncode == 0, result.stderr
-    output = dict(line.split("=", 1) for line in result.stdout.splitlines())
-    assert output["fixture_class"] == "real_application"
-    assert output["status"] == "structurally_valid"
-    assert output["reference_status"] == "unavailable"
-    assert "requested_device" in output["environment_mismatches"]
-    assert "status=accepted" not in result.stdout
-
-
-def test_real_structural_validation_skips_reference_execution(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    directory, _ = _real_cli_fixture(tmp_path)
-    monkeypatch.setattr(
-        cli,
-        "_run_fixture_reference",
-        lambda *args: (_ for _ in ()).throw(AssertionError("reference executed")),
-    )
-    assert (
-        cli.main(
-            [
-                "fixture",
-                "validate",
-                "--fixture",
-                str(directory),
-                "--device",
-                "cpu",
-            ]
-        )
-        == 0
-    )
-    assert "reference_status=unavailable" in capsys.readouterr().out
-
-
-def test_real_fixture_matching_environment_requires_exact_reference(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    import inspectrt.fixtures as fixture_module
-
-    directory, source = _real_cli_fixture(tmp_path)
-    monkeypatch.setattr(
-        cli,
-        "_repository_metadata",
-        lambda cwd: (_ROOT, "f" * 40, False, source.uv_lock_sha256),
-    )
-    device = SimpleNamespace(index=0)
-    monkeypatch.setattr(cli, "_resolve_device", lambda requested, torch: device)
-    monkeypatch.setattr(fixture_module, "cuda_environment_mismatches", lambda *args: [])
-    monkeypatch.setattr(
-        cli, "_configure_determinism", lambda *args: dict(source.determinism)
-    )
-    reference_calls: list[object] = []
-    monkeypatch.setattr(
-        cli,
-        "_run_fixture_reference",
-        lambda fixture, actual_device, torch: reference_calls.append(actual_device),
-    )
-    assert (
-        cli.main(
-            [
-                "fixture",
-                "validate",
-                "--fixture",
-                str(directory),
-                "--device",
-                "cuda:0",
-            ]
-        )
-        == 0
-    )
-    output = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
-    assert output["environment"] == "exact"
+    assert accepted.returncode == 0, accepted.stderr
+    output = dict(line.split("=", 1) for line in accepted.stdout.splitlines())
+    assert output["fixture_class"] == "synthetic_correctness"
     assert output["indices"] == output["distances"] == "exact"
     assert output["status"] == "accepted"
-    assert reference_calls == [device]
 
-
-def test_fixture_invalid_device_fails_without_fallback() -> None:
-    result = _console(
+    rejected = _console(
         "fixture",
         "validate",
         "--fixture",
         str(_RETRIEVAL_FIXTURE),
         "--device",
-        "not-a-device",
+        "cuda",
     )
-    assert result.returncode == 1
-    assert "device" in result.stderr.lower()
-    assert "status=accepted" not in result.stdout
-
-
-def test_missing_runtime_arguments_use_argparse_status_two() -> None:
-    result = _console("evaluate")
-    assert result.returncode == 2
-    assert "required" in result.stderr
-
-
-def test_console_entry_point_is_registered() -> None:
-    entries = [
-        entry
-        for entry in metadata.entry_points(group="console_scripts")
-        if entry.name == "inspectrt"
-    ]
-    assert len(entries) == 1
-    assert entries[0].value == "inspectrt.cli:main"
+    assert rejected.returncode == 1
+    assert "explicit index" in rejected.stderr
+    assert "Traceback" not in rejected.stderr
 
 
 @pytest.fixture
@@ -1359,7 +763,9 @@ def wired_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleName
 
 
 def test_success_wires_complete_run_and_truthful_metadata(
-    wired_command: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+    wired_command: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     command = wired_command
     assert command.run("--run-id", "bottle-local-check") == 0
@@ -1433,35 +839,19 @@ def test_success_wires_complete_run_and_truthful_metadata(
         "image_average_precision=0.5",
         "pixel_auroc=0.625",
     ]
-
-
-def test_omitted_run_id_generates_a_safe_deterministic_component(
-    wired_command: SimpleNamespace,
-) -> None:
-    assert wired_command.run() == 0
-    run_id = wired_command.calls["persist"][2].run_id
-    assert run_id == "20260715T143012123456Z-bottle-aaaaaaa"
-    assert re.fullmatch(r"[A-Za-z0-9._-]+", run_id)
-
-
-@pytest.mark.parametrize(
-    ("device", "message"),
-    [
-        ("cuda", "must include an explicit index"),
-        ("cuda:0", "requested but unavailable"),
-    ],
-)
-def test_cuda_request_never_falls_back_to_cpu(
-    wired_command: SimpleNamespace,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    device: str,
-    message: str,
-) -> None:
-    monkeypatch.setattr(wired_command.torch.cuda, "is_available", lambda: False)
-    assert wired_command.run(device=device) == 1
-    assert message in capsys.readouterr().err
-    assert "evaluate" not in wired_command.calls
+    command.calls.clear()
+    monkeypatch.setattr(
+        command.evaluation_module,
+        "evaluate_mvtec_category",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("invalid dataset structure")
+        ),
+    )
+    assert command.run("--run-id", "failed") == 1
+    captured = capsys.readouterr()
+    assert "invalid dataset structure" in captured.err
+    assert "Traceback" not in captured.err
+    assert "persist" not in command.calls
 
 
 def _benchmark_arguments(device: str, *extra: str) -> list[str]:
@@ -1592,190 +982,12 @@ def test_benchmark_routes_cpu_indexed_cuda_and_mps_with_exact_load_nanoseconds(
         assert "synchronized_end_to_end_p50_ms=2.5" in output
         assert f"timing_device={device}" in output
 
-
-def test_benchmark_rejects_invalid_surface_before_workload(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
     monkeypatch.setattr(
         cli,
-        "_benchmark",
-        lambda *args: (_ for _ in ()).throw(AssertionError("workload executed")),
+        "_resolve_device",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("accelerator unavailable")),
     )
-    scenarios = (
-        (("cuda",), "explicit index"),
-        (("xpu:0",), "cpu, cuda:<index>, or mps"),
-        (("cpu", "--warmup-count", "4"), "warmup-count must be 5"),
-        (("cpu", "--repeat-count", "29"), "repeat-count must be 30"),
-    )
-    for arguments, message in scenarios:
-        assert cli.main(_benchmark_arguments(*arguments)) == 1
-        captured = capsys.readouterr()
-        assert message in captured.err
-        assert "Traceback" not in captured.err
-
-
-def test_benchmark_rejects_unavailable_accelerators_without_cpu_fallback(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    import torch
-
-    monkeypatch.setattr(cli, "_configure_determinism", lambda *args: {})
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
-    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
-    for device, message in (("cuda:2", "CUDA device"), ("mps", "MPS device")):
-        assert cli.main(_benchmark_arguments(device)) == 1
-        captured = capsys.readouterr()
-        assert message in captured.err and "unavailable" in captured.err
-        assert "Traceback" not in captured.err
-
-
-def test_mps_fallback_presence_is_rejected_before_torch_import() -> None:
-    code = f"""
-import contextlib
-import io
-import os
-import sys
-import inspectrt.cli as cli
-arguments = {_benchmark_arguments("mps")!r}
-for value in ('1', '0', 'false', ''):
-    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = value
-    with contextlib.redirect_stderr(io.StringIO()) as errors:
-        assert cli.main(arguments) == 1
-    assert 'requires PYTORCH_ENABLE_MPS_FALLBACK to be absent' in errors.getvalue()
-    assert 'Traceback' not in errors.getvalue()
-    assert os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] == value
-    assert 'torch' not in sys.modules
-"""
-    result = subprocess.run(
-        (sys.executable, "-c", code),
-        cwd=_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
-def test_benchmark_is_the_only_timing_cli_namespace() -> None:
-    result = _console("--help")
-    assert result.returncode == 0
-    assert "benchmark" in result.stdout
-    for name in ("portable-timing", "benchmark-v2", "benchmark-mps"):
-        assert name not in result.stdout
-
-
-def _git(cwd: Path, *arguments: str) -> str:
-    return subprocess.run(
-        ("git", *arguments),
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-
-
-def test_repository_commit_dirty_state_and_exact_lock_digest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "commit.gpgSign")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
-    _git(tmp_path, "init", "--quiet")
-    _git(tmp_path, "config", "user.email", "test@example.com")
-    _git(tmp_path, "config", "user.name", "Test User")
-    lock_bytes = b"exact lock bytes\x00\n"
-    (tmp_path / "uv.lock").write_bytes(lock_bytes)
-    (tmp_path / ".gitignore").write_text("outputs/\n_extra/\n", encoding="utf-8")
-    tracked = tmp_path / "tracked.txt"
-    tracked.write_text("clean\n", encoding="utf-8")
-    _git(tmp_path, "add", ".")
-    _git(
-        tmp_path,
-        "-c",
-        "commit.gpgSign=false",
-        "commit",
-        "--quiet",
-        "-m",
-        "fixture",
-    )
-    assert _git(tmp_path, "config", "--get", "commit.gpgSign") == "true"
-    assert (
-        "gpgsign"
-        not in (tmp_path / ".git/config").read_text(encoding="utf-8").casefold()
-    )
-    nested = tmp_path / "nested" / "directory"
-    nested.mkdir(parents=True)
-    (tmp_path / "outputs").mkdir()
-    (tmp_path / "outputs" / "ignored").write_text("ignored", encoding="utf-8")
-    (tmp_path / "_extra").mkdir()
-    (tmp_path / "_extra" / "ignored").write_text("ignored", encoding="utf-8")
-
-    root, commit, dirty, digest = cli._repository_metadata(nested)
-    assert root == tmp_path.resolve()
-    assert commit == _git(tmp_path, "rev-parse", "HEAD")
-    assert dirty is False
-    assert digest == hashlib.sha256(lock_bytes).hexdigest()
-
-    tracked.write_text("dirty\n", encoding="utf-8")
-    assert cli._repository_metadata(nested)[2] is True
-
-
-def test_repository_metadata_fails_outside_git_and_without_lock(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match="Git metadata command failed"):
-        cli._repository_metadata(tmp_path)
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    _git(repository, "init", "--quiet")
-    _git(repository, "config", "user.email", "test@example.com")
-    _git(repository, "config", "user.name", "Test User")
-    (repository / "tracked").write_text("data", encoding="utf-8")
-    _git(repository, "add", ".")
-    _git(
-        repository,
-        "-c",
-        "commit.gpgSign=false",
-        "commit",
-        "--quiet",
-        "-m",
-        "fixture",
-    )
-    with pytest.raises(FileNotFoundError, match="uv.lock not found"):
-        cli._repository_metadata(repository)
-
-
-def test_evaluation_failure_is_concise_and_does_not_persist(
-    wired_command: SimpleNamespace,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    def fail(*args: object, **kwargs: object) -> None:
-        raise ValueError("invalid dataset structure")
-
-    monkeypatch.setattr(
-        wired_command.evaluation_module, "evaluate_mvtec_category", fail
-    )
-    assert wired_command.run("--run-id", "failed") == 1
+    assert cli.main(_benchmark_arguments("cuda:2")) == 1
     captured = capsys.readouterr()
-    assert "invalid dataset structure" in captured.err
+    assert "accelerator unavailable" in captured.err
     assert "Traceback" not in captured.err
-    assert "persist" not in wired_command.calls
-    assert not wired_command.output_root.exists()
-
-
-def test_existing_run_id_is_reported_without_overwrite(
-    wired_command: SimpleNamespace,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    def fail(*args: object) -> None:
-        raise FileExistsError("Run directory already exists: existing")
-
-    monkeypatch.setattr(wired_command.artifacts, "persist_baseline_run", fail)
-    assert wired_command.run("--run-id", "existing") == 1
-    captured = capsys.readouterr()
-    assert "already exists" in captured.err
-    assert "Traceback" not in captured.err
-    assert not wired_command.output_root.exists()

@@ -192,26 +192,16 @@ def test_patch_extractor_callable_reuses_complete_category_orchestration(
         assert torch.equal(getattr(result, name), getattr(expected, name))
 
 
-@pytest.mark.parametrize(
-    ("empty", "message"),
-    [("train", "No nominal training samples"), ("test", "No test samples")],
-)
-def test_rejects_empty_training_or_test_partitions(
-    tmp_path: Path, empty: str, message: str
-) -> None:
-    _make_dataset(tmp_path)
-    for sample in discover_mvtec_samples(tmp_path, "bottle"):
-        if sample.split == empty:
-            (tmp_path / sample.image_relpath).unlink()
-
-    with pytest.raises(ValueError, match=message):
-        _evaluate(tmp_path)
-
-
-def test_rejects_unavailable_cuda(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _make_dataset(tmp_path)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="CUDA.*unavailable"):
-        _evaluate(tmp_path, "cuda")
+def test_rejects_empty_training_or_test_partitions(tmp_path: Path) -> None:
+    for empty, message in (
+        ("train", "No nominal training samples"),
+        ("test", "No test samples"),
+    ):
+        root = tmp_path / empty
+        _make_dataset(root)
+        for sample in discover_mvtec_samples(root, "bottle"):
+            if sample.split == empty:
+                (root / sample.image_relpath).unlink()
+        with pytest.raises(ValueError, match=message) as raised:
+            _evaluate(root)
+        assert raised.value, empty

@@ -58,22 +58,13 @@ def exported_model(
     return onnx.load(model_path, load_external_data=False), model_path
 
 
-def test_builds_frozen_evaluation_graph(
-    graph_and_reference: tuple[nn.Module, nn.Module],
-) -> None:
-    graph, _ = graph_and_reference
-    parameters = list(graph.parameters())
-
-    assert not graph.training
-    assert all(not module.training for module in graph.modules())
-    assert parameters
-    assert all(not parameter.requires_grad for parameter in parameters)
-
-
-def test_eager_dual_outputs_exactly_match_the_existing_path(
+def test_frozen_eager_graph_exactly_matches_the_existing_path(
     graph_and_reference: tuple[nn.Module, nn.Module],
 ) -> None:
     graph, reference = graph_and_reference
+    assert not graph.training
+    assert all(not module.training for module in graph.modules())
+    assert all(not parameter.requires_grad for parameter in graph.parameters())
     images = torch.linspace(
         -1.0,
         1.0,
@@ -99,12 +90,13 @@ def test_eager_dual_outputs_exactly_match_the_existing_path(
     assert not patch_embeddings.requires_grad
 
 
-def test_exports_static_fp32_dual_output_contract(
+def test_exports_static_dual_outputs_with_pool_and_row_major_layout(
     exported_model: tuple[Any, Path],
 ) -> None:
     from onnx import TensorProto
+    from onnx.external_data_helper import uses_external_data
 
-    model, _ = exported_model
+    model, model_path = exported_model
 
     assert [_value_info(value) for value in model.graph.input] == [
         ("images", TensorProto.FLOAT, (1, 3, 256, 256))
@@ -116,14 +108,6 @@ def test_exports_static_fp32_dual_output_contract(
     assert [(opset.domain, opset.version) for opset in model.opset_import] == [("", 20)]
     assert {node.domain for node in model.graph.node} == {""}
     assert not model.functions
-
-
-def test_exports_frozen_pool_and_row_major_layout_without_external_data(
-    exported_model: tuple[Any, Path],
-) -> None:
-    from onnx.external_data_helper import uses_external_data
-
-    model, model_path = exported_model
     nodes_by_operation = {
         operation: [node for node in model.graph.node if node.op_type == operation]
         for operation in ("AveragePool", "Transpose", "Reshape")

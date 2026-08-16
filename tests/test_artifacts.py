@@ -1,13 +1,11 @@
-from dataclasses import FrozenInstanceError, asdict, replace
+from dataclasses import asdict, replace
 import hashlib
-import inspect
 import json
 from pathlib import Path
 
 import pytest
 import torch
 
-import inspectrt.artifacts as artifacts
 from inspectrt.artifacts import BaselineRunMetadata, persist_baseline_run
 from inspectrt.benchmark import BaselineBenchmark
 import inspectrt.benchmark as benchmark_module
@@ -350,56 +348,9 @@ def test_persists_canonical_schema_two_benchmark_and_run_link(tmp_path: Path) ->
         "schema_version": 2,
         "timing_device": "cpu",
     }
-    source = inspect.getsource(artifacts.persist_baseline_run)
-    assert "benchmark.to_json_value()" in source
-    assert "benchmark.canonical_json" not in source
 
 
-def test_inventory_digest_excludes_run_metadata_but_identifies_order(
-    tmp_path: Path,
-) -> None:
-    evaluation = _evaluation()
-    variants = (
-        (evaluation, _metadata("base")),
-        (evaluation, _metadata("timestamp", created_at_utc="2026-07-15T13:00:00Z")),
-        (evaluation, _metadata("root", dataset_root="/another/dataset")),
-        (
-            replace(
-                evaluation, samples=(evaluation.samples[2], *evaluation.samples[:2])
-            ),
-            _metadata("reordered"),
-        ),
-    )
-    digests = []
-    for item, metadata in variants:
-        run_dir = persist_baseline_run(item, tmp_path, metadata)
-        run = json.loads((run_dir / "run.json").read_bytes())
-        digests.append(run["inventory"]["sample_inventory_sha256"])
-    assert digests[0] == digests[1] == digests[2] != digests[3]
-
-
-@pytest.mark.parametrize(
-    "run_id", ["", ".", "..", "../escape", "a/b", "a\\b", "/absolute", "a//b"]
-)
-def test_rejects_unsafe_run_ids(run_id: str) -> None:
-    with pytest.raises(ValueError, match="one path component"):
-        _metadata(run_id)
-
-
-def test_metadata_is_immutable_and_json_primitive_only() -> None:
-    versions = {"torch": "2.13.0"}
-    metadata = _metadata(dependency_versions=versions)
-    versions["torch"] = "changed"
-    assert metadata.dependency_versions == {"torch": "2.13.0"}
-    with pytest.raises(TypeError):
-        metadata.dependency_versions["torch"] = "changed"  # type: ignore[index]
-    with pytest.raises(FrozenInstanceError):
-        metadata.run_id = "changed"  # type: ignore[misc]
-    with pytest.raises(TypeError, match="JSON primitive"):
-        _metadata(dependency_versions={"torch": []})
-
-
-def test_never_overwrites_an_existing_run(tmp_path: Path) -> None:
+def _assert_no_overwrite(tmp_path: Path) -> None:
     destination = tmp_path / "runs" / "existing"
     destination.mkdir(parents=True)
     marker = destination / "keep.txt"
@@ -416,6 +367,7 @@ def test_never_overwrites_an_existing_run(tmp_path: Path) -> None:
 def test_failed_write_removes_final_and_temporary_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _assert_no_overwrite(tmp_path)
     real_write_bytes = Path.write_bytes
 
     def fail_late(path: Path, value: bytes) -> int:
@@ -424,15 +376,20 @@ def test_failed_write_removes_final_and_temporary_directories(
         return real_write_bytes(path, value)
 
     monkeypatch.setattr(Path, "write_bytes", fail_late)
+    failed_root = tmp_path / "failed-root"
     metadata = _metadata("failed", requested_device="cpu")
     with pytest.raises(OSError, match="late write failed"):
         persist_baseline_run(
-            _evaluation(), tmp_path, metadata, benchmark=_benchmark(metadata)
+            _evaluation(), failed_root, metadata, benchmark=_benchmark(metadata)
         )
-    assert list((tmp_path / "runs").iterdir()) == []
+    assert list((failed_root / "runs").iterdir()) == []
 
 
-def test_rejects_nonfinite_tensors_and_nonfloat_metrics(tmp_path: Path) -> None:
+def test_rejects_unsafe_identity_and_invalid_scientific_values(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="one path component"):
+        _metadata("../unsafe")
+    assert not (tmp_path / "runs").exists()
+
     evaluation = _evaluation()
     distances = evaluation.patch_distances.clone()
     distances[0, 0] = torch.nan

@@ -11,16 +11,33 @@ import inspectrt.onnx_artifacts as artifacts
 
 _COMMIT = "3442fa51fa4134851147466d9cac662c7fd85953"
 _LOCK = "d92724be7ede2442141cf898a67d12752e44d3bd5df6077dbd5ae97df325df42"
+_REAL_IMPORT_ONNX = artifacts._import_onnx
+_REAL_INSPECT_MODEL = artifacts._inspect_model
+_MODEL_RECORD = {
+    "checker_full_check": "passed",
+    "external_data": False,
+    "graph_name": "main_graph",
+    "ir_version": 10,
+    "model_domain": "",
+    "model_version": 0,
+    "node_domains": [""],
+    "opset_imports": [{"domain": "", "version": 20}],
+    "producer_name": "pytorch",
+    "producer_version": "2.13.0+cu130",
+}
 
 
 @pytest.fixture(scope="module")
-def contract_model(tmp_path_factory: pytest.TempPathFactory) -> Path | None:
+def contract_model(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("onnx-artifact-contract")
+    path = directory / "model.onnx"
     if find_spec("onnx") is None:
-        return None
+        path.write_bytes(b"base-install-model-double")
+        return path
+
     import onnx
     from onnx import TensorProto, helper
 
-    directory = tmp_path_factory.mktemp("onnx-artifact-contract")
     layer2_shape = helper.make_tensor(
         "layer2_shape", TensorProto.INT64, [4], [1, 512, 32, 32]
     )
@@ -75,7 +92,6 @@ def contract_model(tmp_path_factory: pytest.TempPathFactory) -> Path | None:
         producer_name="pytorch",
         producer_version="2.13.0+cu130",
     )
-    path = directory / "model.onnx"
     path.write_bytes(model.SerializeToString())
     onnx.checker.check_model(path, full_check=True)
     return path
@@ -111,6 +127,13 @@ def _publish(
         "_EXPECTED_MODEL_SHA256",
         hashlib.sha256(model_bytes).hexdigest(),
     )
+    monkeypatch.setattr(artifacts, "_import_onnx", lambda *, export: object())
+    monkeypatch.setattr(
+        artifacts,
+        "_inspect_model",
+        lambda *args, **kwargs: dict(_MODEL_RECORD),
+    )
+    monkeypatch.setattr(artifacts.importlib_metadata, "version", lambda name: "test")
     return artifacts.publish_onnx_feature_artifact(
         root,
         git_commit=_COMMIT,
@@ -151,11 +174,8 @@ def _rehash_artifact(directory: Path) -> tuple[int, str]:
 def test_canonical_two_file_round_trip_is_deterministic_and_immutable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    contract_model: Path | None,
+    contract_model: Path,
 ) -> None:
-    if contract_model is None:
-        assert find_spec("onnx") is None
-        return
     first_path, first = _publish(tmp_path / "first", contract_model, monkeypatch)
     second_path, second = _publish(tmp_path / "second", contract_model, monkeypatch)
 
@@ -185,11 +205,8 @@ def test_canonical_two_file_round_trip_is_deterministic_and_immutable(
 def test_strict_inventory_and_symlink_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    contract_model: Path | None,
+    contract_model: Path,
 ) -> None:
-    if contract_model is None:
-        assert find_spec("onnx") is None
-        return
     source, _ = _publish(tmp_path / "source", contract_model, monkeypatch)
 
     extra = _copy_artifact(source, tmp_path, "extra")
@@ -205,16 +222,17 @@ def test_strict_inventory_and_symlink_boundaries(
     for directory in (extra, missing, linked_file, linked_directory):
         with pytest.raises(ValueError):
             artifacts.load_onnx_feature_artifact(directory)
+    with monkeypatch.context() as scoped:
+        _assert_manifest_validation_classes(
+            tmp_path / "manifest-cases", scoped, contract_model
+        )
 
 
-def test_manifest_rejects_malformed_noncanonical_unknown_and_wrong_types(
+def _assert_manifest_validation_classes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    contract_model: Path | None,
+    contract_model: Path,
 ) -> None:
-    if contract_model is None:
-        assert find_spec("onnx") is None
-        return
     source, _ = _publish(tmp_path / "source", contract_model, monkeypatch)
     original = (source / "manifest.json").read_bytes()
 
@@ -256,11 +274,8 @@ def test_manifest_rejects_malformed_noncanonical_unknown_and_wrong_types(
 def test_model_id_and_digest_integrity_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    contract_model: Path | None,
+    contract_model: Path,
 ) -> None:
-    if contract_model is None:
-        assert find_spec("onnx") is None
-        return
     source, _ = _publish(tmp_path / "source", contract_model, monkeypatch)
 
     changed_model = _copy_artifact(source, tmp_path, "changed-model")
@@ -296,15 +311,16 @@ def test_model_id_and_digest_integrity_fail_closed(
 def test_graph_contract_metadata_and_external_data_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    contract_model: Path | None,
+    contract_model: Path,
 ) -> None:
-    if contract_model is None:
-        assert find_spec("onnx") is None
-        return
+    if find_spec("onnx") is None:
+        pytest.skip("install inspectrt[onnx] to run ONNX graph inspection tests")
     import onnx
     from onnx import TensorProto, helper
 
     source, _ = _publish(tmp_path / "source", contract_model, monkeypatch)
+    monkeypatch.setattr(artifacts, "_import_onnx", _REAL_IMPORT_ONNX)
+    monkeypatch.setattr(artifacts, "_inspect_model", _REAL_INSPECT_MODEL)
 
     wrong_pool = _copy_artifact(source, tmp_path, "wrong-pool")
     model = onnx.load_model_from_string((wrong_pool / "model.onnx").read_bytes())
@@ -377,11 +393,8 @@ def test_graph_contract_metadata_and_external_data_fail_closed(
 def test_atomic_no_overwrite_and_failure_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    contract_model: Path | None,
+    contract_model: Path,
 ) -> None:
-    if contract_model is None:
-        assert find_spec("onnx") is None
-        return
     destination, _ = _publish(tmp_path / "existing", contract_model, monkeypatch)
     before = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()

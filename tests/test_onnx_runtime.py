@@ -174,7 +174,7 @@ def _install_fakes(
     )
 
 
-def test_delays_onnxruntime_import_and_names_the_missing_extra(
+def test_delays_runtime_import_and_loads_artifact_before_runtime_actions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -204,12 +204,6 @@ def test_delays_onnxruntime_import_and_names_the_missing_extra(
     )
     with pytest.raises(RuntimeError, match=r"inspectrt\[onnx\]"):
         runtime.OnnxRuntimeCpuFeatureConsumer.from_artifact(tmp_path)
-
-
-def test_strict_artifact_loading_precedes_every_runtime_action(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     calls = []
 
     def reject(path: Path) -> object:
