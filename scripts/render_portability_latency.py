@@ -37,16 +37,16 @@ CANDIDATE_ENVIRONMENTS = (
     "m1pro-macos-mps",
 )
 TIMING_LABELS = (
-    "T1000 · CUDA · reference",
-    "T1000 · CUDA · repeat",
-    "P53 · CPU",
-    "RTX 4080 Super · CUDA · WSL 2",
-    "M1 Pro · CPU",
-    "M1 Pro · MPS",
+    "T1000 CUDA reference",
+    "T1000 CUDA repeat",
+    "Intel Core i7-9850H CPU",
+    "RTX 4080 Super CUDA WSL 2",
+    "M1 Pro CPU",
+    "M1 Pro MPS",
 )
 CANDIDATE_LABELS = (
     "T1000 repeat",
-    "P53 CPU",
+    "Intel Core i7-9850H CPU",
     "RTX 4080 Super",
     "M1 Pro CPU",
     "M1 Pro MPS",
@@ -57,7 +57,7 @@ STAGES = (
     ("synchronized_end_to_end", "End to end"),
 )
 RENDERER_ID = "inspectrt_portability_latency"
-RENDERER_VERSION = 3
+RENDERER_VERSION = 5
 SVG_WIDTH = 1200
 SVG_HEIGHT = 1500
 

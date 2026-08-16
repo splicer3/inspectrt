@@ -2,7 +2,7 @@
 <svg role="img" aria-labelledby="title desc" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="1500" viewBox="0 0 864 1080" xmlns="http://www.w3.org/2000/svg" version="1.1">
  <title id="title">InspectRT cross-platform latency and nearest-neighbour index comparison</title>
  <desc id="desc">Panel A shows p50 to p95 pipeline stage latency for six environments. Panel B shows exact top-1 nearest-neighbour index differences for five completed candidates, including MPS.</desc>
- <metadata>{"comparison_id":"1dec773f2d237598305a315145bec7bc40b9f94fbd326ed44f6330d3c9a11fe5","performance_sha256":"44057e5317b902341b1b359c0ff5a43f3900940115a206e1bd8ea2774adc85d9","renderer_id":"inspectrt_portability_latency","renderer_version":3,"schema_id":"inspectrt_portability_latency_graph_v1","schema_version":1,"scientific_sha256":"81318cd81c0e5f23be953719c2bb03604c22c75bb8c1dd17c389786623d32b8a"}</metadata>
+ <metadata>{"comparison_id":"1dec773f2d237598305a315145bec7bc40b9f94fbd326ed44f6330d3c9a11fe5","performance_sha256":"44057e5317b902341b1b359c0ff5a43f3900940115a206e1bd8ea2774adc85d9","renderer_id":"inspectrt_portability_latency","renderer_version":5,"schema_id":"inspectrt_portability_latency_graph_v1","schema_version":1,"scientific_sha256":"81318cd81c0e5f23be953719c2bb03604c22c75bb8c1dd17c389786623d32b8a"}</metadata>
  <defs>
   <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
  </defs>
@@ -295,37 +295,37 @@ L 0 2
     <g id="ytick_1">
      <g id="line2d_36"/>
      <g id="text_9">
-      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="184.745353" transform="rotate(-0 257.84 184.745353)">T1000 · CUDA · reference</text>
+      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="184.745353" transform="rotate(-0 257.84 184.745353)">T1000 CUDA reference</text>
      </g>
     </g>
     <g id="ytick_2">
      <g id="line2d_37"/>
      <g id="text_10">
-      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="245.954561" transform="rotate(-0 257.84 245.954561)">T1000 · CUDA · repeat</text>
+      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="245.954561" transform="rotate(-0 257.84 245.954561)">T1000 CUDA repeat</text>
      </g>
     </g>
     <g id="ytick_3">
      <g id="line2d_38"/>
      <g id="text_11">
-      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="307.164239" transform="rotate(-0 257.84 307.164239)">P53 · CPU</text>
+      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="307.164708" transform="rotate(-0 257.84 307.164708)">Intel Core i7-9850H CPU</text>
      </g>
     </g>
     <g id="ytick_4">
      <g id="line2d_39"/>
      <g id="text_12">
-      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="368.373916" transform="rotate(-0 257.84 368.373916)">RTX 4080 Super · CUDA · WSL 2</text>
+      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="368.373916" transform="rotate(-0 257.84 368.373916)">RTX 4080 Super CUDA WSL 2</text>
      </g>
     </g>
     <g id="ytick_5">
      <g id="line2d_40"/>
      <g id="text_13">
-      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="429.583594" transform="rotate(-0 257.84 429.583594)">M1 Pro · CPU</text>
+      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="429.583594" transform="rotate(-0 257.84 429.583594)">M1 Pro CPU</text>
      </g>
     </g>
     <g id="ytick_6">
      <g id="line2d_41"/>
      <g id="text_14">
-      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="490.793271" transform="rotate(-0 257.84 490.793271)">M1 Pro · MPS</text>
+      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="490.793271" transform="rotate(-0 257.84 490.793271)">M1 Pro MPS</text>
      </g>
     </g>
    </g>
@@ -840,7 +840,7 @@ L 812.16 686.975806
     <g id="ytick_8">
      <g id="line2d_112"/>
      <g id="text_34">
-      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="780.268347" transform="rotate(-0 257.84 780.268347)">P53 CPU</text>
+      <text style="font-size: 12px; font-family: 'DejaVu Sans'; text-anchor: end" x="257.84" y="780.268816" transform="rotate(-0 257.84 780.268816)">Intel Core i7-9850H CPU</text>
      </g>
     </g>
     <g id="ytick_9">

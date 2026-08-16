@@ -16,12 +16,19 @@ commands, and validation limits.
 
 The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 with a
 Quadro T1000 and the current locked Linux stack. The frozen `bottle` workload
-also has reviewed results for P53 CPU, RTX 4080 Super CUDA under WSL 2, M1 Pro
-CPU, and M1 Pro MPS. Floating outputs and metrics stayed within the reviewed
-envelope, although exact nearest-neighbour indices varied across devices. The
-synchronized wall-clock record contains six descriptive timing rows. See
+also has reviewed results for Intel Core i7-9850H CPU, RTX 4080 Super CUDA under
+WSL 2, M1 Pro CPU, and M1 Pro MPS. Floating outputs and metrics stayed within
+the reviewed envelope, although exact nearest-neighbour indices varied across
+devices. The synchronized wall-clock record contains six descriptive timing
+rows. See
 [docs/portability.md](docs/portability.md) and the baseline method contract in
 [docs/baseline.md](docs/baseline.md).
+
+The frozen `bottle` workload also has a reviewed ONNX feature boundary for
+`layer2` and row-major patch embeddings. ONNX Runtime CPU results pass the
+policy-v2 calibration and independent Ryzen/WSL2 holdout. See
+[docs/onnx-portability.md](docs/onnx-portability.md) and the compact
+[scientific evidence](docs/evidence/inspectrt_onnx_feature_portability_v1/scientific.json).
 
 ## Installation
 
@@ -32,12 +39,43 @@ for its locked environment:
 uv sync --locked
 ```
 
+The optional ONNX artifact tools and CPU consumer use a separate extra:
+
+```bash
+uv sync --locked --extra onnx
+```
+
 Run the repository checks with:
 
 ```bash
 uv run pytest
 uv run ruff check .
 ```
+
+## ONNX feature artifact
+
+Export the static feature graph from a clean source tree with the accepted
+pretrained weight already cached:
+
+```bash
+uv run --extra onnx inspectrt onnx export \
+  --output-root outputs
+```
+
+The generated artifact contains only `manifest.json` and `model.onnx`. Its model
+bytes remain ignored. Validate the artifact and graph identities with:
+
+```bash
+uv run --extra onnx inspectrt onnx validate \
+  --artifact \
+  outputs/artifacts/inspectrt_onnx_feature_portability_v1/<artifact-id>
+```
+
+Validation covers artifact structure and graph identities. The scientific
+comparison is a separate procedure. The graph performs feature extraction only;
+preprocessing, retrieval, scoring, and metrics remain outside it. See the
+[ONNX portability guide](docs/onnx-portability.md) for the direct CPU consumer
+and reviewed limits.
 
 ## MVTec AD
 

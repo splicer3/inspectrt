@@ -5,8 +5,8 @@ The public record covers one frozen MVTec AD `bottle` workload under
 unchanged. The performance JSON contains six timing rows. All use benchmark
 schema 2 and synchronized wall-clock timing from the same harness.
 
-The matrix includes a Quadro T1000 on native Linux, the P53 CPU, an RTX 4080
-Super under WSL 2, and an M1 Pro using both CPU and MPS.
+The matrix includes a Quadro T1000 on native Linux, an Intel Core i7-9850H CPU,
+an RTX 4080 Super under WSL 2, and an M1 Pro using both CPU and MPS.
 
 ## Method
 
@@ -46,20 +46,20 @@ All values are milliseconds, shown as `p50 / p95` in evidence order.
 
 | Environment | Feature extraction | Exact retrieval | End to end |
 | --- | ---: | ---: | ---: |
-| T1000 · CUDA · reference | `6.0076435 / 6.0330497` | `245.889269 / 246.27839245` | `273.639384 / 273.8713274` |
-| T1000 · CUDA · repeat | `6.025451 / 6.1318254` | `245.9324995 / 246.04000495` | `272.258691 / 273.3827447` |
-| P53 · CPU | `27.1753105 / 28.462513099999998` | `1061.222402 / 1080.1501984` | `1115.5387955 / 1137.54055905` |
-| RTX 4080 Super · CUDA · WSL 2 | `4.1291615 / 10.1818199` | `18.59127 / 19.375321` | `36.701378 / 41.93894815` |
-| M1 Pro · CPU | `18.622708 / 20.4750205` | `206.1779375 / 211.8529125` | `240.1169165 / 248.6138227` |
-| M1 Pro · MPS | `5.7808745 / 6.43175625` | `150.9159795 / 153.86682105` | `171.8568335 / 175.5521731` |
+| T1000 CUDA reference | `6.0076435 / 6.0330497` | `245.889269 / 246.27839245` | `273.639384 / 273.8713274` |
+| T1000 CUDA repeat | `6.025451 / 6.1318254` | `245.9324995 / 246.04000495` | `272.258691 / 273.3827447` |
+| Intel Core i7-9850H CPU | `27.1753105 / 28.462513099999998` | `1061.222402 / 1080.1501984` | `1115.5387955 / 1137.54055905` |
+| RTX 4080 Super CUDA WSL 2 | `4.1291615 / 10.1818199` | `18.59127 / 19.375321` | `36.701378 / 41.93894815` |
+| M1 Pro CPU | `18.622708 / 20.4750205` | `206.1779375 / 211.8529125` | `240.1169165 / 248.6138227` |
+| M1 Pro MPS | `5.7808745 / 6.43175625` | `150.9159795 / 153.86682105` | `171.8568335 / 175.5521731` |
 
 All 29 structural gates pass for every completed scientific candidate. Sample
 IDs, labels, and masks match exactly. Every floating component has zero policy
 violations, and each metric delta remains inside its reviewed limit. Exact
 top-1 indices still differ across devices: 0 of 84,992 for the T1000 repeat,
-3,569 for P53 CPU, 1,826 for RTX 4080 Super, 2,701 for M1 Pro CPU, and 3,019
-for M1 Pro MPS. The four cross-device records have status `drift_detected`
-because exact index identity is a policy gate.
+3,569 for Intel Core i7-9850H CPU, 1,826 for RTX 4080 Super, 2,701 for M1 Pro
+CPU, and 3,019 for M1 Pro MPS. The four cross-device records have status
+`drift_detected` because exact index identity is a policy gate.
 
 ## Evidence
 
@@ -85,7 +85,7 @@ uv run python scripts/render_portability_latency.py \
 | `scientific.json` SHA-256 | `81318cd81c0e5f23be953719c2bb03604c22c75bb8c1dd17c389786623d32b8a` |
 | Performance | `a6fe809b46bacafd6f1ffdbd3c22ad37d4da1226e48ed2cdd519148b99f3370e` |
 | `performance.json` SHA-256 | `44057e5317b902341b1b359c0ff5a43f3900940115a206e1bd8ea2774adc85d9` |
-| `latency.svg` SHA-256 | `0dc5f7527d95de879ba90f8524bb0cf00eea8b74cbf343792d6ec6618ea9054b` |
+| `latency.svg` SHA-256 | `0fabd72ac0c517c7a1d9f77f6a14a7f9cddee75039ffd8164555f004b61be57a` |
 
 ## Limits
 
