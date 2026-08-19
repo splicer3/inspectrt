@@ -17,7 +17,7 @@ def test_onnx_extra_is_published_and_package_import_isolated() -> None:
 
     assert project["optional-dependencies"]["onnx"] == [
         "onnx>=1.22.0",
-        "onnxruntime>=1.28.0",
+        "onnxruntime==1.28.0",
         "onnxscript>=0.7.1",
     ]
     assert not any(

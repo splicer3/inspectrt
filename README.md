@@ -120,3 +120,15 @@ Both commands write to `outputs/runs/<generated-run-id>/`. An evaluation run
 has seven files. They contain the resolved run metadata, ordered inventory,
 memory bank, predictions, retrieval results, anomaly maps and masks, and
 metrics. A benchmark run adds `benchmark.json`. Generated runs are gitignored.
+
+## License and distribution
+
+InspectRT-authored code is licensed under the
+[Apache License 2.0](LICENSE), and [NOTICE](NOTICE) preserves first-party
+attribution. Dependencies, datasets, and pretrained weights retain separate
+terms. MVTec AD is obtained separately by the user.
+
+Distributions exclude MVTec bytes and application-derived tensors, pretrained
+weights, generated ONNX models, large memory banks, and private evidence.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) records the dependency,
+dataset, weight, and generated-artifact boundaries.
