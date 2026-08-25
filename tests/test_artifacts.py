@@ -324,6 +324,47 @@ def test_persists_complete_recomputable_bundle_without_mutation(tmp_path: Path) 
     )
 
 
+def test_persists_installed_distribution_provenance_as_schema_two(
+    tmp_path: Path,
+) -> None:
+    from inspectrt.portability import BundleValidationError, load_comparable_bundle
+
+    profile_digest = "8df093df5eb8e35f77e0e8c088746b34fe69023f115f89fb822a5682d66cdfb6"
+    metadata = _metadata(
+        "installed-run",
+        git_commit=None,
+        git_dirty=None,
+        uv_lock_sha256=None,
+        source_kind="installed_distribution",
+        distribution_name="inspectrt",
+        distribution_version="0.1.0",
+        baseline_profile_sha256=profile_digest,
+    )
+
+    run_dir = persist_baseline_run(_evaluation(), tmp_path, metadata)
+
+    assert {path.name for path in run_dir.iterdir()} == _FILES
+    _assert_canonical(run_dir / "run.json")
+    run = json.loads((run_dir / "run.json").read_bytes())
+    assert run["schema_version"] == 2
+    assert run["source"] == {
+        "baseline_profile_sha256": profile_digest,
+        "distribution_name": "inspectrt",
+        "distribution_version": "0.1.0",
+        "kind": "installed_distribution",
+    }
+    assert not ({"dirty", "git_commit", "uv_lock_sha256"} & run["source"].keys())
+    with pytest.raises(BundleValidationError, match="schema_version"):
+        load_comparable_bundle(run_dir)
+    with pytest.raises(ValueError, match="must not contain repository fields"):
+        _metadata(
+            source_kind="installed_distribution",
+            distribution_name="inspectrt",
+            distribution_version="0.1.0",
+            baseline_profile_sha256=profile_digest,
+        )
+
+
 def test_persists_canonical_schema_two_benchmark_and_run_link(tmp_path: Path) -> None:
     metadata = _metadata(requested_device="cpu")
     benchmark = _benchmark(metadata)

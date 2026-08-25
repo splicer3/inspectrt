@@ -50,17 +50,22 @@ Install the locked environment, then evaluate one category:
 ```bash
 uv sync --locked
 uv run inspectrt evaluate \
-  --config configs/baseline.toml \
   --dataset-root datasets/mvtec_ad \
   --category bottle \
   --device cuda:0 \
   --output-root outputs
 ```
 
-`--config` selects the committed profile. `--dataset-root` is the parent of the
-category directories. Use `--category` to choose a category and `--device` to
-choose the PyTorch device. `--output-root` sets the run directory location.
-`--run-id` is optional; InspectRT generates a safe ID when it is omitted.
+Omitting `--config` selects the exact bundled `inspectrt_feature_memory_v1`
+profile. An explicit profile path remains supported through `--config` and is
+validated by the same strict parser. The MVTec root remains user-supplied, and
+torchvision resolves the official pretrained weight separately; neither is
+included in InspectRT distributions.
+
+`--dataset-root` is the parent of the category directories. Use `--category`
+to choose a category and `--device` to choose the PyTorch device.
+`--output-root` sets the run directory location. `--run-id` is optional;
+InspectRT generates a safe ID when it is omitted.
 
 ## Running a benchmark
 
@@ -98,6 +103,17 @@ the same files plus `benchmark.json`.
 Raw maps and masks permit metric recomputation. `benchmark.json` is absent from
 evaluation-only runs. Outputs are ignored by Git, and the complete memory bank
 makes accepted runs large.
+
+Repository execution retains run schema 1 and its exact Git commit, real dirty
+state, and repository `uv.lock` digest. Installed-distribution evaluation uses
+run schema 2 with the strict source fields `kind`, `distribution_name`,
+`distribution_version`, and `baseline_profile_sha256`; it does not invent Git
+or lockfile identity. The profile digest records the exact bundled or explicit
+TOML bytes used. Evaluation still writes exactly the seven files above.
+
+The existing portability and fixture-export readers remain schema-1-only and
+reject installed schema-2 runs. Installed runs do not rewrite, replace, or
+extend the frozen accepted evidence.
 
 ## Accepted results
 
@@ -138,8 +154,10 @@ algorithms with cuDNN benchmarking disabled. FP32 precision is set to `ieee`,
 with TF32 disabled and `CUBLAS_WORKSPACE_CONFIG=:4096:8`. The profile pins
 `ResNet50_Weights.IMAGENET1K_V2`; the accepted cached weight SHA-256 is
 `11ad3fa62ca79e40addfd354a8ec4b7c75143b3038b8d2a807fbc68deab379ca`.
-Each run records its Git commit and dirty state. It also records dependency
-versions, platform, lockfile digest, and the ordered sample-inventory digest.
+Repository runs record their Git commit, dirty state, and lockfile digest.
+Installed runs instead record their distribution identity and exact profile
+digest. Both forms record dependency versions, platform, and the ordered
+sample-inventory digest.
 
 The accepted `uv.lock` SHA-256 is
 `ddaddc99b318a1c3a04d5d7cc433cf736d321b56f98a8ae8b532e71e19e6d76b`.

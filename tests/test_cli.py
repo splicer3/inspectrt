@@ -32,6 +32,13 @@ _DETERMINISM_KEYS = {
 }
 
 
+def _installed_source_error() -> None:
+    raise RuntimeError(
+        "this command requires an InspectRT source checkout with Git and "
+        "uv.lock provenance"
+    )
+
+
 def _console(*arguments: str) -> subprocess.CompletedProcess[str]:
     executable = shutil.which("inspectrt")
     assert executable is not None
@@ -68,6 +75,14 @@ def test_baseline_profile_accepts_contract_and_rejects_invalid_classes(
         False,
         ":4096:8",
     )
+    bundled, bundled_digest = cli._runtime_baseline(None)
+    assert bundled == config
+    assert bundled_digest == hashlib.sha256(_PROFILE.read_bytes()).hexdigest()
+    explicit = tmp_path / "explicit-baseline.toml"
+    explicit.write_bytes(_PROFILE.read_bytes() + b"\n")
+    explicit_config, explicit_digest = cli._runtime_baseline(explicit)
+    assert explicit_config == config
+    assert explicit_digest == hashlib.sha256(explicit.read_bytes()).hexdigest()
     with _PROFILE.open("rb") as stream:
         raw = tomllib.load(stream)
     assert set(raw) == _TOP_LEVEL_KEYS
@@ -105,6 +120,8 @@ def test_baseline_profile_accepts_contract_and_rejects_invalid_classes(
 
 def test_command_groups_expose_the_documented_parser_surface() -> None:
     root = _console("--help")
+    evaluate = _console("evaluate", "--help")
+    benchmark = _console("benchmark", "--help")
     group = _console("portability", "--help")
     compare = _console("portability", "compare", "--help")
     performance = _console("portability", "performance", "--help")
@@ -137,7 +154,13 @@ def test_command_groups_expose_the_documented_parser_surface() -> None:
     assert fixture_group.returncode == fixture_validate.returncode == 0
     assert fixture_export.returncode == 0
     assert "{validate,export}" in fixture_group.stdout
-    assert "--fixture" in fixture_validate.stdout
+    assert "[--fixture FIXTURE]" in fixture_validate.stdout
+    assert "fixture directory (default: bundled synthetic-" in fixture_validate.stdout
+    assert "correctness-v1)" in fixture_validate.stdout
+    assert "[--config CONFIG]" in evaluate.stdout
+    assert "[--config CONFIG]" in benchmark.stdout
+    assert "baseline TOML profile (default: bundled" in evaluate.stdout
+    assert "inspectrt_feature_memory_v1)" in evaluate.stdout
     assert all(
         argument in fixture_export.stdout
         for argument in (
@@ -233,7 +256,7 @@ def wired_portability(
     monkeypatch.setattr(
         cli,
         "_repository_metadata",
-        lambda cwd: (_ROOT, "a" * 40, True, "b" * 64),
+        lambda: (_ROOT, "a" * 40, True, "b" * 64),
     )
 
     def run(
@@ -267,6 +290,7 @@ def wired_portability(
 
 def test_portability_routes_candidates_in_explicit_order(
     wired_portability: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     command = wired_portability
@@ -288,6 +312,11 @@ def test_portability_routes_candidates_in_explicit_order(
     captured = capsys.readouterr()
     assert "candidate contract mismatch" in captured.err
     assert "Traceback" not in captured.err
+    command.publisher.reset_mock()
+    monkeypatch.setattr(cli, "_repository_metadata", _installed_source_error)
+    assert command.run(*candidates) == 1
+    assert "source checkout with Git and uv.lock provenance" in capsys.readouterr().err
+    command.publisher.assert_not_called()
 
 
 def test_portability_performance_routes_six_runs_and_has_one_error_boundary(
@@ -329,7 +358,7 @@ def test_portability_performance_routes_six_runs_and_has_one_error_boundary(
     monkeypatch.setattr(
         cli,
         "_repository_metadata",
-        lambda cwd: (_ROOT, "a" * 40, True, "b" * 64),
+        lambda: (_ROOT, "a" * 40, True, "b" * 64),
     )
     arguments = [
         "portability",
@@ -377,6 +406,11 @@ def test_portability_performance_routes_six_runs_and_has_one_error_boundary(
     assert captured.err == (
         "inspectrt portability performance failed: scientific identity mismatch\n"
     )
+    load_scientific.reset_mock()
+    monkeypatch.setattr(cli, "_repository_metadata", _installed_source_error)
+    assert cli.main(arguments) == 1
+    assert "source checkout with Git and uv.lock provenance" in capsys.readouterr().err
+    load_scientific.assert_not_called()
 
 
 def test_onnx_help_action_arguments_and_import_isolation() -> None:
@@ -466,7 +500,7 @@ def test_onnx_export_dirty_gate_routing_and_exact_output(
     monkeypatch.setattr(
         cli,
         "_repository_metadata",
-        lambda cwd: (_ROOT, "c" * 40, False, "d" * 64),
+        lambda: (_ROOT, "c" * 40, False, "d" * 64),
     )
     arguments = ["onnx", "export", "--output-root", str(tmp_path)]
     assert cli.main(arguments) == 0
@@ -491,7 +525,7 @@ def test_onnx_export_dirty_gate_routing_and_exact_output(
     monkeypatch.setattr(
         cli,
         "_repository_metadata",
-        lambda cwd: (_ROOT, "c" * 40, True, "d" * 64),
+        lambda: (_ROOT, "c" * 40, True, "d" * 64),
     )
     assert cli.main(arguments) == 1
     captured = capsys.readouterr()
@@ -500,6 +534,10 @@ def test_onnx_export_dirty_gate_routing_and_exact_output(
         "inspectrt onnx export failed: "
         "ONNX artifact source working tree must be clean\n"
     )
+    publisher.assert_not_called()
+    monkeypatch.setattr(cli, "_repository_metadata", _installed_source_error)
+    assert cli.main(arguments) == 1
+    assert "source checkout with Git and uv.lock provenance" in capsys.readouterr().err
     publisher.assert_not_called()
     _assert_onnx_validate_routing(tmp_path, monkeypatch, capsys)
 
@@ -574,6 +612,8 @@ def _export_arguments(*, run_directory: str = "run") -> list[str]:
 def test_controlled_fixture_export_returns_accepted_identity(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    real_export = cli._export_fixture
+
     def export(arguments: object, config: cli.BaselineConfig) -> int:
         assert config == cli.load_baseline_config(_PROFILE)
         print("fixture_id=bottle-broken-large-000-bc330b9070c5")
@@ -612,9 +652,14 @@ def test_controlled_fixture_export_returns_accepted_identity(
     captured = capsys.readouterr()
     assert "fixture contract mismatch" in captured.err
     assert "Traceback" not in captured.err
+    monkeypatch.setattr(cli, "_export_fixture", real_export)
+    monkeypatch.setattr(cli, "_repository_metadata", _installed_source_error)
+    assert cli.main(_export_arguments()) == 1
+    assert "source checkout with Git and uv.lock provenance" in capsys.readouterr().err
 
 
 def test_fixture_validate_accepts_exact_cpu_and_reports_device_errors() -> None:
+    bundled = _console("fixture", "validate", "--device", "cpu")
     accepted = _console(
         "fixture",
         "validate",
@@ -623,8 +668,15 @@ def test_fixture_validate_accepts_exact_cpu_and_reports_device_errors() -> None:
         "--device",
         "cpu",
     )
+    assert bundled.returncode == 0, bundled.stderr
     assert accepted.returncode == 0, accepted.stderr
+    assert bundled.stdout == accepted.stdout
     output = dict(line.split("=", 1) for line in accepted.stdout.splitlines())
+    assert output["fixture_id"] == "synthetic-correctness-v1"
+    assert (
+        output["fixture_digest"]
+        == "ec30a68439f52051028a56cbd5a1c560edc2bccc4e77e603fa2d3355a26a4e9e"
+    )
     assert output["fixture_class"] == "synthetic_correctness"
     assert output["indices"] == output["distances"] == "exact"
     assert output["status"] == "accepted"
@@ -688,7 +740,7 @@ def wired_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleName
     monkeypatch.setattr(
         cli,
         "_repository_metadata",
-        lambda cwd: (tmp_path, "a" * 40, True, "b" * 64),
+        lambda: (tmp_path, "a" * 40, True, "b" * 64),
     )
     monkeypatch.setattr(
         cli, "_utc_now", lambda: datetime(2026, 7, 15, 14, 30, 12, 123456, timezone.utc)
@@ -726,12 +778,12 @@ def wired_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleName
     monkeypatch.setattr(torch.backends, "fp32_precision", torch.backends.fp32_precision)
     monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
 
-    def run(*extra: str, device: str = "cpu") -> int:
-        return cli.main(
-            [
-                "evaluate",
-                "--config",
-                str(_PROFILE),
+    def run(*extra: str, device: str = "cpu", config_path: Path | None = None) -> int:
+        arguments = ["evaluate"]
+        if config_path is not None:
+            arguments.extend(("--config", str(config_path)))
+        arguments.extend(
+            (
                 "--dataset-root",
                 str(dataset_root),
                 "--category",
@@ -741,8 +793,9 @@ def wired_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleName
                 "--output-root",
                 str(output_root),
                 *extra,
-            ]
+            )
         )
+        return cli.main(arguments)
 
     return SimpleNamespace(
         run=run,
@@ -788,6 +841,9 @@ def test_success_wires_complete_run_and_truthful_metadata(
     assert run_metadata.requested_device == "cpu"
     assert (run_metadata.git_commit, run_metadata.git_dirty) == ("a" * 40, True)
     assert run_metadata.uv_lock_sha256 == "b" * 64
+    assert run_metadata.source_kind == "repository"
+    assert run_metadata.distribution_name is None
+    assert run_metadata.baseline_profile_sha256 is None
     assert run_metadata.python_version == "3.11.test"
     assert run_metadata.platform_description == "Test-Platform"
     assert command.queried == [
@@ -840,6 +896,10 @@ def test_success_wires_complete_run_and_truthful_metadata(
         "pixel_auroc=0.625",
     ]
     command.calls.clear()
+    assert command.run("--run-id", "explicit-profile", config_path=_PROFILE) == 0
+    assert command.calls["persist"][2].run_id == "explicit-profile"
+    capsys.readouterr()
+    command.calls.clear()
     monkeypatch.setattr(
         command.evaluation_module,
         "evaluate_mvtec_category",
@@ -854,23 +914,28 @@ def test_success_wires_complete_run_and_truthful_metadata(
     assert "persist" not in command.calls
 
 
-def _benchmark_arguments(device: str, *extra: str) -> list[str]:
-    return [
-        "benchmark",
-        "--config",
-        str(_PROFILE),
-        "--dataset-root",
-        "dataset",
-        "--category",
-        "bottle",
-        "--device",
-        device,
-        "--output-root",
-        "outputs",
-        "--run-id",
-        "timing-v2",
-        *extra,
-    ]
+def _benchmark_arguments(
+    device: str, *extra: str, explicit_config: bool = True
+) -> list[str]:
+    arguments = ["benchmark"]
+    if explicit_config:
+        arguments.extend(("--config", str(_PROFILE)))
+    arguments.extend(
+        [
+            "--dataset-root",
+            "dataset",
+            "--category",
+            "bottle",
+            "--device",
+            device,
+            "--output-root",
+            "outputs",
+            "--run-id",
+            "timing-v2",
+            *extra,
+        ]
+    )
+    return arguments
 
 
 def test_benchmark_routes_cpu_indexed_cuda_and_mps_with_exact_load_nanoseconds(
@@ -918,7 +983,10 @@ def test_benchmark_routes_cpu_indexed_cuda_and_mps_with_exact_load_nanoseconds(
     monkeypatch.setattr(
         cli,
         "_baseline_run_identity",
-        lambda arguments: {"run_id": arguments.run_id, "created_at_utc": "now"},
+        lambda arguments, profile_digest: {
+            "run_id": arguments.run_id,
+            "created_at_utc": "now",
+        },
     )
     monkeypatch.setattr(
         cli,
@@ -964,7 +1032,9 @@ def test_benchmark_routes_cpu_indexed_cuda_and_mps_with_exact_load_nanoseconds(
 
     for device in ("cpu", "cuda:2", "mps"):
         calls.clear()
-        assert cli.main(_benchmark_arguments(device)) == 0
+        assert (
+            cli.main(_benchmark_arguments(device, explicit_config=device != "cpu")) == 0
+        )
         benchmark_call = next(value for name, value in calls if name == "benchmark")
         assert benchmark_call["device"] == torch.device(device)
         assert benchmark_call["model_and_weight_load_ns"] == 987_654_321

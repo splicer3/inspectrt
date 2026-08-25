@@ -83,6 +83,11 @@ Its frozen identity is:
 fixture_id = synthetic-correctness-v1
 Q/M/D/k = 4/7/5/1
 reference chunk size = 3
+manifest bytes = 1577
+manifest SHA-256 = 9e72d4238ee0cae7f8236a82e50acf8f811c0e3f7b5e2815a11c56a9e1193c12
+payload bytes = 416
+payload SHA-256 = 18c2c4333a060ff25b7304dd396cf4b292617c4593d7cbfc2576b406ed5a14bb
+fixture digest = ec30a68439f52051028a56cbd5a1c560edc2bccc4e77e603fa2d3355a26a4e9e
 ```
 
 Seven bank rows span three chunks, so the final chunk is not full. The values
@@ -94,8 +99,15 @@ tensor values.
 Validate it on the canonical acceptance device with:
 
 ```bash
-uv run inspectrt fixture validate \
-  --fixture tests/fixtures/retrieval_v1 \
+inspectrt fixture validate --device cpu
+```
+
+Omitting `--fixture` selects this exact bundled fixture. Explicit-path
+validation remains supported:
+
+```bash
+inspectrt fixture validate \
+  --fixture /path/to/retrieval_v1 \
   --device cpu
 ```
 
@@ -119,7 +131,8 @@ status=accepted
 ```
 
 CPU is the canonical acceptance device for this synthetic fixture, so the
-check does not require an accelerator.
+check does not require an accelerator. It is offline and requires no dataset,
+pretrained weight, Git checkout, or repository lockfile.
 
 ## Real application fixture
 
@@ -153,7 +166,10 @@ The payload is approximately 420 MiB and includes the complete accepted nominal
 `bottle` bank. It is derived from a local MVTec AD installation and an accepted
 local benchmark run.
 
-The real fixture is generated below the gitignored `outputs/` tree.
+The real fixture is generated below the gitignored `outputs/` tree. It remains
+local and is not included in installed distributions. Installed validation of
+the bundled synthetic fixture does not make this application-derived fixture
+redistributable.
 
 ## Export
 

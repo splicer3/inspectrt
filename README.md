@@ -52,6 +52,16 @@ uv run pytest
 uv run ruff check .
 ```
 
+An installed distribution can validate the bundled canonical synthetic
+fixture without a repository, dataset, or pretrained weight:
+
+```bash
+inspectrt fixture validate --device cpu
+```
+
+The fixture identity and validation limits are documented in
+[docs/retrieval-fixtures.md](docs/retrieval-fixtures.md).
+
 ## ONNX feature artifact
 
 Export the static feature graph from a clean source tree with the accepted
@@ -95,13 +105,17 @@ not an individual category directory, as `--dataset-root`.
 ## Evaluation
 
 ```bash
-uv run inspectrt evaluate \
-  --config configs/baseline.toml \
-  --dataset-root datasets/mvtec_ad \
+inspectrt evaluate \
+  --dataset-root /path/to/mvtec_ad \
   --category bottle \
-  --device cuda:0 \
-  --output-root outputs
+  --device cpu \
+  --output-root /path/to/output
 ```
+
+InspectRT bundles the frozen baseline profile, but not MVTec AD or pretrained
+weights. The user supplies the original dataset, and torchvision resolves its
+official pretrained weight separately. An explicit `--config` remains
+supported; see [docs/baseline.md](docs/baseline.md).
 
 ## Benchmark
 

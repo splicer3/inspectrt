@@ -76,5 +76,16 @@ target-version = "py311"
 [tool.hatch.build.targets.wheel]
 packages = ["inspectrt"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"configs/baseline.toml" = "inspectrt/_resources/baseline.toml"
+"tests/fixtures/retrieval_v1/manifest.json" = "inspectrt/_resources/retrieval_v1/manifest.json"
+"tests/fixtures/retrieval_v1/tensors.bin" = "inspectrt/_resources/retrieval_v1/tensors.bin"
+
 [tool.hatch.build.targets.sdist]
-only-include = ["inspectrt", "uv.lock"]
+only-include = [
+    "inspectrt",
+    "uv.lock",
+    "configs/baseline.toml",
+    "tests/fixtures/retrieval_v1/manifest.json",
+    "tests/fixtures/retrieval_v1/tensors.bin",
+]

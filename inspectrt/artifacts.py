@@ -42,9 +42,9 @@ class BaselineRunMetadata:
     dataset_root: str
     requested_device: str
     bank_chunk_size: int
-    git_commit: str
-    git_dirty: bool
-    uv_lock_sha256: str
+    git_commit: str | None
+    git_dirty: bool | None
+    uv_lock_sha256: str | None
     python_version: str
     platform_description: str
     dependency_versions: Mapping[str, _JsonPrimitive]
@@ -52,6 +52,10 @@ class BaselineRunMetadata:
     weight_enum: str
     weight_source_url: str
     weight_file_sha256: str
+    source_kind: str = "repository"
+    distribution_name: str | None = None
+    distribution_version: str | None = None
+    baseline_profile_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -67,7 +71,6 @@ class BaselineRunMetadata:
             "created_at_utc",
             "dataset_root",
             "requested_device",
-            "git_commit",
             "python_version",
             "platform_description",
             "weight_enum",
@@ -97,12 +100,55 @@ class BaselineRunMetadata:
             or self.bank_chunk_size <= 0
         ):
             raise ValueError("bank_chunk_size must be a positive integer")
-        if not isinstance(self.git_dirty, bool):
-            raise TypeError("git_dirty must be a boolean")
-        for name in ("uv_lock_sha256", "weight_file_sha256"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not _SHA256.fullmatch(value):
-                raise ValueError(f"{name} must be a full SHA-256 hex digest")
+        if not isinstance(self.weight_file_sha256, str) or not _SHA256.fullmatch(
+            self.weight_file_sha256
+        ):
+            raise ValueError("weight_file_sha256 must be a full SHA-256 hex digest")
+        if self.source_kind == "repository":
+            if not isinstance(self.git_commit, str) or not self.git_commit:
+                raise ValueError("git_commit must be a nonempty string")
+            if not isinstance(self.git_dirty, bool):
+                raise TypeError("git_dirty must be a boolean")
+            if not isinstance(self.uv_lock_sha256, str) or not _SHA256.fullmatch(
+                self.uv_lock_sha256
+            ):
+                raise ValueError("uv_lock_sha256 must be a full SHA-256 hex digest")
+            if any(
+                value is not None
+                for value in (
+                    self.distribution_name,
+                    self.distribution_version,
+                    self.baseline_profile_sha256,
+                )
+            ):
+                raise ValueError(
+                    "repository provenance must not contain distribution fields"
+                )
+        elif self.source_kind == "installed_distribution":
+            if any(
+                value is not None
+                for value in (self.git_commit, self.git_dirty, self.uv_lock_sha256)
+            ):
+                raise ValueError(
+                    "installed provenance must not contain repository fields"
+                )
+            if self.distribution_name != "inspectrt":
+                raise ValueError("distribution_name must be 'inspectrt'")
+            if (
+                not isinstance(self.distribution_version, str)
+                or not self.distribution_version
+            ):
+                raise ValueError("distribution_version must be a nonempty string")
+            if not isinstance(
+                self.baseline_profile_sha256, str
+            ) or not _SHA256.fullmatch(self.baseline_profile_sha256):
+                raise ValueError(
+                    "baseline_profile_sha256 must be a full SHA-256 hex digest"
+                )
+        else:
+            raise ValueError(
+                "source_kind must identify repository or installed provenance"
+            )
         for name in ("dependency_versions", "determinism_flags"):
             object.__setattr__(
                 self, name, _frozen_primitives(getattr(self, name), name)
@@ -381,6 +427,21 @@ def _run_record(
     tensors["memory_bank"]["byte_count"] = (
         evaluation.memory_bank.numel() * evaluation.memory_bank.element_size()
     )
+    if metadata.source_kind == "repository":
+        schema_version = 1
+        source = {
+            "dirty": metadata.git_dirty,
+            "git_commit": metadata.git_commit,
+            "uv_lock_sha256": metadata.uv_lock_sha256,
+        }
+    else:
+        schema_version = 2
+        source = {
+            "kind": "installed_distribution",
+            "distribution_name": metadata.distribution_name,
+            "distribution_version": metadata.distribution_version,
+            "baseline_profile_sha256": metadata.baseline_profile_sha256,
+        }
     return {
         "bank_chunk_size": metadata.bank_chunk_size,
         "batch_size": 1,
@@ -418,12 +479,8 @@ def _run_record(
         "profile_id": "inspectrt_feature_memory_v1",
         "retrieval_semantics": "exact top-1 squared L2",
         "run_id": metadata.run_id,
-        "schema_version": 1,
-        "source": {
-            "dirty": metadata.git_dirty,
-            "git_commit": metadata.git_commit,
-            "uv_lock_sha256": metadata.uv_lock_sha256,
-        },
+        "schema_version": schema_version,
+        "source": source,
         "tensors": tensors,
         "weights": {
             "cached_file_sha256": metadata.weight_file_sha256,

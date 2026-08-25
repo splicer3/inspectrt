@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+from io import BytesIO
 from importlib import metadata as importlib_metadata
 import os
 from pathlib import Path
@@ -17,6 +18,12 @@ import sys
 import tomllib
 from typing import Any
 from urllib.parse import urlsplit
+
+from inspectrt._resources import (
+    bundled_baseline_bytes,
+    bundled_fixture_directory,
+    source_checkout_root,
+)
 
 _PROFILE_ID = "inspectrt_feature_memory_v1"
 _PREPROCESSING_PROFILE_ID = "inspectrt_resize256_v1"
@@ -65,8 +72,11 @@ class BaselineConfig:
 
 def load_baseline_config(path: Path) -> BaselineConfig:
     """Load and strictly validate the supported baseline TOML profile."""
-    with path.open("rb") as stream:
-        profile = tomllib.load(stream)
+    return _load_baseline_config(path.read_bytes())
+
+
+def _load_baseline_config(contents: bytes) -> BaselineConfig:
+    profile = tomllib.load(BytesIO(contents))
     _validate_keys(profile, _PROFILE_KEYS, "profile")
     determinism = profile["determinism"]
     if not isinstance(determinism, Mapping):
@@ -137,7 +147,11 @@ def _argument_parser() -> argparse.ArgumentParser:
     validate = fixture_commands.add_parser(
         "validate", help="validate a retrieval fixture"
     )
-    validate.add_argument("--fixture", required=True, type=Path)
+    validate.add_argument(
+        "--fixture",
+        type=Path,
+        help="fixture directory (default: bundled synthetic-correctness-v1)",
+    )
     validate.add_argument("--device", required=True)
     export = fixture_commands.add_parser(
         "export", help="export an accepted benchmark run as a retrieval fixture"
@@ -184,7 +198,11 @@ def _argument_parser() -> argparse.ArgumentParser:
 
 
 def _add_runtime_arguments(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--config", required=True, type=Path)
+    command.add_argument(
+        "--config",
+        type=Path,
+        help="baseline TOML profile (default: bundled inspectrt_feature_memory_v1)",
+    )
     command.add_argument("--dataset-root", required=True, type=Path)
     command.add_argument("--category", required=True)
     command.add_argument("--device", required=True)
@@ -226,10 +244,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _export_fixture(arguments, config)
         if arguments.command == "benchmark":
             _validate_benchmark_arguments(arguments)
-        config = load_baseline_config(arguments.config)
+        config, profile_digest = _runtime_baseline(arguments.config)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = config.cublas_workspace_config
         handler = _benchmark if arguments.command == "benchmark" else _evaluate
-        return handler(arguments, config)
+        return handler(arguments, config, profile_digest)
     except Exception as error:
         command = arguments.command
         if command == "fixture":
@@ -242,8 +260,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
+def _runtime_baseline(path: Path | None) -> tuple[BaselineConfig, str]:
+    contents = path.read_bytes() if path is not None else bundled_baseline_bytes()
+    return _load_baseline_config(contents), hashlib.sha256(contents).hexdigest()
+
+
 def _export_onnx(arguments: argparse.Namespace) -> int:
-    _, commit, dirty, lock_digest = _repository_metadata(Path.cwd())
+    _, commit, dirty, lock_digest = _repository_metadata()
     if dirty:
         raise ValueError("ONNX artifact source working tree must be clean")
     from inspectrt.onnx_artifacts import publish_onnx_feature_artifact
@@ -279,12 +302,12 @@ def _validate_onnx(arguments: argparse.Namespace) -> int:
 
 
 def _compare_portability(arguments: argparse.Namespace) -> int:
+    _, commit, dirty, _ = _repository_metadata()
     from inspectrt.portability import (
         ScientificGenerator,
         publish_portability_comparison,
     )
 
-    _, commit, dirty, _ = _repository_metadata(Path.cwd())
     comparison, performance = publish_portability_comparison(
         reference_run=arguments.reference_run,
         candidate_runs=tuple(arguments.candidate_run),
@@ -303,6 +326,7 @@ def _compare_portability(arguments: argparse.Namespace) -> int:
 
 
 def _performance_portability(arguments: argparse.Namespace) -> int:
+    _, commit, dirty, _ = _repository_metadata()
     from inspectrt.portability import (
         ScientificGenerator,
         build_portability_performance_v2,
@@ -322,7 +346,6 @@ def _performance_portability(arguments: argparse.Namespace) -> int:
         for path in arguments.timing_run
     ):
         raise ValueError("--output must be outside source timing bundles")
-    _, commit, dirty, _ = _repository_metadata(Path.cwd())
     scientific = load_portability_scientific_identity(arguments.scientific)
     policy = load_portability_policy(arguments.policy)
     environment_map = load_portability_environment_map(arguments.environment_map)
@@ -346,11 +369,6 @@ def _performance_portability(arguments: argparse.Namespace) -> int:
 
 def _validate_fixture(arguments: argparse.Namespace) -> int:
     fixture_directory = arguments.fixture
-    if not fixture_directory.exists():
-        raise FileNotFoundError(f"fixture directory not found: {fixture_directory}")
-    if not fixture_directory.is_dir() or fixture_directory.is_symlink():
-        raise ValueError(f"fixture path must be a real directory: {fixture_directory}")
-
     from inspectrt.fixtures import (
         RealApplicationFixtureSource,
         basic_environment_mismatches,
@@ -358,12 +376,25 @@ def _validate_fixture(arguments: argparse.Namespace) -> int:
         load_retrieval_fixture,
     )
 
-    fixture = load_retrieval_fixture(fixture_directory)
+    if fixture_directory is None:
+        with bundled_fixture_directory() as bundled:
+            fixture = load_retrieval_fixture(bundled)
+    else:
+        if not fixture_directory.exists():
+            raise FileNotFoundError(f"fixture directory not found: {fixture_directory}")
+        if not fixture_directory.is_dir() or fixture_directory.is_symlink():
+            raise ValueError(
+                f"fixture path must be a real directory: {fixture_directory}"
+            )
+        fixture = load_retrieval_fixture(fixture_directory)
     if fixture.metadata.fixture_class == "real_application":
         source = fixture.metadata.source
         if not isinstance(source, RealApplicationFixtureSource):
             raise ValueError("real fixture source metadata is malformed")
-        _, _, _, lock_digest = _repository_metadata(Path.cwd())
+        if source_checkout_root() is None:
+            _print_unavailable_fixture(fixture, ("uv_lock_sha256",))
+            return 0
+        _, _, _, lock_digest = _repository_metadata()
         mismatches = basic_environment_mismatches(
             source,
             requested_device=arguments.device,
@@ -467,7 +498,7 @@ def _print_unavailable_fixture(fixture: Any, mismatches: Sequence[str]) -> None:
 
 def _export_fixture(arguments: argparse.Namespace, config: BaselineConfig) -> int:
     repository_root, generator_commit, generator_dirty, lock_digest = (
-        _repository_metadata(Path.cwd())
+        _repository_metadata()
     )
     if generator_dirty:
         raise ValueError("fixture generator working tree must be clean")
@@ -546,7 +577,10 @@ def _export_fixture(arguments: argparse.Namespace, config: BaselineConfig) -> in
     return 0
 
 
-def _evaluate(arguments: argparse.Namespace, config: BaselineConfig) -> int:
+def _evaluate(
+    arguments: argparse.Namespace, config: BaselineConfig, profile_digest: str
+) -> int:
+    identity = _baseline_run_identity(arguments, profile_digest)
     import numpy as np
     import torch
 
@@ -559,7 +593,6 @@ def _evaluate(arguments: argparse.Namespace, config: BaselineConfig) -> int:
     from inspectrt.evaluation import evaluate_mvtec_category
     from inspectrt.features import build_resnet50_layer2_extractor
 
-    identity = _baseline_run_identity(arguments)
     weights = ResNet50_Weights.IMAGENET1K_V2
     extractor = build_resnet50_layer2_extractor(weights=weights)
     weight_digest = _cached_weight_sha256(weights.url, torch)
@@ -589,7 +622,10 @@ def _evaluate(arguments: argparse.Namespace, config: BaselineConfig) -> int:
     return 0
 
 
-def _benchmark(arguments: argparse.Namespace, config: BaselineConfig) -> int:
+def _benchmark(
+    arguments: argparse.Namespace, config: BaselineConfig, profile_digest: str
+) -> int:
+    identity = _baseline_run_identity(arguments, profile_digest)
     import numpy as np
     import torch
 
@@ -601,8 +637,6 @@ def _benchmark(arguments: argparse.Namespace, config: BaselineConfig) -> int:
     from inspectrt.artifacts import persist_baseline_run
     from inspectrt.benchmark import _time_backend_operation, benchmark_mvtec_category
     from inspectrt.features import build_resnet50_layer2_extractor
-
-    identity = _baseline_run_identity(arguments)
 
     def load_model() -> tuple[Any, Any, str]:
         weights = ResNet50_Weights.IMAGENET1K_V2
@@ -684,23 +718,47 @@ def _baseline_run_metadata(
             if weight_digest is not None
             else _cached_weight_sha256(weights.url, torch)
         ),
+        source_kind=identity["source_kind"],
+        distribution_name=identity["distribution_name"],
+        distribution_version=identity["distribution_version"],
+        baseline_profile_sha256=identity["baseline_profile_sha256"],
     )
 
 
-def _baseline_run_identity(arguments: argparse.Namespace) -> dict[str, Any]:
+def _baseline_run_identity(
+    arguments: argparse.Namespace, profile_digest: str
+) -> dict[str, Any]:
     now = _utc_now()
-    _, commit, dirty, lock_digest = _repository_metadata(Path.cwd())
-    run_id = arguments.run_id or _generated_run_id(now, arguments.category, commit)
+    if source_checkout_root() is None:
+        distribution = importlib_metadata.distribution("inspectrt")
+        distribution_name = distribution.metadata["Name"]
+        distribution_version = distribution.version
+        if distribution_name != "inspectrt" or distribution_version != "0.1.0":
+            raise RuntimeError("installed InspectRT distribution identity is invalid")
+        commit = dirty = lock_digest = None
+        source_kind = "installed_distribution"
+        suffix = f"v{distribution_version}"
+        installed_profile_digest = profile_digest
+    else:
+        _, commit, dirty, lock_digest = _repository_metadata()
+        distribution_name = distribution_version = installed_profile_digest = None
+        source_kind = "repository"
+        suffix = commit
+    run_id = arguments.run_id or _generated_run_id(now, arguments.category, suffix)
     return {
+        "baseline_profile_sha256": installed_profile_digest,
         "created_at_utc": now.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         "dependency_versions": {
             name: importlib_metadata.version(name) for name in _DISTRIBUTIONS
         },
         "git_commit": commit,
         "git_dirty": dirty,
+        "distribution_name": distribution_name,
+        "distribution_version": distribution_version,
         "platform_description": platform.platform(),
         "python_version": platform.python_version(),
         "run_id": run_id,
+        "source_kind": source_kind,
         "uv_lock_sha256": lock_digest,
     }
 
@@ -769,8 +827,16 @@ def _validate_benchmark_arguments(arguments: argparse.Namespace) -> None:
         )
 
 
-def _repository_metadata(cwd: Path) -> tuple[Path, str, bool, str]:
-    root = Path(_git(cwd, "rev-parse", "--show-toplevel")).resolve()
+def _repository_metadata() -> tuple[Path, str, bool, str]:
+    root = source_checkout_root()
+    if root is None:
+        raise RuntimeError(
+            "this command requires an InspectRT source checkout with Git and "
+            "uv.lock provenance"
+        )
+    git_root = Path(_git(root, "rev-parse", "--show-toplevel")).resolve()
+    if git_root != root:
+        raise RuntimeError("InspectRT package location does not match its Git root")
     commit = _git(root, "rev-parse", "--verify", "HEAD")
     dirty = bool(_git(root, "status", "--porcelain=v1", "--untracked-files=normal"))
     lockfile = root / "uv.lock"
