@@ -9,8 +9,8 @@ environments. The generated graph stops at `layer2` and row-major patch
 embeddings; retrieval, scoring, anomaly-map construction, and metrics remain in
 the existing PyTorch pipeline.
 
-The result establishes numerical portability under the reviewed policy. Bitwise
-identity remains outside the claim.
+The result establishes numerical portability under policy-v2 floating-point
+bounds.
 
 ## Graph boundary
 
@@ -28,6 +28,10 @@ order. Batch and spatial dimensions are static. The ONNX opset is 20. The model
 keeps all tensor data inside the ONNX model.
 
 ## Installation
+
+Wheel installation and platform support are covered by
+[Installation and support](installation.md). The commands below describe the
+locked source-checkout environment used for artifact reproduction.
 
 Set up the base environment with:
 
@@ -48,7 +52,8 @@ repository distribution excludes both files.
 
 ## Artifact export and validation
 
-Run export from the repository:
+Export is a supported source-checkout reproducibility command and requires
+`inspectrt[onnx]`. Run it from the verified repository:
 
 ```bash
 uv run --extra onnx inspectrt onnx export \
@@ -64,7 +69,8 @@ manifest.json
 model.onnx
 ```
 
-Validate those artifact bytes and their ONNX structure with:
+Validation is a supported installed/user command when `inspectrt[onnx]` is
+installed. Validate those artifact bytes and their ONNX structure with:
 
 ```bash
 uv run --extra onnx inspectrt onnx validate \
@@ -78,9 +84,10 @@ comparison are separate steps.
 
 ## Direct ORT CPU consumer usage
 
-The public consumer requests only `CPUExecutionProvider` and requires it to be
-the only active provider. Provider fallback is disabled. Supply your own image
-and artifact paths:
+This direct consumer is an experimental Python API. It requests only
+`CPUExecutionProvider` and requires it to be the only active provider.
+Provider fallback is disabled. Supply your own image and artifact paths; see
+the [Python API policy](public-interface.md#python-api):
 
 ```python
 from pathlib import Path
@@ -102,10 +109,9 @@ layer2 = outputs.layer2
 patch_embeddings = outputs.patch_embeddings
 ```
 
-Preprocessing is explicit because it is outside the graph. The consumer returns
-only the two feature tensors; it does not perform retrieval, scoring, map
-construction, or metric evaluation. The existing PyTorch pipeline handles
-those steps.
+The caller preprocesses each image before the graph. The consumer returns the
+two feature tensors, which the PyTorch pipeline uses for retrieval, scoring,
+map construction, and metric evaluation.
 
 ## Scientific method
 
@@ -174,8 +180,7 @@ The compact public record is
 [scientific.json](evidence/inspectrt_onnx_feature_portability_v1/scientific.json),
 8,705 bytes with SHA-256
 `b07bbd05d7d6535e0d1088ce23b54e83b0a7754e0ffd921ced778e81d7c5430f`.
-Its source diagnostic records remain private and are neither linked nor
-redistributed.
+The compact record carries the reviewed results and source identities.
 
 | Item | Identity |
 | --- | --- |
@@ -195,15 +200,12 @@ redistributed.
 | M1 evidence | `7f2fc282149bb4e9128a6edb92e7118218585bb62ba23ebbe1bbfd581c767b11` |
 | Ryzen/WSL2 evidence | `f1d784ca314ca7731ec589073df66025d14e6098cd13aa22bec5d66ba480077e` |
 
-The generated `model.onnx` and official pretrained weight bytes stay outside
-Git tracking and repository distribution. The public evidence inventory
-contains only the compact scientific record.
+Git tracks the compact scientific record. Export generates `model.onnx`
+locally from the accepted pretrained weight in the user's cache.
 
-## Limitations
+## Evidence scope
 
 The evidence covers one `bottle` profile, one ResNet-50 weight identity, one
 static batch-1 FP32 `256 x 256` graph, ONNX Runtime 1.28.0 on
 `CPUExecutionProvider`, the three named environments, the complete frozen
 292-image inventory, and one local repeatability scope per environment.
-
-The claim is limited to the scope above.

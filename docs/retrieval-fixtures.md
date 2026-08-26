@@ -6,10 +6,14 @@ A retrieval fixture contains one exact top-1 squared-L2 retrieval problem. This
 keeps retrieval separate from image decoding, preprocessing, feature
 extraction, anomaly-map reconstruction, and PyTorch serialization.
 
-The fixture contains the retrieval inputs and the expected outputs needed to
-check another consumer. InspectRT currently validates those outputs with its
-existing exact PyTorch retrieval reference. The repository does not contain an
-alternative retrieval backend.
+The fixture contains the retrieval inputs and expected outputs needed to check
+another consumer. InspectRT validates those outputs with its exact PyTorch
+retrieval reference.
+
+`fixture validate` is a supported installed/user command. `fixture export` is
+a verified-source reproducibility command. See
+[Public interface](public-interface.md) for their exact availability and the
+schema compatibility boundary.
 
 ## Retrieval contract
 
@@ -28,11 +32,11 @@ expected global bank indices:  [Q]
 ```
 
 The distance is the sum of squared component differences. Queries and bank rows
-are FP32, finite, C-contiguous, and row-major. Distances are raw FP32 squared L2
-values. No square-rooted distance is stored or compared, and inputs are not
-normalized. Indices are signed 64-bit global bank-row indices.
+are FP32, finite, C-contiguous, and row-major. The fixture stores and compares
+raw FP32 squared-L2 values directly, with the stored inputs passed unchanged to
+retrieval. Indices are signed 64-bit global bank-row indices.
 
-The contract fixes `k=1` and exact exhaustive search (no approximation).
+The contract fixes `k=1` and exact exhaustive search.
 If computed distances tie exactly, the lower global index is retained,
 including when equal minimum occurs in different reference chunks.
 
@@ -61,9 +65,8 @@ Intervening padding is zero. The manifest gives every tensor's shape, offset,
 byte count, byte order, layout, and SHA-256 hash. It also gives the complete
 payload length and SHA-256 hash, including padding.
 
-The 64-byte offsets are a file-layout property. They do not guarantee that a
-segment will have the same in-memory alignment after a consumer loads or maps
-the file.
+The 64-byte offsets define the file layout. A consumer that requires aligned
+runtime allocation copies the decoded tensor into aligned storage.
 
 You only need JSON and binary parsing to read the fixtures.
 
@@ -130,9 +133,8 @@ distances=exact
 status=accepted
 ```
 
-CPU is the canonical acceptance device for this synthetic fixture, so the
-check does not require an accelerator. It is offline and requires no dataset,
-pretrained weight, Git checkout, or repository lockfile.
+CPU is the canonical acceptance device for this synthetic fixture. The check
+runs offline from the installed fixture bytes.
 
 ## Real application fixture
 
@@ -167,14 +169,13 @@ The payload is approximately 420 MiB and includes the complete accepted nominal
 local benchmark run.
 
 The real fixture is generated below the gitignored `outputs/` tree. It remains
-local and is not included in installed distributions. Installed validation of
-the bundled synthetic fixture does not make this application-derived fixture
-redistributable.
+local and follows the source dataset's distribution terms.
 
 ## Export
 
-Export the local bottle fixture only when its deterministic destination does
-not exist:
+This source-checkout workflow reproduces the accepted real fixture from the
+frozen historical schema-1 benchmark bundle. Export it only when its
+deterministic destination does not exist:
 
 ```bash
 uv run inspectrt fixture export \
@@ -187,14 +188,16 @@ uv run inspectrt fixture export \
 ```
 
 Before writing, the command verifies the benchmark run, its source identities,
-and five recorded source-artifact hashes. The run bundle does not contain the
-query tensor, so the command extracts it again and recomputes retrieval with
-the frozen profile. It requires an exact match with the accepted run's stored
-distances and indices. The accepted export ran on the recorded environment.
+and five recorded source-artifact hashes. It regenerates the query tensor from
+the dataset and recomputes retrieval with the frozen profile. It requires an
+exact match with the accepted run's stored distances and indices. The accepted
+export ran on the recorded environment.
 
 Export requires a clean working tree and writes the fixture atomically. It
 refuses to overwrite the deterministic fixture directory. The dataset and
-pretrained weight must be obtained manually.
+pretrained weight must be obtained manually. The command also requires the
+repository `uv.lock`, explicit baseline config, accepted cached weight and the
+recorded device. It reads the frozen historical benchmark schema 1.
 
 ## Real-fixture validation
 
@@ -224,12 +227,14 @@ reference_status=unavailable
 ```
 
 The command also reports `environment_mismatches` with the differing recorded
-identity fields.
+identity fields. An installed distribution can establish structural validity,
+but exact reference acceptance requires the matching source checkout, lock,
+platform, dependencies and device.
 
 ## Workload matrix
 
 `configs/retrieval_workloads.json` defines frozen workload shapes and synthetic
-input-generation rules. It contains no benchmark results.
+input-generation rules. Timing results live in the portability evidence.
 
 | Workload                       | Class                |     Q |       M |   D |  k |
 | ------------------------------ | -------------------- | ----: | ------: | --: | -: |
@@ -282,13 +287,14 @@ queries: a=131071, b=524287, salt=17
 banks:   a=104729, b=130363, salt=31
 ```
 
-## Current limits
+## Contract scope
 
-- Only fixture schema version 1 is supported.
-- Retrieval fixes `k=1`, FP32 inputs, and C-contiguous row-major layout.
-- The real fixture remains local and gitignored.
-- Real numerical acceptance is limited to the recorded environment.
-- No cross-implementation floating-point tolerance is fixed.
-- No separate C++, OpenMP, native CUDA, FAISS, cuVS, or other alternative
-  retrieval backend is included: CUDA validation uses the PyTorch reference.
-- No performance conclusion currently follows from the fixture or workload matrix.
+Installation and platform support are documented in
+[Installation and support](installation.md). The supported fixture contract is
+classified in [Public interface](public-interface.md).
+
+- Fixture schema 1 uses `k=1`, FP32 inputs, and C-contiguous row-major layout.
+- The bundled synthetic fixture provides exact CPU correctness acceptance.
+- The local real fixture provides exact acceptance on its recorded environment.
+- CPU and CUDA validation use the same PyTorch retrieval reference.
+- Performance measurements are published in the portability evidence.

@@ -128,24 +128,56 @@ def _require_fixed(table: Mapping[str, object], key: str, expected: object) -> N
 
 
 def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="inspectrt")
+    parser = argparse.ArgumentParser(
+        prog="inspectrt",
+        description="InspectRT v0.1.0 installed, reproducibility, and evidence tools.",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     evaluate = commands.add_parser(
-        "evaluate", help="evaluate and persist one MVTec AD category"
+        "evaluate",
+        help="installed/user: evaluate one MVTec AD category",
+        description=(
+            "Supported installed/user command: evaluate and persist one "
+            "MVTec AD category."
+        ),
     )
     _add_runtime_arguments(evaluate)
     benchmark = commands.add_parser(
-        "benchmark", help="measure and persist one MVTec AD category"
+        "benchmark",
+        help="installed/user: run the frozen bottle benchmark",
+        description=(
+            "Supported installed/user command: measure and persist the frozen "
+            "MVTec AD bottle benchmark."
+        ),
     )
     _add_runtime_arguments(benchmark)
-    benchmark.add_argument("--warmup-count", type=_positive_integer, default=5)
-    benchmark.add_argument("--repeat-count", type=_positive_integer, default=30)
+    benchmark.add_argument(
+        "--warmup-count",
+        type=_positive_integer,
+        default=5,
+        help="must be exactly 5 (default: 5)",
+    )
+    benchmark.add_argument(
+        "--repeat-count",
+        type=_positive_integer,
+        default=30,
+        help="must be exactly 30 (default: 30)",
+    )
     fixture = commands.add_parser(
-        "fixture", help="export or validate retrieval fixtures"
+        "fixture",
+        help="retrieval fixture validation and source reproduction",
+        description=(
+            "Retrieval fixture validation and source-checkout reproducibility commands."
+        ),
     )
     fixture_commands = fixture.add_subparsers(dest="fixture_command", required=True)
     validate = fixture_commands.add_parser(
-        "validate", help="validate a retrieval fixture"
+        "validate",
+        help="installed/user: validate a retrieval fixture",
+        description=(
+            "Supported installed/user command: validate the bundled or an "
+            "explicit retrieval fixture."
+        ),
     )
     validate.add_argument(
         "--fixture",
@@ -154,7 +186,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--device", required=True)
     export = fixture_commands.add_parser(
-        "export", help="export an accepted benchmark run as a retrieval fixture"
+        "export",
+        help="source reproducibility: export an accepted schema-1 run",
+        description=(
+            "Supported source-checkout reproducibility command: export a "
+            "frozen accepted schema-1 benchmark run as a retrieval fixture."
+        ),
     )
     export.add_argument("--config", required=True, type=Path)
     export.add_argument("--run-dir", required=True, type=Path)
@@ -162,37 +199,77 @@ def _argument_parser() -> argparse.ArgumentParser:
     export.add_argument("--sample-id", required=True)
     export.add_argument("--device", required=True)
     export.add_argument("--output-root", required=True, type=Path)
-    onnx = commands.add_parser("onnx", help="export or validate ONNX feature artifacts")
+    onnx = commands.add_parser(
+        "onnx",
+        help="ONNX artifact validation and source reproduction",
+        description=(
+            "ONNX artifact validation and source-checkout reproducibility commands."
+        ),
+    )
     onnx_commands = onnx.add_subparsers(dest="onnx_command", required=True)
     onnx_export = onnx_commands.add_parser(
-        "export", help="export the fixed ONNX feature artifact"
+        "export",
+        help="source reproducibility: export the fixed feature artifact",
+        description=(
+            "Supported source-checkout reproducibility command: export the "
+            "fixed ONNX feature artifact."
+        ),
     )
     onnx_export.add_argument("--output-root", required=True, type=Path)
     onnx_validate = onnx_commands.add_parser(
-        "validate", help="validate an ONNX feature artifact"
+        "validate",
+        help="installed/user: validate an ONNX feature artifact",
+        description=(
+            "Supported installed/user command: validate an ONNX feature "
+            "artifact (requires inspectrt[onnx])."
+        ),
     )
     onnx_validate.add_argument("--artifact", required=True, type=Path)
     portability = commands.add_parser(
-        "portability", help="compare portable run bundles"
+        "portability",
+        help="maintainer tooling for reviewed portability evidence",
+        description="Maintainer tooling for reviewed portability evidence.",
     )
     portability_commands = portability.add_subparsers(
         dest="portability_command", required=True
     )
     compare = portability_commands.add_parser(
-        "compare", help="publish scientific and descriptive performance records"
+        "compare",
+        help="compare reviewed source run bundles",
+        description=(
+            "Maintainer/evidence command: compare reviewed source run bundles "
+            "and publish scientific and descriptive records."
+        ),
     )
     compare.add_argument("--reference-run", required=True, type=Path)
-    compare.add_argument("--candidate-run", required=True, action="append", type=Path)
+    compare.add_argument(
+        "--candidate-run",
+        required=True,
+        action="append",
+        type=Path,
+        help=("repeat at least once; count must match environment-map candidates"),
+    )
     compare.add_argument("--environment-map", required=True, type=Path)
     compare.add_argument("--policy", type=Path)
     compare.add_argument("--output", required=True, type=Path)
     performance = portability_commands.add_parser(
-        "performance", help="aggregate reviewed synchronized timing bundles"
+        "performance",
+        help="aggregate six reviewed timing bundles",
+        description=(
+            "Maintainer/evidence command: aggregate exactly six reviewed "
+            "synchronized timing bundles."
+        ),
     )
     performance.add_argument("--scientific", required=True, type=Path)
     performance.add_argument("--policy", required=True, type=Path)
     performance.add_argument("--environment-map", required=True, type=Path)
-    performance.add_argument("--timing-run", required=True, action="append", type=Path)
+    performance.add_argument(
+        "--timing-run",
+        required=True,
+        action="append",
+        type=Path,
+        help="repeat exactly six times in environment-map order",
+    )
     performance.add_argument("--output", required=True, type=Path)
     return parser
 

@@ -6,6 +6,11 @@
 original MVTec AD dataset. It evaluates one category per run and fits only that
 category's nominal training images.
 
+`evaluate` and `benchmark` are supported installed/user commands. Install the
+wheel and select a PyTorch build as described in
+[Installation and support](installation.md); their complete public boundary is
+listed in [Public interface](public-interface.md).
+
 ## Method
 
 Pillow decodes each image and resizes it directly to `256 x 256` with bilinear
@@ -24,9 +29,9 @@ index. The largest patch distance is the image score. Patch distances are
 reshaped to `32 x 32` and bilinearly interpolated with `align_corners=False` to
 a raw `256 x 256` anomaly map.
 
-The baseline reports image AUROC, image Average Precision, and pixel AUROC.
-There is no crop, coreset, approximate search, score reweighting, Gaussian
-smoothing, score normalization, decision threshold, or threshold fitting.
+The baseline reports image AUROC, image Average Precision, and pixel AUROC from
+the raw image scores and anomaly maps. The complete FP32 bank and exact
+retrieval define the reduced profile.
 
 ## Dataset layout
 
@@ -45,22 +50,21 @@ must retain the original `train`, `test`, and `ground_truth` structure.
 
 ## Running an evaluation
 
-Install the locked environment, then evaluate one category:
+From an installed distribution, evaluate one category:
 
 ```bash
-uv sync --locked
-uv run inspectrt evaluate \
-  --dataset-root datasets/mvtec_ad \
+inspectrt evaluate \
+  --dataset-root /path/to/mvtec_ad \
   --category bottle \
-  --device cuda:0 \
-  --output-root outputs
+  --device cpu \
+  --output-root /path/to/output
 ```
 
 Omitting `--config` selects the exact bundled `inspectrt_feature_memory_v1`
 profile. An explicit profile path remains supported through `--config` and is
-validated by the same strict parser. The MVTec root remains user-supplied, and
-torchvision resolves the official pretrained weight separately; neither is
-included in InspectRT distributions.
+validated by the same strict parser. The user supplies the MVTec root, and
+torchvision resolves the official pretrained weight. In a source checkout,
+`configs/baseline.toml` is the canonical explicit profile path.
 
 `--dataset-root` is the parent of the category directories. Use `--category`
 to choose a category and `--device` to choose the PyTorch device.
@@ -70,19 +74,20 @@ InspectRT generates a safe ID when it is omitted.
 ## Running a benchmark
 
 ```bash
-uv run inspectrt benchmark \
-  --config configs/baseline.toml \
-  --dataset-root datasets/mvtec_ad \
+inspectrt benchmark \
+  --dataset-root /path/to/mvtec_ad \
   --category bottle \
-  --device cuda:0 \
-  --output-root outputs \
+  --device cpu \
+  --output-root /path/to/output \
   --warmup-count 5 \
   --repeat-count 30
 ```
 
-The benchmark runs the same evaluation and adds batch-1 stage timing.
-`--warmup-count` controls excluded warm-ups, and `--repeat-count` controls the
-measured repetitions. Both values must be positive integers.
+The benchmark is limited to the frozen `bottle` workload and adds batch-1
+stage timing to the same evaluation. `--warmup-count` must be exactly `5`,
+and `--repeat-count` must be exactly `30`. Unlike evaluation, the benchmark
+requires the accepted official weight bytes to be present in the torchvision
+cache before it starts.
 
 ## Run bundle
 
@@ -100,20 +105,22 @@ the same files plus `benchmark.json`.
 | `metrics.json` | Stores the three threshold-free metrics and sample and pixel counts. |
 | `benchmark.json` | Stores benchmark identity, workload, methodology, stage timing, and device-memory measurements. |
 
-Raw maps and masks permit metric recomputation. `benchmark.json` is absent from
-evaluation-only runs. Outputs are ignored by Git, and the complete memory bank
-makes accepted runs large.
+Raw maps and masks permit metric recomputation. Benchmark runs add
+`benchmark.json` to the evaluation bundle. Outputs are ignored by Git, and the
+complete memory bank makes accepted runs large.
 
 Repository execution retains run schema 1 and its exact Git commit, real dirty
 state, and repository `uv.lock` digest. Installed-distribution evaluation uses
 run schema 2 with the strict source fields `kind`, `distribution_name`,
-`distribution_version`, and `baseline_profile_sha256`; it does not invent Git
-or lockfile identity. The profile digest records the exact bundled or explicit
-TOML bytes used. Evaluation still writes exactly the seven files above.
+`distribution_version`, and `baseline_profile_sha256`. The profile digest
+records the exact bundled or explicit TOML bytes used. Evaluation writes the
+seven files above under both schemas.
 
-The existing portability and fixture-export readers remain schema-1-only and
-reject installed schema-2 runs. Installed runs do not rewrite, replace, or
-extend the frozen accepted evidence.
+The portability and fixture-export readers consume repository schema 1. The
+installed evaluation path emits schema 2 with distribution provenance.
+
+The [public-interface policy](public-interface.md) classifies both run schemas,
+the current benchmark schema and the historical evidence inputs.
 
 ## Accepted results
 
@@ -173,12 +180,10 @@ identical. Maximum absolute differences were `0.0` for image scores, patch
 distances, and anomaly maps. All three metric differences were also `0.0`.
 Both runs used the same host, so this only establishes same-stack behavior.
 
-## Limitations
+## Evidence scope
 
 The evidence covers the original MVTec AD dataset and two accepted categories.
-The only implemented profile uses one ResNet-50 layer and a complete FP32 bank,
-which costs 418 MiB for `bottle` and 490 MiB for `leather`. Exact full-bank
-search has substantial measured latency, and the baseline fits no decision
-threshold.
-
-The method is not comparable to something like PatchCore results.
+The implemented profile uses one ResNet-50 layer and a complete FP32 bank,
+which costs 418 MiB for `bottle` and 490 MiB for `leather`. It uses exact
+full-bank search, raw anomaly scores, and threshold-free metrics. Interpret
+these results as the reduced feature-memory method documented here.

@@ -1,16 +1,20 @@
 # InspectRT
 
 InspectRT is a reproducible, reduced feature-memory baseline for one MVTec AD
-category at a time. `RT` means **Runtime**. InspectRT measures runtime behavior,
-but it does not make hard real-time guarantees.
+category at a time. `RT` means **Runtime**. InspectRT records scientific outputs
+and runtime measurements for its frozen workloads.
 
 ## Status
 
 `inspectrt_feature_memory_v1` is the implemented profile. It uses a frozen
 ResNet-50 feature extractor, a complete nominal patch bank, exact
 nearest-neighbor retrieval, raw anomaly maps, and threshold-free metrics. The
-CLI can run complete `evaluate` and `benchmark` jobs, and it can export and
-validate binary exact-retrieval fixtures. See
+supported installed/user commands are `evaluate`, `benchmark`,
+`fixture validate` and `onnx validate`. Fixture and ONNX export are
+source-checkout reproducibility workflows; portability commands are scoped
+maintainer/evidence tooling. The complete command, schema and experimental
+Python API boundary is in
+[docs/public-interface.md](docs/public-interface.md). See
 [docs/retrieval-fixtures.md](docs/retrieval-fixtures.md) for the format,
 commands, and validation limits.
 
@@ -30,30 +34,14 @@ policy-v2 calibration and independent Ryzen/WSL2 holdout. See
 [docs/onnx-portability.md](docs/onnx-portability.md) and the compact
 [scientific evidence](docs/evidence/inspectrt_onnx_feature_portability_v1/scientific.json).
 
-## Installation
+## Bundled fixture quickstart
 
-InspectRT requires Python 3.11 or later and uses [uv](https://docs.astral.sh/uv/)
-for its locked environment:
-
-```bash
-uv sync --locked
-```
-
-The optional ONNX artifact tools and CPU consumer use a separate extra:
-
-```bash
-uv sync --locked --extra onnx
-```
-
-Run the repository checks with:
-
-```bash
-uv run pytest
-uv run ruff check .
-```
+InspectRT supports CPython 3.11 and 3.12. Install a reviewed wheel by following
+[docs/installation.md](docs/installation.md), including the CPU-first or
+CUDA-first PyTorch sequence for Linux.
 
 An installed distribution can validate the bundled canonical synthetic
-fixture without a repository, dataset, or pretrained weight:
+fixture offline on CPU:
 
 ```bash
 inspectrt fixture validate --device cpu
@@ -64,16 +52,23 @@ The fixture identity and validation limits are documented in
 
 ## ONNX feature artifact
 
-Export the static feature graph from a clean source tree with the accepted
-pretrained weight already cached:
+The optional ONNX tools use the `onnx` extra in a locked source checkout:
+
+```bash
+uv sync --locked --extra onnx
+```
+
+Export is a source-checkout reproducibility workflow. It requires a clean
+source tree and the accepted pretrained weight already cached:
 
 ```bash
 uv run --extra onnx inspectrt onnx export \
   --output-root outputs
 ```
 
-The generated artifact contains only `manifest.json` and `model.onnx`. Its model
-bytes remain ignored. Validate the artifact and graph identities with:
+The generated artifact contains only `manifest.json` and `model.onnx`. Its
+model bytes remain ignored. Validation is a supported installed/user workflow
+when `inspectrt[onnx]` is installed:
 
 ```bash
 uv run --extra onnx inspectrt onnx validate \
@@ -81,11 +76,11 @@ uv run --extra onnx inspectrt onnx validate \
   outputs/artifacts/inspectrt_onnx_feature_portability_v1/<artifact-id>
 ```
 
-Validation covers artifact structure and graph identities. The scientific
-comparison is a separate procedure. The graph performs feature extraction only;
-preprocessing, retrieval, scoring, and metrics remain outside it. See the
-[ONNX portability guide](docs/onnx-portability.md) for the direct CPU consumer
-and reviewed limits.
+Validation covers artifact structure and graph identities. The graph emits the
+two feature tensors; InspectRT's PyTorch pipeline handles preprocessing,
+retrieval, scoring, maps, and metrics. See the
+[ONNX portability guide](docs/onnx-portability.md) for the experimental direct
+CPU consumer API and reviewed limits.
 
 ## MVTec AD
 
@@ -102,7 +97,7 @@ datasets/mvtec_ad/
 The dataset remains untracked through `.gitignore`. Pass `datasets/mvtec_ad`,
 not an individual category directory, as `--dataset-root`.
 
-## Evaluation
+## Installed MVTec quickstart
 
 ```bash
 inspectrt evaluate \
@@ -112,28 +107,26 @@ inspectrt evaluate \
   --output-root /path/to/output
 ```
 
-InspectRT bundles the frozen baseline profile, but not MVTec AD or pretrained
-weights. The user supplies the original dataset, and torchvision resolves its
-official pretrained weight separately. An explicit `--config` remains
-supported; see [docs/baseline.md](docs/baseline.md).
+The wheel includes the frozen baseline profile. Use a separately obtained
+MVTec root; torchvision supplies the official pretrained weight. An explicit
+`--config` remains supported. See the [baseline guide](docs/baseline.md) for
+the method, complete run bundle and benchmark command.
 
 ## Benchmark
 
-```bash
-uv run inspectrt benchmark \
-  --config configs/baseline.toml \
-  --dataset-root datasets/mvtec_ad \
-  --category bottle \
-  --device cuda:0 \
-  --output-root outputs \
-  --warmup-count 5 \
-  --repeat-count 30
-```
+`benchmark` is supported for the frozen `bottle` workload with exactly five
+warm-ups and 30 measured repetitions. See
+[docs/baseline.md](docs/baseline.md) for the command, device rules, eight-file
+bundle and reviewed measurements.
 
-Both commands write to `outputs/runs/<generated-run-id>/`. An evaluation run
-has seven files. They contain the resolved run metadata, ordered inventory,
-memory bank, predictions, retrieval results, anomaly maps and masks, and
-metrics. A benchmark run adds `benchmark.json`. Generated runs are gitignored.
+## Method scope
+
+`inspectrt_feature_memory_v1` is InspectRT's reduced feature-memory reference.
+Interpret its results under the method in the [baseline guide](docs/baseline.md).
+Supported installation paths are listed in the
+[installation and support guide](docs/installation.md), while reviewed
+scientific portability evidence is documented in
+[docs/portability.md](docs/portability.md).
 
 ## License and distribution
 
@@ -142,7 +135,8 @@ InspectRT-authored code is licensed under the
 attribution. Dependencies, datasets, and pretrained weights retain separate
 terms. MVTec AD is obtained separately by the user.
 
-Distributions exclude MVTec bytes and application-derived tensors, pretrained
-weights, generated ONNX models, large memory banks, and private evidence.
+Release archives contain InspectRT code, the baseline profile, the synthetic
+fixture, and legal metadata. Users obtain MVTec and torchvision weights
+separately and generate run bundles or ONNX models locally.
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) records the dependency,
 dataset, weight, and generated-artifact boundaries.

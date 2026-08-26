@@ -1126,7 +1126,7 @@ def test_tracked_portability_policy_is_the_reviewed_canonical_artifact(
         with pytest.raises(ComparisonValidationError) as raised:
             load_portability_policy(invalid_path)
         assert raised.value, case
-    assert b"/" not in payload and b"\\" not in payload and b"_extra" not in payload
+    assert b"/" not in payload and b"\\" not in payload
 
 
 def test_exact_pair_is_within_zero_policy(

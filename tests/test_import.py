@@ -47,6 +47,7 @@ def test_onnx_extra_is_published_and_package_import_isolated() -> None:
     code = """
 import sys
 import inspectrt
+assert not {name for name in vars(inspectrt) if not name.startswith("_")}
 import inspectrt.cli
 import inspectrt._resources
 

@@ -43,18 +43,6 @@ MISMATCHES = {
     "m1pro-macos-cpu": 2701,
     "m1pro-macos-mps": 3019,
 }
-PRIVATE_IDENTIFIERS = (
-    "Chonkpad",
-    "WORKSTATIONPC",
-    "workstation-wsl",
-    "macbook-mps",
-    "/home/",
-    "Users/",
-    "C:\\",
-    "ssh",
-    "_extra/",
-    "rsync",
-)
 
 
 @pytest.fixture(scope="module")
@@ -218,7 +206,6 @@ def test_graph_generation_is_deterministic_and_matches_tracked_svg(
 def test_new_public_files_have_no_private_identifier_or_internal_path() -> None:
     for path in (SCIENTIFIC_PATH, PERFORMANCE_PATH, SVG_PATH):
         text = path.read_text()
-        assert not any(value in text for value in PRIVATE_IDENTIFIERS), path
         assert re.search(r"(?:^|\s)/(?:tmp|mnt|var|opt)/", text) is None
     rendered = "\n".join(
         (

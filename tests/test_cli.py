@@ -127,8 +127,20 @@ def test_command_groups_expose_the_documented_parser_surface() -> None:
     performance = _console("portability", "performance", "--help")
     assert root.returncode == group.returncode == compare.returncode == 0
     assert performance.returncode == 0
-    assert "portability" in root.stdout
+    for command in ("evaluate", "benchmark", "fixture", "onnx", "portability"):
+        assert command in root.stdout
+    assert "installed/user" in evaluate.stdout
+    assert "installed/user" in benchmark.stdout
+    assert "frozen MVTec AD bottle benchmark" in " ".join(benchmark.stdout.split())
     assert "{compare,performance}" in group.stdout
+    assert "Maintainer tooling for reviewed portability evidence" in group.stdout
+    assert "Maintainer/evidence command" in compare.stdout
+    assert "repeat at least once" in compare.stdout
+    assert "count must match environment-map candidates" in " ".join(
+        compare.stdout.split()
+    )
+    assert "Maintainer/evidence command" in performance.stdout
+    assert "repeat exactly six times" in performance.stdout
     for argument in (
         "--reference-run",
         "--candidate-run",
@@ -154,6 +166,8 @@ def test_command_groups_expose_the_documented_parser_surface() -> None:
     assert fixture_group.returncode == fixture_validate.returncode == 0
     assert fixture_export.returncode == 0
     assert "{validate,export}" in fixture_group.stdout
+    assert "Supported installed/user command" in fixture_validate.stdout
+    assert "Supported source-checkout reproducibility command" in fixture_export.stdout
     assert "[--fixture FIXTURE]" in fixture_validate.stdout
     assert "fixture directory (default: bundled synthetic-" in fixture_validate.stdout
     assert "correctness-v1)" in fixture_validate.stdout
@@ -161,6 +175,8 @@ def test_command_groups_expose_the_documented_parser_surface() -> None:
     assert "[--config CONFIG]" in benchmark.stdout
     assert "baseline TOML profile (default: bundled" in evaluate.stdout
     assert "inspectrt_feature_memory_v1)" in evaluate.stdout
+    assert "must be exactly 5" in benchmark.stdout
+    assert "must be exactly 30" in benchmark.stdout
     assert all(
         argument in fixture_export.stdout
         for argument in (
@@ -392,6 +408,18 @@ def test_portability_performance_routes_six_runs_and_has_one_error_boundary(
         "status=published",
     ]
 
+    too_few = arguments[:-4] + arguments[-2:]
+    assert cli.main(too_few) == 1
+    assert "--timing-run must occur exactly six times" in capsys.readouterr().err
+    too_many = [
+        *arguments[:-2],
+        "--timing-run",
+        str(tmp_path / "run-6"),
+        *arguments[-2:],
+    ]
+    assert cli.main(too_many) == 1
+    assert "--timing-run must occur exactly six times" in capsys.readouterr().err
+
     inside_bundle = [*arguments[:-1], str(paths[0] / "performance_v2.json")]
     assert cli.main(inside_bundle) == 1
     assert capsys.readouterr().err == (
@@ -422,6 +450,9 @@ def test_onnx_help_action_arguments_and_import_isolation() -> None:
     assert validate.returncode == 0
     assert "onnx" in root.stdout
     assert "{export,validate}" in group.stdout
+    assert "Supported source-checkout reproducibility command" in export.stdout
+    assert "Supported installed/user command" in validate.stdout
+    assert "requires inspectrt[onnx]" in " ".join(validate.stdout.split())
     assert "--output-root" in export.stdout
     assert "--artifact" in validate.stdout
     for arguments, required in (

@@ -8,21 +8,26 @@ schema 2 and synchronized wall-clock timing from the same harness.
 The matrix includes a Quadro T1000 on native Linux, an Intel Core i7-9850H CPU,
 an RTX 4080 Super under WSL 2, and an M1 Pro using both CPU and MPS.
 
+The tracked JSON files are published evidence formats used by
+`inspectrt portability compare` and `inspectrt portability performance`.
+These source-checkout maintainer/evidence commands are documented in
+[Public interface](public-interface.md).
+
 ## Method
 
 Each run used the accepted profile, ordered sample inventory, ResNet-50
 `IMAGENET1K_V2` weights, and exact chunked top-1 squared-L2 retrieval against
 the complete nominal bank. The scientific JSON comes from source commit
 `bc330b9070c5ca8db9cb7cfbb27617256388536b`; its classifications and policy
-values were not regenerated.
+values retain their frozen identities.
 
 The six timing bundles use timing-harness commit
 `4f230679d52b5ed08e43230ebb1308cb85a33e57` and `uv.lock` SHA-256
 `4464c375e3bf0f9c575504b427a0e82aedc954ef3491807306b72c382ce07d5c`.
-Each benchmark excluded five warm-ups and retained 30 measured repetitions.
+Each benchmark ran five warm-ups followed by 30 measured repetitions.
 `performance.json` contains every raw nanosecond observation. CPU intervals
-measure synchronous host work without accelerator synchronization. CUDA and
-MPS intervals synchronize the accelerator at their boundaries.
+measure synchronous host work. CUDA and MPS intervals synchronize the
+accelerator at their boundaries.
 
 Stage measurements use a segmented complete-pipeline pass.
 Feature extraction covers frozen `layer2` inference, local pooling, row-major
@@ -32,11 +37,10 @@ stages include accelerator completion on CUDA and MPS.
 
 A separate uninterrupted pass measures end to end. It starts before image
 decode and ends after the raw anomaly map is materialized and the backend has
-completed. Model load, nominal-bank construction and transfer, masks, metrics,
-serialization, persistence, and console output are outside this interval. The
-stage and end-to-end values come from separate passes, so they are not
-additive. The p50 and p95 values below are recomputed from the persisted raw
-arrays.
+completed. Model load, nominal-bank construction, masks, metrics, and output
+writing have separate boundaries. Stage measurements and end-to-end
+measurements use separate passes and are interpreted separately. The p50 and
+p95 values below are recomputed from the persisted raw arrays.
 
 ## Results
 
@@ -68,7 +72,8 @@ CPU, and 3,019 for M1 Pro MPS. The four cross-device records have status
 - [latency.svg](evidence/inspectrt_cross_platform_evidence_v2/latency.svg)
 - [portability policy](../configs/portability_policy.json)
 
-Regenerate the graph and check it against the tracked bytes with:
+As a deterministic source-checkout evidence check, regenerate the graph and
+compare it with the tracked bytes:
 
 ```bash
 uv run python scripts/render_portability_latency.py \
@@ -87,18 +92,9 @@ uv run python scripts/render_portability_latency.py \
 | `performance.json` SHA-256 | `44057e5317b902341b1b359c0ff5a43f3900940115a206e1bd8ea2774adc85d9` |
 | `latency.svg` SHA-256 | `0fabd72ac0c517c7a1d9f77f6a14a7f9cddee75039ffd8164555f004b61be57a` |
 
-## Limits
+## Evidence scope
 
-Performance is descriptive, not inferential. Host power, host load, and thermal
-conditions were not uniformly controlled. The record reports only absolute
-observations and does not establish a cross-machine ordering or general
-portability.
-
-The records cover only the named profile, category, software versions, and
-environments. Each timing row is one complete run and does not establish
-behavior for other libraries, drivers, operating systems, or hardware. The
-scientific comparison covers the nominal feature bank and persisted downstream
-artifacts, but not raw test feature tensors.
-
-`RT` means Runtime. Latency measurements do not imply a hard-real-time
-guarantee.
+The records report absolute latency observations for the named profile,
+category, software versions, and hardware under the host conditions present
+during each run. Each timing row is one complete run. The scientific comparison
+covers the nominal feature bank and persisted downstream artifacts.
