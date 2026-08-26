@@ -1,0 +1,65 @@
+name: Feature request
+description: Describe a user problem and a bounded proposed change
+title: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the problem rather than a predetermined implementation. A request is not a roadmap commitment.
+        Suspected security vulnerabilities must be reported privately through `SECURITY.md`, not this form.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: What is difficult or impossible today, and who encounters it?
+    validations:
+      required: true
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Current use case
+      description: Describe the current workflow and its relevant constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest observable behavior that would address the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: What have you tried, and why is it insufficient?
+  - type: textarea
+    id: contracts
+    attributes:
+      label: Effect on documented contracts
+      description: Note any expected effect on the CLI, schemas, scientific method, evidence or package boundary.
+    validations:
+      required: true
+  - type: textarea
+    id: prerequisites
+    attributes:
+      label: Data, model, runtime or hardware prerequisites
+      description: List required external data, weights, runtimes or devices without attaching them.
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Willingness to contribute
+      options:
+        - Yes
+        - Maybe, with guidance
+        - No
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Public-material confirmation
+      options:
+        - label: I confirmed that this request contains no secrets, private paths, MVTec bytes, pretrained weights or private artifacts.
+          required: true
+

@@ -1,0 +1,92 @@
+name: Bug report
+description: Report a reproducible InspectRT problem
+title: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not disclose a suspected security vulnerability here. Follow `SECURITY.md` and report it privately.
+        Do not attach MVTec data, pretrained weights, generated bundles or unsanitized output.
+  - type: input
+    id: version
+    attributes:
+      label: InspectRT version or commit
+      description: Give the installed version or full source commit.
+      placeholder: 0.1.0 or a full commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation mode
+      options:
+        - Source checkout
+        - Wheel
+        - Sdist-built wheel
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: CPython 3.11.15
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and execution layer
+      description: Include the distribution or OS release and WSL or virtualization layer when relevant.
+      placeholder: Ubuntu 24.04, native Linux
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: State CPU, CUDA or MPS and the relevant hardware identity.
+      placeholder: CPU, Intel Core i7-9850H
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: Provide the smallest command that demonstrates the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: List the minimal steps and inputs needed to reproduce the problem without private material.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant sanitized output
+      description: Remove secrets, private paths and private data. Paste only the lines needed to understand the failure.
+      render: shell
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Public-material confirmation
+      options:
+        - label: I confirmed that this report contains no secrets, private paths, MVTec bytes, pretrained weights or private artifacts.
+          required: true
+

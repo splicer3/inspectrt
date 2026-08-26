@@ -1,0 +1,40 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+
+          pattern = re.compile(
+              r"^(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
+              r"(?:\([A-Za-z0-9][A-Za-z0-9._/-]*\))?!?: \S.*$"
+          )
+          title = os.environ["PR_TITLE"]
+          if not pattern.fullmatch(title):
+              raise SystemExit(
+                  "invalid pull-request title; expected "
+                  "type(scope)!: nonempty description"
+              )
+          print("pull-request title is valid")
+          PY

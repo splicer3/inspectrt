@@ -1,0 +1,562 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.6"
+  TORCH_VERSION: "2.13.0+cpu"
+  TORCHVISION_VERSION: "0.28.0+cpu"
+  RELEASE_LOCK_SHA256: "54553a9333abf06be92c7ca11fd1b35b1548ac7f50a7fb196897b4691ac73f5e"
+  UV_LINK_MODE: copy
+
+jobs:
+  base:
+    name: Base / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      PYTHON_VERSION: ${{ matrix.python-version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python-version }}
+          github-token: ""
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+            .github/workflows/ci.yml
+          cache-suffix: inspectrt-cpu-${{ matrix.python-version }}
+          prune-cache: true
+          cache-python: false
+
+      - name: Prepare isolated paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          CI_ROOT="$(mktemp -d "$RUNNER_TEMP/inspectrt-ci.XXXXXX")"
+          mkdir -p \
+            "$CI_ROOT/matplotlib" \
+            "$CI_ROOT/pycache" \
+            "$CI_ROOT/ruff" \
+            "$CI_ROOT/tmp" \
+            "$CI_ROOT/torch" \
+            "$CI_ROOT/xdg"
+          {
+            printf 'CI_ROOT=%s\n' "$CI_ROOT"
+            printf 'MPLCONFIGDIR=%s\n' "$CI_ROOT/matplotlib"
+            printf 'PYTHONPYCACHEPREFIX=%s\n' "$CI_ROOT/pycache"
+            printf 'RUFF_CACHE_DIR=%s\n' "$CI_ROOT/ruff"
+            printf 'TMPDIR=%s\n' "$CI_ROOT/tmp"
+            printf 'TORCH_HOME=%s\n' "$CI_ROOT/torch"
+            printf 'XDG_CACHE_HOME=%s\n' "$CI_ROOT/xdg"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$CI_ROOT/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install CPU development environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$CI_ROOT/venv/bin/python"
+          uv venv --python "$PYTHON_VERSION" "$CI_ROOT/venv" --no-project --no-config
+          uv --quiet export \
+            --locked \
+            --python "$PYTHON_VERSION" \
+            --no-emit-project \
+            --prune torch \
+            --prune torchvision \
+            --output-file "$CI_ROOT/locked.txt"
+          uv pip install \
+            --python "$PY" \
+            --no-config \
+            --strict \
+            --torch-backend cpu \
+            --requirement "$CI_ROOT/locked.txt" \
+            "torch==$TORCH_VERSION" \
+            "torchvision==$TORCHVISION_VERSION"
+          uv pip install \
+            --python "$PY" \
+            --no-config \
+            --strict \
+            --no-deps \
+            --editable .
+          uv pip check --python "$PY" --no-config
+          uv pip list --python "$PY" --no-config --format freeze
+
+      - name: Audit CPU package graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CI_ROOT/venv/bin/python" - <<'PY'
+          from importlib.metadata import distributions, version
+          import re
+
+          import torch
+
+          canonical = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+          installed = {
+              canonical(item.metadata["Name"]): item.version for item in distributions()
+          }
+          forbidden = sorted(
+              name
+              for name in installed
+              if name.startswith(("cuda-", "nvidia-"))
+              or name in {"onnxruntime-gpu", "triton"}
+          )
+          assert version("torch") == "2.13.0+cpu"
+          assert version("torchvision") == "0.28.0+cpu"
+          assert torch.version.cuda is None
+          assert not torch.cuda.is_available()
+          assert "onnxruntime" not in installed
+          assert not forbidden, forbidden
+          PY
+
+      - name: Run quality and focused evidence checks
+        if: matrix.python-version == '3.11'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$CI_ROOT/venv/bin/python"
+          "$PY" -m ruff check .
+          "$PY" -m ruff format --check .
+          "$PY" -m compileall -q inspectrt scripts tests
+          "$PY" -m pytest \
+            -q \
+            --runxfail \
+            -p no:cacheprovider \
+            tests/test_portability_evidence.py \
+            tests/test_onnx_portability_evidence.py \
+            -k 'not graph_generation_is_deterministic_and_matches_tracked_svg'
+
+      - name: Verify repository and test result
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$CI_ROOT/venv/bin/python"
+          git diff --check
+          git diff --check HEAD^ HEAD
+          uv lock --check
+          printf '%s  uv.lock\n' "$RELEASE_LOCK_SHA256" | sha256sum --check --strict
+          "$PY" -m pytest \
+            -q \
+            --runxfail \
+            -p no:cacheprovider \
+            -o junit_family=xunit1 \
+            --junitxml="$CI_ROOT/pytest.xml"
+          "$PY" scripts/verify_pytest_report.py \
+            "$CI_ROOT/pytest.xml" \
+            --tests 96 \
+            --skip tests/test_fixtures.py::test_ignored_real_fixture_manifest_matches_bottle_metadata_when_present \
+            --skip tests/test_onnx_artifacts.py::test_graph_contract_metadata_and_external_data_fail_closed \
+            --skip tests/test_onnx_features.py::test_exports_static_dual_outputs_with_pool_and_row_major_layout
+          if find "$TORCH_HOME" -type f -print -quit | grep -q .; then
+            echo "unexpected pretrained-weight file in TORCH_HOME" >&2
+            exit 1
+          fi
+
+      - name: Remove isolated paths
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${CI_ROOT:-}" ]]; then
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+
+          root = Path(os.environ["CI_ROOT"]).resolve()
+          runner = Path(os.environ["RUNNER_TEMP"]).resolve()
+          if root.parent != runner or not root.name.startswith("inspectrt-ci."):
+              raise SystemExit(f"refusing to remove unexpected path: {root}")
+          shutil.rmtree(root)
+          PY
+          fi
+
+  onnx:
+    name: ONNX / Python 3.11
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHON_VERSION: "3.11"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11"
+          github-token: ""
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+            .github/workflows/ci.yml
+          cache-suffix: inspectrt-cpu-onnx-3.11
+          prune-cache: true
+          cache-python: false
+
+      - name: Prepare isolated paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          CI_ROOT="$(mktemp -d "$RUNNER_TEMP/inspectrt-ci.XXXXXX")"
+          mkdir -p \
+            "$CI_ROOT/matplotlib" \
+            "$CI_ROOT/pycache" \
+            "$CI_ROOT/tmp" \
+            "$CI_ROOT/torch" \
+            "$CI_ROOT/xdg"
+          {
+            printf 'CI_ROOT=%s\n' "$CI_ROOT"
+            printf 'MPLCONFIGDIR=%s\n' "$CI_ROOT/matplotlib"
+            printf 'PYTHONPYCACHEPREFIX=%s\n' "$CI_ROOT/pycache"
+            printf 'TMPDIR=%s\n' "$CI_ROOT/tmp"
+            printf 'TORCH_HOME=%s\n' "$CI_ROOT/torch"
+            printf 'XDG_CACHE_HOME=%s\n' "$CI_ROOT/xdg"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$CI_ROOT/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install CPU ONNX development environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$CI_ROOT/venv/bin/python"
+          uv venv --python "$PYTHON_VERSION" "$CI_ROOT/venv" --no-project --no-config
+          uv --quiet export \
+            --locked \
+            --python "$PYTHON_VERSION" \
+            --extra onnx \
+            --no-emit-project \
+            --prune torch \
+            --prune torchvision \
+            --output-file "$CI_ROOT/locked.txt"
+          uv pip install \
+            --python "$PY" \
+            --no-config \
+            --strict \
+            --torch-backend cpu \
+            --requirement "$CI_ROOT/locked.txt" \
+            "torch==$TORCH_VERSION" \
+            "torchvision==$TORCHVISION_VERSION" \
+            "onnxruntime==1.28.0"
+          uv pip install \
+            --python "$PY" \
+            --no-config \
+            --strict \
+            --no-deps \
+            --editable ".[onnx]"
+          uv pip check --python "$PY" --no-config
+          uv pip list --python "$PY" --no-config --format freeze
+
+      - name: Audit CPU and ONNX package graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CI_ROOT/venv/bin/python" - <<'PY'
+          from importlib.metadata import distributions, version
+          import re
+
+          import onnxruntime as ort
+          import torch
+
+          canonical = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+          installed = {
+              canonical(item.metadata["Name"]): item.version for item in distributions()
+          }
+          forbidden = sorted(
+              name
+              for name in installed
+              if name.startswith(("cuda-", "nvidia-"))
+              or name in {"onnxruntime-gpu", "triton"}
+          )
+          providers = ort.get_available_providers()
+          assert version("torch") == "2.13.0+cpu"
+          assert version("torchvision") == "0.28.0+cpu"
+          assert version("onnxruntime") == "1.28.0"
+          assert torch.version.cuda is None
+          assert not torch.cuda.is_available()
+          assert "CPUExecutionProvider" in providers
+          assert "CUDAExecutionProvider" not in providers
+          assert not forbidden, forbidden
+          print("onnxruntime providers:", ", ".join(providers))
+          PY
+
+      - name: Verify repository and ONNX test result
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$CI_ROOT/venv/bin/python"
+          git diff --check
+          git diff --check HEAD^ HEAD
+          uv lock --check
+          printf '%s  uv.lock\n' "$RELEASE_LOCK_SHA256" | sha256sum --check --strict
+          "$PY" -m pytest \
+            -q \
+            --runxfail \
+            -p no:cacheprovider \
+            -o junit_family=xunit1 \
+            --junitxml="$CI_ROOT/pytest.xml"
+          "$PY" scripts/verify_pytest_report.py \
+            "$CI_ROOT/pytest.xml" \
+            --tests 96 \
+            --skip tests/test_fixtures.py::test_ignored_real_fixture_manifest_matches_bottle_metadata_when_present
+          if find "$TORCH_HOME" -type f -print -quit | grep -q .; then
+            echo "unexpected pretrained-weight file in TORCH_HOME" >&2
+            exit 1
+          fi
+
+      - name: Remove isolated paths
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${CI_ROOT:-}" ]]; then
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+
+          root = Path(os.environ["CI_ROOT"]).resolve()
+          runner = Path(os.environ["RUNNER_TEMP"]).resolve()
+          if root.parent != runner or not root.name.startswith("inspectrt-ci."):
+              raise SystemExit(f"refusing to remove unexpected path: {root}")
+          shutil.rmtree(root)
+          PY
+          fi
+
+  distribution:
+    name: Distribution / Python 3.11
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PYTHON_VERSION: "3.11"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11"
+          github-token: ""
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+            .github/workflows/ci.yml
+          cache-suffix: inspectrt-cpu-distribution-3.11
+          prune-cache: true
+          cache-python: false
+
+      - name: Prepare isolated paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          CI_ROOT="$(mktemp -d "$RUNNER_TEMP/inspectrt-ci.XXXXXX")"
+          ARTIFACT_ROOT="$RUNNER_TEMP/inspectrt-artifacts"
+          mkdir -p "$CI_ROOT/no-git-build" "$CI_ROOT/no-git-bin" "$ARTIFACT_ROOT/direct"
+          printf '#!/bin/sh\nexit 97\n' > "$CI_ROOT/no-git-bin/git"
+          chmod 755 "$CI_ROOT/no-git-bin/git"
+          {
+            printf 'CI_ROOT=%s\n' "$CI_ROOT"
+            printf 'ARTIFACT_ROOT=%s\n' "$ARTIFACT_ROOT"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and audit distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv build \
+            --no-sources \
+            --out-dir "$ARTIFACT_ROOT/direct" \
+            --no-create-gitignore
+          WHEEL="$ARTIFACT_ROOT/direct/inspectrt-0.1.0-py3-none-any.whl"
+          SDIST="$ARTIFACT_ROOT/direct/inspectrt-0.1.0.tar.gz"
+          mkdir -p "$ARTIFACT_ROOT/from-sdist"
+          (
+            cd "$CI_ROOT/no-git-build"
+            PATH="$CI_ROOT/no-git-bin:$PATH" uv build \
+              --no-sources \
+              --wheel \
+              --out-dir "$ARTIFACT_ROOT/from-sdist" \
+              --no-create-gitignore \
+              "$SDIST"
+          )
+          python3 scripts/verify_distribution.py \
+            "$WHEEL" \
+            "$SDIST" \
+            "$ARTIFACT_ROOT/from-sdist/inspectrt-0.1.0-py3-none-any.whl"
+
+      - name: Validate clean distribution installs
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL="$ARTIFACT_ROOT/direct/inspectrt-0.1.0-py3-none-any.whl"
+          SDIST_WHEEL="$ARTIFACT_ROOT/from-sdist/inspectrt-0.1.0-py3-none-any.whl"
+          EXPECTED_OUTPUT=$'fixture_id=synthetic-correctness-v1\nfixture_class=synthetic_correctness\nQ=4\nM=7\nD=5\nk=1\nchunk_size=3\npayload_sha256=18c2c4333a060ff25b7304dd396cf4b292617c4593d7cbfc2576b406ed5a14bb\nfixture_digest=ec30a68439f52051028a56cbd5a1c560edc2bccc4e77e603fa2d3355a26a4e9e\nindices=exact\ndistances=exact\nstatus=accepted'
+
+          validate_install() {
+            local label="$1"
+            local archive="$2"
+            local with_onnx="$3"
+            local root="$CI_ROOT/$label"
+            local py="$root/venv/bin/python"
+            local command="$root/venv/bin/inspectrt"
+            mkdir -p "$root/torch" "$root/xdg" "$root/tmp" "$root/work"
+            uv venv --python "$PYTHON_VERSION" "$root/venv" --no-project --no-config
+            if [[ "$with_onnx" == yes ]]; then
+              uv pip install \
+                --python "$py" \
+                --no-config \
+                --strict \
+                --torch-backend cpu \
+                "${archive}[onnx]" \
+                "torch==$TORCH_VERSION" \
+                "torchvision==$TORCHVISION_VERSION" \
+                "onnxruntime==1.28.0"
+            else
+              uv pip install \
+                --python "$py" \
+                --no-config \
+                --strict \
+                --torch-backend cpu \
+                "$archive" \
+                "torch==$TORCH_VERSION" \
+                "torchvision==$TORCHVISION_VERSION"
+            fi
+            uv pip check --python "$py" --no-config
+            uv pip list --python "$py" --no-config --format freeze
+            TORCH_HOME="$root/torch" XDG_CACHE_HOME="$root/xdg" TMPDIR="$root/tmp" \
+              "$py" - "$with_onnx" <<'PY'
+          from importlib.metadata import distributions, version
+          import re
+          import sys
+
+          import torch
+
+          canonical = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+          installed = {
+              canonical(item.metadata["Name"]): item.version for item in distributions()
+          }
+          forbidden = sorted(
+              name
+              for name in installed
+              if name.startswith(("cuda-", "nvidia-"))
+              or name in {"onnxruntime-gpu", "triton"}
+          )
+          assert version("inspectrt") == "0.1.0"
+          assert version("torch") == "2.13.0+cpu"
+          assert version("torchvision") == "0.28.0+cpu"
+          assert torch.version.cuda is None
+          assert not torch.cuda.is_available()
+          assert not forbidden, forbidden
+          if sys.argv[1] == "yes":
+              import onnxruntime as ort
+
+              assert version("onnxruntime") == "1.28.0"
+              assert "onnxruntime-gpu" not in installed
+              assert "CPUExecutionProvider" in ort.get_available_providers()
+          else:
+              assert "onnxruntime" not in installed
+          PY
+            (
+              cd "$root/work"
+              "$command" --help > /dev/null
+              "$command" fixture validate --help > /dev/null
+              if [[ "$with_onnx" == yes ]]; then
+                "$command" onnx validate --help > /dev/null
+              fi
+              output="$(
+                TORCH_HOME="$root/torch" \
+                XDG_CACHE_HOME="$root/xdg" \
+                TMPDIR="$root/tmp" \
+                "$command" fixture validate --device cpu
+              )"
+              [[ "$output" == "$EXPECTED_OUTPUT" ]]
+            )
+            if find "$root/torch" -type f -print -quit | grep -q .; then
+              echo "unexpected pretrained-weight file in $label TORCH_HOME" >&2
+              return 1
+            fi
+          }
+
+          validate_install direct-wheel "$WHEEL" no
+          validate_install sdist-wheel "$SDIST_WHEEL" no
+          validate_install onnx-wheel "$WHEEL" yes
+
+      - name: Verify repository boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --check HEAD^ HEAD
+          uv lock --check
+          printf '%s  uv.lock\n' "$RELEASE_LOCK_SHA256" | sha256sum --check --strict
+
+      - name: Upload audited distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: inspectrt-ci-distributions
+          path: |
+            ${{ runner.temp }}/inspectrt-artifacts/direct/inspectrt-0.1.0-py3-none-any.whl
+            ${{ runner.temp }}/inspectrt-artifacts/direct/inspectrt-0.1.0.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: false
+          overwrite: false
+
+      - name: Remove isolated paths
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+
+          runner = Path(os.environ["RUNNER_TEMP"]).resolve()
+          candidates = []
+          if os.environ.get("CI_ROOT"):
+              candidates.append(Path(os.environ["CI_ROOT"]).resolve())
+          candidates.append(Path(os.environ["ARTIFACT_ROOT"]).resolve())
+          for root in candidates:
+              if root.parent != runner or not root.name.startswith("inspectrt-"):
+                  raise SystemExit(f"refusing to remove unexpected path: {root}")
+              if root.exists():
+                  shutil.rmtree(root)
+          PY
