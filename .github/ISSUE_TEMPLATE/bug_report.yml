@@ -89,4 +89,3 @@ body:
       options:
         - label: I confirmed that this report contains no secrets, private paths, MVTec bytes, pretrained weights or private artifacts.
           required: true
-

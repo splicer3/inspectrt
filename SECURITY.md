@@ -16,4 +16,3 @@ safety, production readiness or hard-real-time certification.
 
 GitHub private vulnerability reporting is a separate repository setting and
 is not implied by this file.
-

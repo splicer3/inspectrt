@@ -62,4 +62,3 @@ body:
       options:
         - label: I confirmed that this request contains no secrets, private paths, MVTec bytes, pretrained weights or private artifacts.
           required: true
-
