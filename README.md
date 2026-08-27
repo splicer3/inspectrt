@@ -1,5 +1,9 @@
 # InspectRT
 
+[![CI](https://github.com/splicer3/inspectrt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/splicer3/inspectrt/actions/workflows/ci.yml?query=branch%3Amain)
+[![Python 3.11 | 3.12](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)](docs/installation.md)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 InspectRT is a reproducible, reduced feature-memory baseline for one MVTec AD
 category at a time. `RT` means **Runtime**. InspectRT records scientific outputs
 and runtime measurements for its frozen workloads.
