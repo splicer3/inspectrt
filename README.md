@@ -1,8 +1,8 @@
-# InspectRT
+![InspectRT: A Portable Runtime for Industrial Visual Inspection](https://raw.githubusercontent.com/splicer3/inspectrt/main/docs/assets/banners/inspectrt-banner.png)
 
 [![CI](https://github.com/splicer3/inspectrt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/splicer3/inspectrt/actions/workflows/ci.yml?query=branch%3Amain)
-[![Python 3.11 | 3.12](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)](docs/installation.md)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Python 3.11 | 3.12](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB)](https://github.com/splicer3/inspectrt/blob/main/docs/installation.md)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/splicer3/inspectrt/blob/main/LICENSE)
 
 InspectRT is a reproducible, reduced feature-memory baseline for one MVTec AD
 category at a time. `RT` means **Runtime**. InspectRT records scientific outputs
@@ -18,8 +18,8 @@ supported installed/user commands are `evaluate`, `benchmark`,
 source-checkout reproducibility workflows; portability commands are scoped
 maintainer/evidence tooling. The complete command, schema and experimental
 Python API boundary is in
-[docs/public-interface.md](docs/public-interface.md). See
-[docs/retrieval-fixtures.md](docs/retrieval-fixtures.md) for the format,
+[docs/public-interface.md](https://github.com/splicer3/inspectrt/blob/main/docs/public-interface.md). See
+[docs/retrieval-fixtures.md](https://github.com/splicer3/inspectrt/blob/main/docs/retrieval-fixtures.md) for the format,
 commands, and validation limits.
 
 The baseline freeze covers `bottle` and `leather` on a ThinkPad P53 with a
@@ -29,19 +29,19 @@ WSL 2, M1 Pro CPU, and M1 Pro MPS. Floating outputs and metrics stayed within
 the reviewed envelope, although exact nearest-neighbour indices varied across
 devices. The synchronized wall-clock record contains six descriptive timing
 rows. See
-[docs/portability.md](docs/portability.md) and the baseline method contract in
-[docs/baseline.md](docs/baseline.md).
+[docs/portability.md](https://github.com/splicer3/inspectrt/blob/main/docs/portability.md) and the baseline method contract in
+[docs/baseline.md](https://github.com/splicer3/inspectrt/blob/main/docs/baseline.md).
 
 The frozen `bottle` workload also has a reviewed ONNX feature boundary for
 `layer2` and row-major patch embeddings. ONNX Runtime CPU results pass the
 policy-v2 calibration and independent Ryzen/WSL2 holdout. See
-[docs/onnx-portability.md](docs/onnx-portability.md) and the compact
-[scientific evidence](docs/evidence/inspectrt_onnx_feature_portability_v1/scientific.json).
+[docs/onnx-portability.md](https://github.com/splicer3/inspectrt/blob/main/docs/onnx-portability.md) and the compact
+[scientific evidence](https://github.com/splicer3/inspectrt/blob/main/docs/evidence/inspectrt_onnx_feature_portability_v1/scientific.json).
 
 ## Bundled fixture quickstart
 
 InspectRT supports CPython 3.11 and 3.12. Install a reviewed wheel by following
-[docs/installation.md](docs/installation.md), including the CPU-first or
+[docs/installation.md](https://github.com/splicer3/inspectrt/blob/main/docs/installation.md), including the CPU-first or
 CUDA-first PyTorch sequence for Linux.
 
 An installed distribution can validate the bundled canonical synthetic
@@ -52,7 +52,7 @@ inspectrt fixture validate --device cpu
 ```
 
 The fixture identity and validation limits are documented in
-[docs/retrieval-fixtures.md](docs/retrieval-fixtures.md).
+[docs/retrieval-fixtures.md](https://github.com/splicer3/inspectrt/blob/main/docs/retrieval-fixtures.md).
 
 ## ONNX feature artifact
 
@@ -83,7 +83,7 @@ uv run --extra onnx inspectrt onnx validate \
 Validation covers artifact structure and graph identities. The graph emits the
 two feature tensors; InspectRT's PyTorch pipeline handles preprocessing,
 retrieval, scoring, maps, and metrics. See the
-[ONNX portability guide](docs/onnx-portability.md) for the experimental direct
+[ONNX portability guide](https://github.com/splicer3/inspectrt/blob/main/docs/onnx-portability.md) for the experimental direct
 CPU consumer API and reviewed limits.
 
 ## MVTec AD
@@ -113,34 +113,34 @@ inspectrt evaluate \
 
 The wheel includes the frozen baseline profile. Use a separately obtained
 MVTec root; torchvision supplies the official pretrained weight. An explicit
-`--config` remains supported. See the [baseline guide](docs/baseline.md) for
+`--config` remains supported. See the [baseline guide](https://github.com/splicer3/inspectrt/blob/main/docs/baseline.md) for
 the method, complete run bundle and benchmark command.
 
 ## Benchmark
 
 `benchmark` is supported for the frozen `bottle` workload with exactly five
 warm-ups and 30 measured repetitions. See
-[docs/baseline.md](docs/baseline.md) for the command, device rules, eight-file
+[docs/baseline.md](https://github.com/splicer3/inspectrt/blob/main/docs/baseline.md) for the command, device rules, eight-file
 bundle and reviewed measurements.
 
 ## Method scope
 
 `inspectrt_feature_memory_v1` is InspectRT's reduced feature-memory reference.
-Interpret its results under the method in the [baseline guide](docs/baseline.md).
+Interpret its results under the method in the [baseline guide](https://github.com/splicer3/inspectrt/blob/main/docs/baseline.md).
 Supported installation paths are listed in the
-[installation and support guide](docs/installation.md), while reviewed
+[installation and support guide](https://github.com/splicer3/inspectrt/blob/main/docs/installation.md), while reviewed
 scientific portability evidence is documented in
-[docs/portability.md](docs/portability.md).
+[docs/portability.md](https://github.com/splicer3/inspectrt/blob/main/docs/portability.md).
 
 ## License and distribution
 
 InspectRT-authored code is licensed under the
-[Apache License 2.0](LICENSE), and [NOTICE](NOTICE) preserves first-party
+[Apache License 2.0](https://github.com/splicer3/inspectrt/blob/main/LICENSE), and [NOTICE](https://github.com/splicer3/inspectrt/blob/main/NOTICE) preserves first-party
 attribution. Dependencies, datasets, and pretrained weights retain separate
 terms. MVTec AD is obtained separately by the user.
 
 Release archives contain InspectRT code, the baseline profile, the synthetic
 fixture, and legal metadata. Users obtain MVTec and torchvision weights
 separately and generate run bundles or ONNX models locally.
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) records the dependency,
+[THIRD_PARTY_NOTICES.md](https://github.com/splicer3/inspectrt/blob/main/THIRD_PARTY_NOTICES.md) records the dependency,
 dataset, weight, and generated-artifact boundaries.
