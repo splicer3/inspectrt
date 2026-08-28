@@ -1,0 +1,548 @@
+name: Publish package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inspectrt-pypi-0.1.0
+  cancel-in-progress: false
+
+env:
+  PROJECT: inspectrt
+  VERSION: "0.1.0"
+  TAG: v0.1.0
+  SOURCE_COMMIT: ab91d48b2645259506a07b5f5e74ceb41366ebe6
+  SOURCE_PARENT: 8cf98166cfaf328756006cd30e53ff829d160845
+  SOURCE_TREE: d3d5f9ab3f1668e7273ea59d70ed9107ce807dd9
+  SOURCE_SUBJECT: "chore(release): prepare v0.1.0 candidate"
+  SIGNER_FINGERPRINT: 15DD2B380EC7BA67E25BDACB1C197479AAD3062B
+  TAG_OBJECT: 31e3d1edcca71e97a70329b9c2bb4575a0a4897c
+  RELEASE_ID: "378344578"
+  RELEASE_TITLE: InspectRT v0.1.0
+  GH_REPO: splicer3/inspectrt
+  WHEEL_NAME: inspectrt-0.1.0-py3-none-any.whl
+  WHEEL_BYTES: "107591"
+  WHEEL_SHA256: 7e2f45813cc5795866b625092074ab8ea01ec29c72ede86a722665af6c5ef05c
+  SDIST_NAME: inspectrt-0.1.0.tar.gz
+  SDIST_BYTES: "140845"
+  SDIST_SHA256: e20f2c5a8dc30a19a196d9e882e5b158155259f290f2e4e19764ac314b221080
+  CHECKSUMS_NAME: SHA256SUMS
+  CHECKSUMS_BYTES: "188"
+  CHECKSUMS_SHA256: e6bf9ace38fbfa73805e197167c456524c58c9a5590a88d6b10d4800c903a4ba
+  UV_VERSION: "0.11.28"
+
+jobs:
+  prepare:
+    name: Prepare
+    if: github.repository == 'splicer3/inspectrt' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ab91d48b2645259506a07b5f5e74ceb41366ebe6
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11"
+          github-token: ""
+          enable-cache: false
+
+      - name: Verify release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          P8_ROOT="$(mktemp -d "$RUNNER_TEMP/inspectrt-pypi.XXXXXX")"
+          ASSET_ROOT="$P8_ROOT/assets"
+          REBUILD_ROOT="$P8_ROOT/rebuilt"
+          PUBLISH_ROOT="$P8_ROOT/publish"
+          mkdir "$ASSET_ROOT" "$REBUILD_ROOT" "$PUBLISH_ROOT"
+          {
+            printf 'ASSET_ROOT=%s\n' "$ASSET_ROOT"
+            printf 'REBUILD_ROOT=%s\n' "$REBUILD_ROOT"
+            printf 'PUBLISH_ROOT=%s\n' "$PUBLISH_ROOT"
+          } >> "$GITHUB_ENV"
+          printf 'publish_root=%s\n' "$PUBLISH_ROOT" >> "$GITHUB_OUTPUT"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          repository = os.environ["GH_REPO"]
+          owner, name = repository.split("/", 1)
+          source_commit = os.environ["SOURCE_COMMIT"]
+          tag = os.environ["TAG"]
+          tag_object = os.environ["TAG_OBJECT"]
+          fingerprint = os.environ["SIGNER_FINGERPRINT"]
+
+
+          def api(endpoint: str) -> dict:
+              result = subprocess.run(
+                  ["gh", "api", "--method", "GET", endpoint],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  text=True,
+              )
+              value = json.loads(result.stdout)
+              if not isinstance(value, dict):
+                  raise SystemExit(f"invalid API object: {endpoint}")
+              return value
+
+
+          def graphql(query: str, **fields: str) -> dict:
+              command = [
+                  "gh",
+                  "api",
+                  "graphql",
+                  "--method",
+                  "POST",
+                  "--raw-field",
+                  f"query={query}",
+              ]
+              for key, value in fields.items():
+                  command.extend(("--raw-field", f"{key}={value}"))
+              result = subprocess.run(
+                  command,
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  text=True,
+              )
+              value = json.loads(result.stdout)
+              if not isinstance(value, dict) or value.get("errors"):
+                  raise SystemExit("invalid GraphQL response")
+              return value
+
+
+          def require(condition: bool, message: str) -> None:
+              if not condition:
+                  raise SystemExit(message)
+
+
+          def require_verified(record: dict, label: str) -> None:
+              verification = record.get("verification", {})
+              require(verification.get("verified") is True, f"{label} is unverified")
+              require(
+                  verification.get("reason") == "valid",
+                  f"{label} verification reason is not valid",
+              )
+              signature = verification.get("signature")
+              require(
+                  isinstance(signature, str) and signature,
+                  f"{label} has no signature",
+              )
+              packets = subprocess.run(
+                  ["gpg", "--batch", "--list-packets"],
+                  input=signature,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              require(packets.returncode == 0, f"cannot inspect {label} signature")
+              issuers = {
+                  value.upper()
+                  for value in re.findall(
+                      r"issuer fpr v4 ([0-9A-F]{40})",
+                      packets.stdout,
+                      re.IGNORECASE,
+                  )
+              }
+              require(issuers == {fingerprint}, f"{label} fingerprint mismatch")
+
+
+          ref = api(f"repos/{repository}/git/ref/tags/{tag}")
+          require(ref.get("ref") == f"refs/tags/{tag}", "tag ref mismatch")
+          require(ref.get("object") == {
+              "type": "tag",
+              "sha": tag_object,
+              "url": (
+                  f"https://api.github.com/repos/{repository}/git/tags/{tag_object}"
+              ),
+          }, "annotated tag object mismatch")
+
+          tag_record = api(f"repos/{repository}/git/tags/{tag_object}")
+          require(tag_record.get("sha") == tag_object, "tag SHA mismatch")
+          require(tag_record.get("tag") == tag, "tag name mismatch")
+          require(
+              tag_record.get("object", {}).get("type") == "commit"
+              and tag_record.get("object", {}).get("sha") == source_commit,
+              "tag target mismatch",
+          )
+          require(tag_record.get("tagger") == {
+              "name": "Matteo Di Iorio",
+              "email": "matteo.di.iorio@icloud.com",
+              "date": "2026-08-28T08:06:23Z",
+          }, "tagger identity mismatch")
+          tag_message = tag_record.get("message", "").split(
+              "\n-----BEGIN PGP SIGNATURE-----",
+              1,
+          )[0]
+          require(tag_message == "InspectRT v0.1.0", "tag message mismatch")
+          require_verified(tag_record, "tag")
+
+          commit = api(f"repos/{repository}/git/commits/{source_commit}")
+          require(commit.get("sha") == source_commit, "source commit mismatch")
+          require(
+              commit.get("tree", {}).get("sha") == os.environ["SOURCE_TREE"],
+              "source tree mismatch",
+          )
+          require(
+              [item.get("sha") for item in commit.get("parents", [])]
+              == [os.environ["SOURCE_PARENT"]],
+              "source parent mismatch",
+          )
+          require(
+              commit.get("message", "").splitlines()[0]
+              == os.environ["SOURCE_SUBJECT"],
+              "source subject mismatch",
+          )
+          identity = {
+              "name": "Matteo Di Iorio",
+              "email": "matteo.di.iorio@icloud.com",
+              "date": "2026-08-27T17:05:34Z",
+          }
+          require(commit.get("author") == identity, "source author mismatch")
+          require(commit.get("committer") == identity, "source committer mismatch")
+          require_verified(commit, "source commit")
+
+          comparison = api(f"repos/{repository}/compare/{source_commit}...main")
+          require(
+              comparison.get("status") in {"identical", "ahead"}
+              and comparison.get("behind_by") == 0
+              and comparison.get("base_commit", {}).get("sha") == source_commit
+              and comparison.get("merge_base_commit", {}).get("sha")
+              == source_commit,
+              "public main does not contain the source commit",
+          )
+
+          release = api(f"repos/{repository}/releases/tags/{tag}")
+          require(
+              release.get("id") == int(os.environ["RELEASE_ID"])
+              and release.get("name") == os.environ["RELEASE_TITLE"]
+              and release.get("tag_name") == tag
+              and release.get("target_commitish") == "main"
+              and release.get("draft") is False
+              and release.get("prerelease") is False,
+              "release identity mismatch",
+          )
+
+          query = (
+              "query Release($owner:String!,$name:String!,$tag:String!){"
+              "repository(owner:$owner,name:$name){"
+              "release(tagName:$tag){"
+              "databaseId name tagName isDraft isPrerelease tagCommit{oid}"
+              "}}}"
+          )
+          graph_release = graphql(
+              query,
+              owner=owner,
+              name=name,
+              tag=tag,
+          ).get("data", {}).get("repository", {}).get("release")
+          require(graph_release == {
+              "databaseId": int(os.environ["RELEASE_ID"]),
+              "name": os.environ["RELEASE_TITLE"],
+              "tagName": tag,
+              "isDraft": False,
+              "isPrerelease": False,
+              "tagCommit": {"oid": source_commit},
+          }, "resolved release identity mismatch")
+
+          expected = {
+              os.environ["WHEEL_NAME"]: (
+                  int(os.environ["WHEEL_BYTES"]),
+                  os.environ["WHEEL_SHA256"],
+              ),
+              os.environ["SDIST_NAME"]: (
+                  int(os.environ["SDIST_BYTES"]),
+                  os.environ["SDIST_SHA256"],
+              ),
+              os.environ["CHECKSUMS_NAME"]: (
+                  int(os.environ["CHECKSUMS_BYTES"]),
+                  os.environ["CHECKSUMS_SHA256"],
+              ),
+          }
+          assets = release.get("assets")
+          require(isinstance(assets, list), "release assets are invalid")
+          require(len(assets) == len(expected), "release asset count mismatch")
+          names = [item.get("name") for item in assets]
+          require(
+              len(names) == len(set(names)) and set(names) == set(expected),
+              "release asset inventory mismatch",
+          )
+          by_name = {item["name"]: item for item in assets}
+          for asset_name, (size, digest) in expected.items():
+              asset = by_name[asset_name]
+              require(
+                  isinstance(asset.get("id"), int)
+                  and asset["id"] > 0
+                  and asset.get("state") == "uploaded"
+                  and asset.get("size") == size
+                  and asset.get("digest") == f"sha256:{digest}",
+                  f"release asset mismatch: {asset_name}",
+              )
+
+          outputs = {
+              "wheel_asset_id": by_name[os.environ["WHEEL_NAME"]]["id"],
+              "sdist_asset_id": by_name[os.environ["SDIST_NAME"]]["id"],
+              "checksums_asset_id": by_name[os.environ["CHECKSUMS_NAME"]]["id"],
+          }
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+              for key, value in outputs.items():
+                  stream.write(f"{key}={value}\n")
+          PY
+
+      - name: Download assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WHEEL_ASSET_ID: ${{ steps.release.outputs.wheel_asset_id }}
+          SDIST_ASSET_ID: ${{ steps.release.outputs.sdist_asset_id }}
+          CHECKSUMS_ASSET_ID: ${{ steps.release.outputs.checksums_asset_id }}
+        run: |
+          set -euo pipefail
+          gh api -H "Accept: application/octet-stream" "repos/$GH_REPO/releases/assets/$WHEEL_ASSET_ID" > "$ASSET_ROOT/$WHEEL_NAME"
+          gh api -H "Accept: application/octet-stream" "repos/$GH_REPO/releases/assets/$SDIST_ASSET_ID" > "$ASSET_ROOT/$SDIST_NAME"
+          gh api -H "Accept: application/octet-stream" "repos/$GH_REPO/releases/assets/$CHECKSUMS_ASSET_ID" > "$ASSET_ROOT/$CHECKSUMS_NAME"
+
+      - name: Verify package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from hashlib import sha256
+          import os
+          from pathlib import Path
+          import stat
+
+          root = Path(os.environ["ASSET_ROOT"])
+          expected = {
+              os.environ["WHEEL_NAME"]: (
+                  int(os.environ["WHEEL_BYTES"]),
+                  os.environ["WHEEL_SHA256"],
+              ),
+              os.environ["SDIST_NAME"]: (
+                  int(os.environ["SDIST_BYTES"]),
+                  os.environ["SDIST_SHA256"],
+              ),
+              os.environ["CHECKSUMS_NAME"]: (
+                  int(os.environ["CHECKSUMS_BYTES"]),
+                  os.environ["CHECKSUMS_SHA256"],
+              ),
+          }
+          actual = {path.name for path in root.iterdir()}
+          if actual != set(expected):
+              raise SystemExit(f"downloaded asset inventory mismatch: {sorted(actual)}")
+          for name, (size, digest) in expected.items():
+              path = root / name
+              mode = path.lstat().st_mode
+              if not stat.S_ISREG(mode) or path.is_symlink():
+                  raise SystemExit(f"non-regular release asset: {name}")
+              data = path.read_bytes()
+              if len(data) != size or sha256(data).hexdigest() != digest:
+                  raise SystemExit(f"release asset bytes mismatch: {name}")
+          checksums = (
+              f'{os.environ["WHEEL_SHA256"]}  {os.environ["WHEEL_NAME"]}\n'
+              f'{os.environ["SDIST_SHA256"]}  {os.environ["SDIST_NAME"]}\n'
+          ).encode("ascii")
+          if (root / os.environ["CHECKSUMS_NAME"]).read_bytes() != checksums:
+              raise SystemExit("checksum manifest mismatch")
+          PY
+          (
+            cd "$ASSET_ROOT"
+            sha256sum --check --strict "$CHECKSUMS_NAME"
+          )
+          python3 scripts/verify_distribution.py "$ASSET_ROOT/$WHEEL_NAME" "$ASSET_ROOT/$SDIST_NAME"
+          python3 - <<'PY'
+          from email import policy
+          from email.parser import BytesParser
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          assets = Path(os.environ["ASSET_ROOT"])
+          wheel_name = os.environ["WHEEL_NAME"]
+          wheel = assets / wheel_name
+
+          with zipfile.ZipFile(wheel) as archive:
+              metadata = archive.read(
+                  f'{os.environ["PROJECT"]}-{os.environ["VERSION"]}.dist-info/METADATA'
+              )
+          with tarfile.open(assets / os.environ["SDIST_NAME"], "r:gz") as archive:
+              member = archive.extractfile(
+                  f'{os.environ["PROJECT"]}-{os.environ["VERSION"]}/PKG-INFO'
+              )
+              if member is None:
+                  raise SystemExit("sdist metadata is missing")
+              pkg_info = member.read()
+
+          for label, data in (("wheel", metadata), ("sdist", pkg_info)):
+              message = BytesParser(policy=policy.default).parsebytes(data)
+              if message.defects:
+                  raise SystemExit(f"{label} metadata parser defects")
+              if message.get("Name") != os.environ["PROJECT"]:
+                  raise SystemExit(f"{label} project name mismatch")
+              if message.get("Version") != os.environ["VERSION"]:
+                  raise SystemExit(f"{label} version mismatch")
+              if message.get("License-Expression") != "Apache-2.0":
+                  raise SystemExit(f"{label} license expression mismatch")
+              requires_python = message.get("Requires-Python", "")
+              bounds = {item.strip() for item in requires_python.split(",")}
+              if bounds != {">=3.11", "<3.13"}:
+                  raise SystemExit(f"{label} Python range mismatch")
+          PY
+
+      - name: Check PyPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          from urllib.error import HTTPError, URLError
+          from urllib.request import (
+              HTTPRedirectHandler,
+              Request,
+              build_opener,
+          )
+
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def require_absent(url: str, accept: str) -> None:
+              request = Request(
+                  url,
+                  headers={
+                      "Accept": accept,
+                      "User-Agent": "splicer3/inspectrt pypi preflight",
+                  },
+              )
+              try:
+                  with build_opener(NoRedirect).open(request, timeout=15) as response:
+                      response.read(1024)
+                      code = response.status
+                      final_url = response.geturl()
+                      location = response.headers.get("Location")
+              except HTTPError as error:
+                  error.read(1024)
+                  code = error.code
+                  final_url = error.geturl()
+                  location = error.headers.get("Location")
+              except (OSError, URLError) as error:
+                  raise SystemExit(f"PyPI request failed: {url}: {error}") from error
+              if code != 404 or final_url != url or location is not None:
+                  raise SystemExit(
+                      f"PyPI absence gate failed: {url}: "
+                      f"status={code} final={final_url!r} location={location!r}"
+                  )
+
+
+          project = os.environ["PROJECT"]
+          version = os.environ["VERSION"]
+          require_absent(
+              f"https://pypi.org/pypi/{project}/json",
+              "application/json",
+          )
+          require_absent(
+              f"https://pypi.org/pypi/{project}/{version}/json",
+              "application/json",
+          )
+          require_absent(
+              f"https://pypi.org/simple/{project}/",
+              "application/vnd.pypi.simple.v1+json",
+          )
+
+          assets = Path(os.environ["ASSET_ROOT"])
+          publish = Path(os.environ["PUBLISH_ROOT"])
+          expected = {os.environ["WHEEL_NAME"], os.environ["SDIST_NAME"]}
+          for name in expected:
+              shutil.copyfile(assets / name, publish / name)
+          actual = {path.name for path in publish.iterdir()}
+          if actual != expected:
+              raise SystemExit(f"publishing artifact mismatch: {sorted(actual)}")
+          for path in publish.iterdir():
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"non-regular publishing file: {path.name}")
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: inspectrt-pypi-0.1.0
+          path: |
+            ${{ steps.release.outputs.publish_root }}/${{ env.WHEEL_NAME }}
+            ${{ steps.release.outputs.publish_root }}/${{ env.SDIST_NAME }}
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: false
+          overwrite: false
+
+      - name: Rebuild package
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd "$REBUILD_ROOT"
+            uv build --wheel --no-sources --no-cache --no-create-gitignore --out-dir "$REBUILD_ROOT" "$ASSET_ROOT/$SDIST_NAME"
+          )
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          assets = Path(os.environ["ASSET_ROOT"])
+          rebuilt_root = Path(os.environ["REBUILD_ROOT"])
+          wheel_name = os.environ["WHEEL_NAME"]
+          rebuilt_paths = list(rebuilt_root.iterdir())
+          if rebuilt_paths != [rebuilt_root / wheel_name]:
+              raise SystemExit("rebuilt wheel inventory mismatch")
+          rebuilt = rebuilt_paths[0]
+          if not rebuilt.is_file() or rebuilt.is_symlink():
+              raise SystemExit("rebuilt wheel is not a regular file")
+          if (assets / wheel_name).read_bytes() != rebuilt.read_bytes():
+              raise SystemExit("sdist-built wheel differs from release wheel")
+          rebuilt.unlink()
+          if any(rebuilt_root.iterdir()):
+              raise SystemExit("rebuilt wheel cleanup failed")
+          PY
+
+  publish-pypi:
+    name: Publish
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/inspectrt
+    permissions:
+      id-token: write
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: inspectrt-pypi-0.1.0
+          path: dist/
+
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          attestations: true
